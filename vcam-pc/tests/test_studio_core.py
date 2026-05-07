@@ -80,6 +80,15 @@ class TestLicenseKey:
         v = verify_key(key, secret=self.SECRET)
         assert v.max_devices == 1
 
+    def test_default_tier_matches_brand(self):
+        """1 license = 3 phones is the default selling tier (BRAND)."""
+        from src.branding import BRAND
+
+        key = generate_key("Default", secret=self.SECRET)
+        v = verify_key(key, secret=self.SECRET)
+        assert v.max_devices == BRAND.default_devices_per_key
+        assert v.max_devices == 3  # explicit tripwire
+
     def test_thai_customer_name(self):
         key = generate_key("คุณสมชาย", max_devices=2, secret=self.SECRET)
         v = verify_key(key, secret=self.SECRET)

@@ -31,6 +31,11 @@ class Brand:
 
     license_prefix: str = "888"
 
+    # Default subscription tier: 1 license key may activate this many phones.
+    # Tweak here and every CLI/UI default updates in lock-step.
+    default_devices_per_key: int = 3
+    default_license_days: int = 30
+
 
 @dataclass(frozen=True)
 class Theme:

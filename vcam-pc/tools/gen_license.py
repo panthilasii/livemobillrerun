@@ -3,8 +3,11 @@
 
 Usage::
 
-    python tools/gen_license.py --customer "คุณสมชาย" --devices 3 --days 30
-    python tools/gen_license.py -c "Test" -n 1 -d 7 -j         # JSON output
+    # Default tier: 3 devices / 30 days (matches BRAND.default_*)
+    python tools/gen_license.py --customer "คุณสมชาย"
+
+    # Custom: 1 device, 7 days, JSON output for piping into a webhook
+    python tools/gen_license.py -c "Test" -n 1 -d 7 -j
 
 Exit codes: 0 success, 2 bad arguments, 3 secret missing.
 
@@ -54,15 +57,21 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         "-n",
         "--devices",
         type=int,
-        default=1,
-        help="how many phones this key may activate (default 1)",
+        default=BRAND.default_devices_per_key,
+        help=(
+            f"how many phones this key may activate "
+            f"(default {BRAND.default_devices_per_key})"
+        ),
     )
     p.add_argument(
         "-d",
         "--days",
         type=int,
-        default=30,
-        help="lifetime in days from today (default 30)",
+        default=BRAND.default_license_days,
+        help=(
+            f"lifetime in days from today "
+            f"(default {BRAND.default_license_days})"
+        ),
     )
     p.add_argument(
         "--expiry",

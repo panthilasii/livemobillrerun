@@ -49,7 +49,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .branding import BRAND
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT  # noqa: F401  (kept for SECRET_PATH below)
 
 
 SECRET_PATH = PROJECT_ROOT / ".license_secret"
@@ -98,8 +98,8 @@ def _hmac_short(secret: bytes, payload: str) -> str:
 
 def generate_key(
     customer: str,
-    max_devices: int = 1,
-    days: int = 30,
+    max_devices: int | None = None,
+    days: int | None = None,
     expiry: date | None = None,
     nonce: str | None = None,
     secret: bytes | None = None,
@@ -107,11 +107,16 @@ def generate_key(
     """Build a license key from the given fields.
 
     ``customer`` may not contain ``'|'`` (the field separator).
-    ``max_devices`` is clamped to [1, 100]. ``days`` is used to derive
-    ``expiry`` if no explicit ``expiry`` is given.
+    ``max_devices`` is clamped to [1, 100] and defaults to the brand
+    tier (``BRAND.default_devices_per_key``). ``days`` is used to
+    derive ``expiry`` if no explicit ``expiry`` is given.
     """
     if "|" in customer:
         raise ValueError("customer name cannot contain '|'")
+    if max_devices is None:
+        max_devices = BRAND.default_devices_per_key
+    if days is None:
+        days = BRAND.default_license_days
     max_devices = max(1, min(100, int(max_devices)))
     if expiry is None:
         from datetime import timedelta
