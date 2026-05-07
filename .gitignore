@@ -65,6 +65,9 @@ vcam-magisk/src/zygisk/third_party/shadowhook/
 *.key
 .auth_cache/
 
-# Live Studio Pro — license HMAC secret (NEVER commit)
+# Live Studio Pro — Ed25519 signing seed (admin only, NEVER commit)
+.private_key
+vcam-pc/.private_key
+# Legacy HMAC secret (kept ignored in case any old workspace still has one)
 .license_secret
 vcam-pc/.license_secret

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Studio Pro — admin license generator.
+"""Live Studio Pro — admin license generator (Ed25519).
 
 Usage::
 
@@ -9,20 +9,23 @@ Usage::
     # Custom: 1 device, 7 days, JSON output for piping into a webhook
     python tools/gen_license.py -c "Test" -n 1 -d 7 -j
 
-Exit codes: 0 success, 2 bad arguments, 3 secret missing.
+Exit codes: 0 success, 2 bad arguments, 3 private key missing.
 
 Setup
 -----
 
-The HMAC secret lives at ``vcam-pc/.license_secret`` (UTF-8, single
-line). Create it once with::
+Run once on the admin machine::
 
-    head -c 64 /dev/urandom | base64 > vcam-pc/.license_secret
-    chmod 600 vcam-pc/.license_secret
+    python tools/init_keys.py
 
-Add ``.license_secret`` to ``.gitignore`` and back the file up to a
-password manager — losing it means you can't issue or verify keys
-that match shipped builds.
+That creates the keypair: ``vcam-pc/.private_key`` (admin only,
+gitignored) and ``vcam-pc/src/_pubkey.py`` (baked into all builds).
+
+Back up ``.private_key`` to a password manager — losing it means
+you can't issue any more keys that match shipped builds. Knowing
+only the public key (which ships with every customer bundle) is
+not enough to forge keys: that's the whole point of asymmetric
+crypto.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ sys.path.insert(0, str(PROJECT))
 
 from src.branding import BRAND  # noqa: E402
 from src.license_key import (  # noqa: E402
-    SECRET_PATH,
+    PRIVATE_KEY_PATH,
     generate_key,
     verify_key,
 )
@@ -89,12 +92,11 @@ def _parse(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv if argv is not None else sys.argv[1:])
 
-    if not SECRET_PATH.is_file():
+    if not PRIVATE_KEY_PATH.is_file():
         print(
-            f"\n[!] Secret missing at {SECRET_PATH}\n"
-            "    Create it once:\n"
-            f"      head -c 64 /dev/urandom | base64 > {SECRET_PATH.relative_to(PROJECT)}\n"
-            f"      chmod 600 {SECRET_PATH.relative_to(PROJECT)}\n",
+            f"\n[!] Private key missing at {PRIVATE_KEY_PATH}\n"
+            "    Generate the keypair once on this machine:\n"
+            "      python tools/init_keys.py\n",
             file=sys.stderr,
         )
         return 3

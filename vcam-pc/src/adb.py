@@ -30,7 +30,25 @@ class AdbDevice:
 
 class AdbController:
     def __init__(self, adb_path: str = "adb") -> None:
-        self.adb_path = adb_path
+        self.adb_path = self._resolve(adb_path)
+
+    @staticmethod
+    def _resolve(adb_path: str) -> str:
+        """Resolve ``adb_path`` to an actual binary, falling back to
+        the bundled ``.tools/<os>/platform-tools/adb`` if the user's
+        PATH doesn't have ``adb``. Keeps the configured value if it
+        already works, so power users can override via config.json."""
+        if adb_path and shutil.which(adb_path) is not None:
+            return adb_path
+        try:
+            from . import platform_tools
+
+            bundled = platform_tools.find_adb()
+            if bundled is not None:
+                return str(bundled)
+        except Exception:
+            pass
+        return adb_path
 
     # ── plumbing ────────────────────────────────────────────────
 

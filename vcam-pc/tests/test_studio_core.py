@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from src import _ed25519 as ed
 from src.customer_devices import DeviceEntry, DeviceLibrary
 from src.license_key import (
     LicenseError,
@@ -22,82 +23,102 @@ from src.license_key import (
 )
 
 
-# ── license_key ─────────────────────────────────────────────────────
+# ── license_key (Ed25519) ────────────────────────────────────────
 
 
 class TestLicenseKey:
-    SECRET = b"unit-test-secret-do-not-ship"
+    # Deterministic keypair so test runs are stable.
+    SEED = bytes.fromhex(
+        "9d61b19deffd5a60ba844af492ec2cc4"
+        "4449c5697b326919703bac031cae7f60"
+    )
+
+    @classmethod
+    def setup_class(cls):
+        cls.PRIV, cls.PUB = ed.keypair_from_seed(cls.SEED)
+        cls.WRONG_PUB = ed.keypair_from_seed(b"x" * 32)[1]
+
+    def _make(self, *args, **kw):
+        kw.setdefault("private_seed", self.PRIV)
+        return generate_key(*args, **kw)
+
+    def _verify(self, key):
+        return verify_key(key, public_key=self.PUB)
 
     def test_round_trip(self):
-        key = generate_key(
-            "Alice", max_devices=3, days=30, secret=self.SECRET,
-        )
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("Alice", max_devices=3, days=30)
+        v = self._verify(key)
         assert v.customer == "Alice"
         assert v.max_devices == 3
-        assert v.days_left in (29, 30)  # tolerate clock-rounding
+        assert v.days_left in (29, 30)
         assert not v.is_expired
 
     def test_format_starts_with_888(self):
-        key = generate_key("X", secret=self.SECRET)
+        key = self._make("X")
         assert key.startswith("888-")
 
     def test_tampered_key_rejected(self):
-        key = generate_key("Bob", secret=self.SECRET)
-        # Flip the last char.
-        bad = key[:-1] + ("A" if key[-1] != "A" else "B")
+        """Flip a meaningful char inside the signature region. (Base32
+        is case-insensitive *and* the last 1-2 chars only encode
+        padding bits, so we pick a char near the middle of the string
+        that's guaranteed to carry real signature data.)"""
+        key = self._make("Bob")
+        # Find a hyphenated group somewhere in the back half (signature
+        # bytes live there) and bump its first char by one.
+        chars = list(key)
+        mid = len(chars) // 2 + 8  # well past the payload, into the sig
+        # base32 alphabet is A-Z, 2-7. Pick something different.
+        original = chars[mid].upper()
+        chars[mid] = "Q" if original != "Q" else "M"
+        bad = "".join(chars)
         with pytest.raises(LicenseError):
-            verify_key(bad, secret=self.SECRET)
+            self._verify(bad)
 
     def test_garbage_rejected(self):
         with pytest.raises(LicenseError):
-            verify_key("not a real key", secret=self.SECRET)
+            self._verify("not a real key")
 
-    def test_wrong_secret_rejected(self):
-        key = generate_key("Carol", secret=self.SECRET)
+    def test_wrong_pubkey_rejected(self):
+        """Customer can't replace the bundled pubkey to forge new keys."""
+        key = self._make("Carol")
         with pytest.raises(LicenseError):
-            verify_key(key, secret=b"different-secret")
+            verify_key(key, public_key=self.WRONG_PUB)
 
     def test_explicit_expiry(self):
         future = date.today() + timedelta(days=100)
-        key = generate_key(
-            "Dave", max_devices=1, expiry=future, secret=self.SECRET,
-        )
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("Dave", max_devices=1, expiry=future)
+        v = self._verify(key)
         assert v.expiry == future
 
     def test_expired_key_returns_but_flagged(self):
         past = date.today() - timedelta(days=2)
-        key = generate_key(
-            "Eve", max_devices=1, expiry=past, secret=self.SECRET,
-        )
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("Eve", max_devices=1, expiry=past)
+        v = self._verify(key)
         assert v.is_expired
         assert v.days_left < 0
 
     def test_devices_clamped_to_one_minimum(self):
-        key = generate_key("Frank", max_devices=0, secret=self.SECRET)
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("Frank", max_devices=0)
+        v = self._verify(key)
         assert v.max_devices == 1
 
     def test_default_tier_matches_brand(self):
-        """1 license = 3 phones is the default selling tier (BRAND)."""
         from src.branding import BRAND
 
-        key = generate_key("Default", secret=self.SECRET)
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("Default")
+        v = self._verify(key)
         assert v.max_devices == BRAND.default_devices_per_key
-        assert v.max_devices == 3  # explicit tripwire
+        assert v.max_devices == 3
 
     def test_thai_customer_name(self):
-        key = generate_key("คุณสมชาย", max_devices=2, secret=self.SECRET)
-        v = verify_key(key, secret=self.SECRET)
+        key = self._make("คุณสมชาย", max_devices=2)
+        v = self._verify(key)
         assert v.customer == "คุณสมชาย"
         assert v.max_devices == 2
 
     def test_pipe_in_customer_rejected(self):
         with pytest.raises(ValueError):
-            generate_key("a|b", secret=self.SECRET)
+            self._make("a|b")
 
 
 # ── customer_devices ────────────────────────────────────────────────

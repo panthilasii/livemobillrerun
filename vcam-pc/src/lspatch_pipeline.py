@@ -57,18 +57,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import platform_tools
 from .config import PROJECT_ROOT, StreamConfig
 
 log = logging.getLogger(__name__)
-
-# Where we expect the LSPatch jar + portable JDK to live. The setup
-# script in `tools/` populates these.
-TOOLS_DIR = (PROJECT_ROOT / ".." / ".tools").resolve()
-LSPATCH_JAR = TOOLS_DIR / "lspatch" / "lspatch.jar"
-JDK_HOME = TOOLS_DIR / "jdk-21" / "Contents" / "Home"  # macOS layout
-JDK_HOME_LINUX = TOOLS_DIR / "jdk-21"                  # linux layout fallback
-
-VCAM_APK_REL = Path("vcam-app/app/build/outputs/apk/debug/app-debug.apk")
 
 # TikTok package candidates, in order of likelihood for our market.
 TIKTOK_PACKAGES = (
@@ -141,60 +133,64 @@ class LSPatchPipeline:
     # ──────────────────────────────
 
     def probe_tools(self) -> ToolStatus:
-        st = ToolStatus(adb=self.cfg.adb_path)
+        # Resolve every tool through the cross-platform resolver so
+        # macOS / Windows / Linux all pick the right binary layout.
+        paths = platform_tools.discover()
+        # Prefer the configured adb if it works (lets the user override
+        # via config.json), else fall back to whatever resolver found.
+        configured_adb = self.cfg.adb_path or "adb"
+        adb_str = (
+            configured_adb
+            if shutil.which(configured_adb)
+            else (str(paths.adb) if paths.adb else configured_adb)
+        )
+        st = ToolStatus(adb=adb_str)
 
-        # JDK — try macOS layout first, then linux.
-        java = JDK_HOME / "bin" / "java"
-        if not java.is_file():
-            java = JDK_HOME_LINUX / "bin" / "java"
-        if not java.is_file():
-            sys_java = shutil.which("java")
-            if sys_java:
-                java = Path(sys_java)
-        if java.is_file():
+        if paths.java is not None:
             try:
-                r = subprocess.run([str(java), "-version"],
-                                   capture_output=True, text=True,
-                                   timeout=5, check=False)
+                r = subprocess.run(
+                    [str(paths.java), "-version"],
+                    capture_output=True, text=True,
+                    timeout=5, check=False,
+                )
                 # `java -version` writes to stderr.
                 vline = (r.stderr or r.stdout or "").splitlines()
                 vstr = vline[0] if vline else ""
-                m = re.search(r'"(\d+)\.', vstr)
+                m = re.search(r'"(\d+)\.', vstr) or re.search(
+                    r'"(\d+)"', vstr
+                )
                 major = int(m.group(1)) if m else 0
-                st.java = java
+                st.java = paths.java
                 st.java_version = vstr.strip()
                 if major < 21:
                     st.errors.append(
                         f"Java {major} is too old; LSPatch needs JDK 21+. "
-                        f"Install with tools/install_jdk21.sh"
+                        f"Run setup script in tools/ to install bundled JDK."
                     )
             except (subprocess.TimeoutExpired, OSError) as exc:
                 st.errors.append(f"java probe failed: {exc}")
         else:
             st.errors.append(
-                "JDK 21 not found; run tools/install_jdk21.sh first."
+                "JDK 21 not found. Expected under "
+                f".tools/{platform_tools.current_os()}/jdk-21/."
             )
 
-        # LSPatch jar
-        if LSPATCH_JAR.is_file():
-            st.lspatch = LSPATCH_JAR
+        if paths.lspatch_jar is not None:
+            st.lspatch = paths.lspatch_jar
         else:
             st.errors.append(
-                f"lspatch.jar missing at {LSPATCH_JAR}; "
-                f"run tools/install_lspatch.sh"
+                "lspatch.jar missing — expected at "
+                f".tools/{platform_tools.current_os()}/lspatch/lspatch.jar"
             )
 
-        # vcam-app debug APK
-        vcam = (PROJECT_ROOT.parent / VCAM_APK_REL).resolve()
-        if vcam.is_file():
-            st.vcam_apk = vcam
+        if paths.vcam_apk is not None:
+            st.vcam_apk = paths.vcam_apk
         else:
             st.errors.append(
-                f"vcam-app not built — expected {vcam}. "
-                f"Run `cd vcam-app && ./gradlew assembleDebug`."
+                "vcam-app APK not found. Looked under apk/ and "
+                "vcam-app/app/build/outputs/apk/."
             )
 
-        # adb sanity check
         if shutil.which(st.adb) is None:
             st.errors.append(f"adb not found on PATH: {st.adb}")
 
@@ -420,13 +416,9 @@ class LSPatchPipeline:
         # MsDosDateTimeUtils.packCurrentDate which only accepts years
         # 1980-2107. On Thai macOS the JVM defaults to BuddhistCalendar
         # (year = 2569) and the patch crashes with VerifyException.
-        env = os.environ.copy()
-        env["LANG"] = "C"
-        env["LC_ALL"] = "C"
-        # Belt-and-braces — also pin the JVM-internal calendar.
-        env["JAVA_TOOL_OPTIONS"] = (
-            (env.get("JAVA_TOOL_OPTIONS", "") + " -Duser.language=en "
-             "-Duser.country=US -Duser.timezone=UTC").strip()
+        # Same fix needed if the customer's Windows locale is Thai.
+        env = platform_tools.make_subprocess_env(
+            extra_path=[st.java.parent] if st.java else None,
         )
 
         t0 = time.monotonic()

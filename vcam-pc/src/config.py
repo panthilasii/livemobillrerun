@@ -21,6 +21,9 @@ PROFILES_PATH = PROJECT_ROOT / "device_profiles.json"
 
 @dataclass
 class StreamConfig:
+    # ``ffmpeg_path`` and ``adb_path`` default to bare names so a
+    # user's system install on PATH wins. The resolver
+    # (``platform_tools.find_*``) handles the bundled-binary fall-back.
     ffmpeg_path: str = "ffmpeg"
     adb_path: str = "adb"
     tcp_port: int = 8888
