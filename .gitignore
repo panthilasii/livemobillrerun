@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+vcam-pc/videos/*
+!vcam-pc/videos/.gitkeep
+vcam-pc/.cache/
+vcam-pc/logs/
+vcam-pc/tools/bin/
+.tools/
+.cache/
+*.log
+# Pulled TikTok APKs + LSPatch outputs (1+ GB, regeneratable)
+.cache/lspatch/
+
+# PyInstaller artefacts (recreated on every build)
+vcam-pc/build/
+vcam-pc/dist/
+vcam-pc/*.spec
+
+# Android
+vcam-app/build/
+vcam-app/.gradle/
+vcam-app/local.properties
+vcam-app/app/build/
+*.apk
+*.aab
+*.keystore
+!vcam-magisk/module/keystore.example
+
+# Magisk module build artifacts
+vcam-magisk/dist/
+vcam-magisk/*.zip
+vcam-magisk/src/zygisk/build/
+vcam-magisk/src/zygisk/third_party/dobby/
+vcam-magisk/src/zygisk/third_party/shadowhook/
+
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.auth_cache/
+
+# Live Studio Pro — license HMAC secret (NEVER commit)
+.license_secret
+vcam-pc/.license_secret

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Thai (th) localization. Picked up automatically by Android when the
+    user's device language is set to ภาษาไทย. The English strings in
+    `values/strings.xml` remain the fallback for any other locale.
+-->
+<resources>
+    <string name="app_name">livemobillrerun vcam</string>
+    <string name="status_idle">รอเริ่ม — กด เริ่ม</string>
+    <string name="status_running">กำลังสตรีม…</string>
+    <string name="btn_start">เริ่ม</string>
+    <string name="btn_stop">หยุด</string>
+    <string name="notif_channel_name">vcam streamer</string>
+    <string name="notif_text">กำลังรับสตรีมจากกล้องเสมือน</string>
+    <string name="hint_host">โฮสต์ (ค่าเริ่มต้น 127.0.0.1)</string>
+    <string name="hint_port">พอร์ต (ค่าเริ่มต้น 8888)</string>
+    <string name="preview_desc">พรีวิววีดีโอที่ถอดรหัสแล้ว</string>
+    <string name="preview_idle">ยังไม่มีเฟรม</string>
+    <string name="preview_source_memory">แหล่ง: หน่วยความจำ</string>
+    <string name="preview_source_disk">แหล่ง: ดิสก์ (loopback)</string>
+    <string name="loopback_label">ตรวจสอบ loopback (อ่าน vcam.yuv จากดิสก์)</string>
+    <string name="portrait_label">หมุนพรีวิวให้ตรง (สำหรับการแสดงผลเท่านั้น)</string>
+    <string name="btn_go_live">📺  ขึ้นไลฟ์ (เต็มจอ)</string>
+    <string name="live_hint">แตะเพื่อออก · พร้อมใช้ TikTok Screen Share</string>
+    <string name="xposed_description">VCam — แทนกล้อง TikTok ด้วยสตรีมจาก PC (ต้องใช้ LSPosed/LSPatch)</string>
+
+    <!-- Rotation picker (เพิ่มใหม่) -->
+    <string name="rotation_label">หมุนพรีวิว</string>
+    <string name="rotation_0">ปกติ (0°)</string>
+    <string name="rotation_90">90° ตามเข็ม</string>
+    <string name="rotation_180">180° (กลับหัว)</string>
+    <string name="rotation_270">270° ตามเข็ม</string>
+    <string name="mirror_h_label">กลับซ้าย-ขวา</string>
+    <string name="mirror_v_label">กลับบน-ล่าง</string>
+
+    <!-- Health / status section -->
+    <string name="health_title">สุขภาพระบบ</string>
+    <string name="health_streaming">สตรีม</string>
+    <string name="health_decoder">ตัวถอดรหัส</string>
+    <string name="health_writer">เขียนไฟล์</string>
+    <string name="health_ok">ปกติ</string>
+    <string name="health_warn">เตือน</string>
+    <string name="health_error">ผิดพลาด</string>
+</resources>

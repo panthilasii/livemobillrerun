@@ -1,0 +1,11 @@
+# Live Studio Pro — runtime dependencies
+#
+# customtkinter  — modern dark-themed Tk wrapper for the Studio UI
+# Pillow         — image handling for previews + wizard illustrations
+# pytest         — test suite
+#
+# To install:
+#   pip install -r requirements.txt
+customtkinter>=5.2.2
+Pillow>=10.4.0
+pytest>=8.0

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        LSPosed scope — the list of packages this Xposed module
+        wants to hook by default. The user can still tick/untick from
+        the LSPosed manager.
+
+        com.ss.android.ugc.trill   = TikTok (international, en/th)
+        com.zhiliaoapp.musically   = TikTok (musically, also intl)
+        com.ss.android.ugc.aweme   = TikTok (Douyin, China)
+    -->
+    <string-array name="xposed_scope">
+        <item>com.ss.android.ugc.trill</item>
+        <item>com.zhiliaoapp.musically</item>
+        <item>com.ss.android.ugc.aweme</item>
+    </string-array>
+</resources>

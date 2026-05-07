@@ -1,0 +1,7 @@
+id=livemobillrerun_vcam
+name=livemobillrerun Virtual Camera
+version=v0.1.0
+versionCode=1
+author=livemobillrerun
+description=Serve /data/local/tmp/vcam.yuv as the system camera. Personal use only.
+updateJson=

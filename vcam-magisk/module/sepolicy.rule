@@ -1,0 +1,6 @@
+# Allow cameraserver to read the YUV frame file written by vcam-app.
+allow cameraserver shell_data_file file { read getattr open ioctl }
+allow cameraserver tmpfs file { read getattr open }
+
+# Allow our own service to write to /data/local/tmp/.
+# (vcam-app runs as a normal user app, default already permits this.)

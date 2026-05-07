@@ -1,0 +1,15 @@
+{
+  "ffmpeg_path": "ffmpeg",
+  "adb_path": "adb",
+  "tcp_port": 8888,
+  "resolution": "720x1280",
+  "fps": 30,
+  "video_bitrate": "2000k",
+  "video_maxrate": "2500k",
+  "video_bufsize": "4000k",
+  "keyint_seconds": 2,
+  "loop_playlist": true,
+  "auto_adb_reverse": true,
+  "videos_dir": "videos",
+  "default_profile": "Redmi 14C"
+}

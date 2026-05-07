@@ -1,0 +1,41 @@
+{
+  "profiles": [
+    {
+      "name": "Redmi 13C",
+      "model": "23100RN82L",
+      "soc_hint": "MT6769V/CU (Helio G85)",
+      "rotation_filter": "transpose=2,vflip",
+      "notes": "Confirmed against UltimateRerun reference profiles"
+    },
+    {
+      "name": "Redmi 14C",
+      "model": "Redmi 14C",
+      "rotation_filter": "transpose=2,vflip",
+      "notes": "Same as 13C / Poco C75"
+    },
+    {
+      "name": "Poco C75",
+      "model": "Poco C75",
+      "rotation_filter": "transpose=2,vflip",
+      "notes": "Confirmed"
+    },
+    {
+      "name": "Redmi 15C",
+      "model": "25078RA3EA",
+      "rotation_filter": "transpose=1",
+      "notes": "Try transpose=1 first (untested)"
+    },
+    {
+      "name": "Generic / unknown",
+      "model": "generic",
+      "rotation_filter": "none",
+      "notes": "Start here, then adjust if image is rotated"
+    },
+    {
+      "name": "Test (no rotation)",
+      "model": "test",
+      "rotation_filter": "none",
+      "notes": "Use with ffplay tcp://localhost:8888 to verify pipeline"
+    }
+  ]
+}

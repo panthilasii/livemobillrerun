@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">livemobillrerun vcam</string>
+    <string name="status_idle">Idle — press Start</string>
+    <string name="status_running">Streaming…</string>
+    <string name="btn_start">Start</string>
+    <string name="btn_stop">Stop</string>
+    <string name="notif_channel_name">vcam streamer</string>
+    <string name="notif_text">Receiving virtual camera feed</string>
+    <string name="hint_host">Host (default 127.0.0.1)</string>
+    <string name="hint_port">Port (default 8888)</string>
+    <string name="preview_desc">Live preview of the decoded video frames</string>
+    <string name="preview_idle">no frames yet</string>
+    <string name="preview_source_memory">src: memory</string>
+    <string name="preview_source_disk">src: disk (loopback)</string>
+    <string name="loopback_label">Loopback verify (read vcam.yuv from disk)</string>
+    <string name="portrait_label">Show preview as portrait (un-rotate display only)</string>
+    <string name="btn_go_live">📺  Go Live (fullscreen)</string>
+    <string name="live_hint">tap to exit · ready for TikTok Screen Share</string>
+    <string name="xposed_description">VCam — replace TikTok\'s camera with the live PC stream (requires LSPosed)</string>
+
+    <!-- Rotation picker -->
+    <string name="rotation_label">Rotate preview</string>
+    <string name="rotation_0">Normal (0°)</string>
+    <string name="rotation_90">90° CW</string>
+    <string name="rotation_180">180° (upside-down)</string>
+    <string name="rotation_270">270° CW</string>
+    <string name="mirror_h_label">Mirror H</string>
+    <string name="mirror_v_label">Mirror V</string>
+
+    <!-- Health / status section -->
+    <string name="health_title">System health</string>
+    <string name="health_streaming">stream</string>
+    <string name="health_decoder">decoder</string>
+    <string name="health_writer">file writer</string>
+    <string name="health_ok">OK</string>
+    <string name="health_warn">warn</string>
+    <string name="health_error">error</string>
+</resources>
