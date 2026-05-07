@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Studio Pro — admin helper: populate ``.tools/windows/``.
+"""NP Create — admin helper: populate ``.tools/windows/``.
 
 Downloads (or hard-links) the three things the Windows customer
 ZIP needs:
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     cache = WORKSPACE / ".cache" / "windows-tools"
     cache.mkdir(parents=True, exist_ok=True)
 
-    print("Live Studio Pro — Windows tools setup")
+    print("NP Create — Windows tools setup")
     print(f"  target : {WIN_TOOLS}")
 
     # ── JDK ──────────────────────────────────────────────────────

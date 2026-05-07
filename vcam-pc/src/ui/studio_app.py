@@ -1,4 +1,4 @@
-"""Live Studio Pro — main application shell.
+"""NP Create — main application shell.
 
 This is the customer-facing entry point (the "shop window"). The
 older ``ui/app.py`` survives as ``--legacy`` for power users / dev
@@ -80,7 +80,7 @@ class _DevicePoller(threading.Thread):
         tk_after,
         get_wifi_targets,
     ) -> None:
-        super().__init__(daemon=True, name="livestudio-device-poller")
+        super().__init__(daemon=True, name="npcreate-device-poller")
         self._adb = adb
         self._on_devices = on_devices
         self._tk_after = tk_after
@@ -148,7 +148,7 @@ class _DevicePoller(threading.Thread):
 
 
 class StudioApp(ctk.CTk):
-    """The Live Studio Pro main window."""
+    """The NP Create main window."""
 
     WIDTH = 1100
     HEIGHT = 720
@@ -166,6 +166,7 @@ class StudioApp(ctk.CTk):
         self.title(f"{BRAND.name} — {BRAND.tagline_th}")
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(960, 640)
+        self._install_window_icon()
 
         # ── shared services
         self.cfg = StreamConfig.load()
@@ -213,6 +214,34 @@ class StudioApp(ctk.CTk):
         self._route_initial()
 
     # ── clipboard bindings ───────────────────────────────────────
+
+    def _install_window_icon(self) -> None:
+        """Set the OS-native window/dock icon. We try the multi-res
+        ``.ico`` on Windows (Tk's native path), then fall back to a
+        PNG ``iconphoto`` which Linux + macOS pick up. macOS Finder
+        also reads the icon from a code-signed ``.app`` bundle, but
+        for a bare ``run.command`` launch the dock icon will show
+        the Python rocket — that's a packaging-time concern, not a
+        runtime one."""
+        try:
+            if BRAND.icon_ico_path.is_file():
+                # iconbitmap on Windows accepts .ico directly.
+                try:
+                    self.iconbitmap(default=str(BRAND.icon_ico_path))
+                except Exception:
+                    pass
+            png = BRAND.logo_64_path if BRAND.logo_64_path.is_file() else BRAND.logo_path
+            if png.is_file():
+                from tkinter import PhotoImage
+
+                self._icon_img = PhotoImage(file=str(png))
+                # Ignore failures (some macOS Tk-Cocoa builds throw).
+                try:
+                    self.iconphoto(True, self._icon_img)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug("window-icon install failed: %s", e)
 
     def _install_clipboard_bindings(self) -> None:
         """Make ⌘V/⌘C/⌘X/⌘A actually work in Entry widgets.
@@ -419,6 +448,22 @@ class StudioApp(ctk.CTk):
             self.show_page(ActivationPage, error=error)
         else:
             self.show_page(ActivationPage)
+
+    def go_admin(self) -> None:
+        from .studio_pages import AdminPage
+
+        self.show_page(AdminPage)
+
+    @property
+    def is_admin(self) -> bool:
+        """True iff the .private_key signing seed lives next to this
+        install — i.e. we're on the admin's machine, not a customer's.
+        Customers never receive the file (build_release.py strips it),
+        so the admin tab is invisible on their builds.
+        """
+        from ..license_key import PRIVATE_KEY_PATH
+
+        return PRIVATE_KEY_PATH.is_file()
 
     # ── device polling ───────────────────────────────────────────
 

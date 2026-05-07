@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Studio Pro — release bundler.
+"""NP Create — release bundler.
 
 Produces ZIP archives for shipping to customers (or as an admin
 backup) targeting macOS or Windows. The same source tree is used
@@ -69,6 +69,7 @@ ADMIN_TOOLS: set[str] = {
     "init_keys.py",
     "build_release.py",
     "setup_windows_tools.py",
+    "setup_ffmpeg.py",
 }
 
 # Top-level project files always shipped.
@@ -125,6 +126,8 @@ SHIP_TOOLS_PATTERNS = (
     "jdk-21/",                          # JDK 21 (~330 MB)
     "platform-tools/",                  # adb + bundled libs (~38 MB)
     "android-sdk/platform-tools/",      # legacy macOS layout
+    "ffmpeg",                           # static ffmpeg (file at root)
+    "ffmpeg.exe",                       # Windows variant
 )
 
 
@@ -188,7 +191,7 @@ def _launcher_body(os_name: str) -> str:
     if os_name == "windows":
         return textwrap.dedent("""\
             @echo off
-            REM Live Studio Pro — Windows launcher
+            REM NP Create — Windows launcher
             cd /d "%~dp0\\vcam-pc"
             where py >nul 2>&1
             if %ERRORLEVEL%==0 (
@@ -210,7 +213,7 @@ def _launcher_body(os_name: str) -> str:
     if os_name == "macos":
         return textwrap.dedent("""\
             #!/usr/bin/env bash
-            # Live Studio Pro — macOS launcher
+            # NP Create — macOS launcher
             set -e
             cd "$(dirname "$0")/vcam-pc"
             if ! command -v python3 >/dev/null 2>&1; then
@@ -370,6 +373,14 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
             if f.is_file():
                 zf.write(f, f"{prefix}/vcam-pc/{fname}")
 
+        # ── vcam-pc/assets/ (logo + icon — needed by the UI) ────
+        assets_dir = PROJECT / "assets"
+        if assets_dir.is_dir():
+            n_assets = add_dir(
+                zf, assets_dir, f"{prefix}/vcam-pc/assets",
+            )
+            print(f"   assets/ : {n_assets} files (logo, icon)")
+
         # ── tests/ (admin only) ─────────────────────────────────
         if target == "admin":
             n_tests = add_dir(
@@ -384,6 +395,14 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
             print("   .private_key : included (ADMIN ONLY)")
         elif target == "customer" and priv.is_file():
             print("   .private_key : EXCLUDED (customer-safe)")
+
+        # ── license_history.json (admin only) ───────────────────
+        hist = PROJECT / "license_history.json"
+        if target == "admin" and hist.is_file():
+            zf.write(hist, f"{prefix}/vcam-pc/license_history.json")
+            print("   license_history.json : included (ADMIN ONLY)")
+        elif target == "customer" and hist.is_file():
+            print("   license_history.json : EXCLUDED (customer-safe)")
 
         # ── apk ─────────────────────────────────────────────────
         zf.write(apk, f"{prefix}/apk/vcam-app.apk")

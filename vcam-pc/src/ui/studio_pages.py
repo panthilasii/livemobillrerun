@@ -1,4 +1,4 @@
-"""Live Studio Pro — page widgets.
+"""NP Create — page widgets.
 
 Four pages live in this module:
 
@@ -35,6 +35,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+from PIL import Image
 
 from ..branding import BRAND, THEME
 from ..customer_devices import DeviceEntry
@@ -93,6 +94,46 @@ def _body(parent, text: str, **kw) -> ctk.CTkLabel:
         font=ctk.CTkFont(size=13),
         **kw,
     )
+
+
+# Cache CTkImage objects so we don't re-decode the logo PNG every
+# time a page is rebuilt (re-decoding on every redraw causes UI lag
+# on slower laptops and gradual memory growth).
+_LOGO_CACHE: dict[tuple[int, int], "ctk.CTkImage"] = {}
+
+
+def _logo(size: int = 96) -> "ctk.CTkImage | None":
+    """Return a CTkImage of the brand logo at ``size`` × ``size``.
+
+    Falls back to ``None`` if the asset is missing (in which case the
+    caller should display the plain text branding) so a corrupted
+    install never crashes the activation page.
+    """
+    key = (size, size)
+    if key in _LOGO_CACHE:
+        return _LOGO_CACHE[key]
+    # Pick the smallest pre-rendered size ≥ requested to keep things
+    # crisp on HiDPI without paying the full 1024² decode cost.
+    candidates = [
+        (64, BRAND.logo_64_path),
+        (128, BRAND.logo_128_path),
+        (256, BRAND.logo_256_path),
+        (1024, BRAND.logo_path),
+    ]
+    chosen = next(
+        (p for sz, p in candidates if sz >= size and p.is_file()),
+        BRAND.logo_path if BRAND.logo_path.is_file() else None,
+    )
+    if not chosen:
+        return None
+    try:
+        img = Image.open(chosen).convert("RGBA")
+    except Exception as e:
+        log.warning("logo load failed: %s", e)
+        return None
+    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+    _LOGO_CACHE[key] = ctk_img
+    return ctk_img
 
 
 def _primary_button(parent, text: str, command, **kw) -> ctk.CTkButton:
@@ -175,15 +216,19 @@ class ActivationPage(ctk.CTkFrame):
         wrap = ctk.CTkFrame(self, fg_color="transparent")
         wrap.grid(row=0, column=0)
 
-        # Brand mark
-        ctk.CTkLabel(
-            wrap,
-            text="🎬",
-            font=ctk.CTkFont(size=56),
-            text_color=THEME.primary,
-        ).pack(pady=(0, 8))
+        # Brand mark — real logo if available, fall back to a glyph
+        # so the activation page still works on a corrupted install.
+        logo = _logo(140)
+        if logo is not None:
+            ctk.CTkLabel(wrap, text="", image=logo).pack(pady=(0, 4))
+        else:
+            ctk.CTkLabel(
+                wrap, text="🎬", text_color=THEME.primary,
+                font=ctk.CTkFont(size=56),
+            ).pack(pady=(0, 8))
         _h1(wrap, BRAND.name).pack()
-        _muted(wrap, BRAND.tagline_th).pack(pady=(2, 24))
+        _muted(wrap, BRAND.tagline_en).pack(pady=(2, 2))
+        _muted(wrap, BRAND.company_th).pack(pady=(0, 24))
 
         # License entry card
         card = _card(wrap)
@@ -324,16 +369,22 @@ class DashboardPage(ctk.CTkFrame):
         side.grid_rowconfigure(2, weight=1)
         self.side = side
 
-        # Header
+        # Header — small logo + product name, side by side.
         head = ctk.CTkFrame(side, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 4))
-
+        title_row = ctk.CTkFrame(head, fg_color="transparent")
+        title_row.pack(anchor="w")
+        logo_small = _logo(28)
+        if logo_small is not None:
+            ctk.CTkLabel(title_row, text="", image=logo_small).pack(
+                side="left", padx=(0, 8),
+            )
         ctk.CTkLabel(
-            head,
-            text=f"🎬 {BRAND.short_name}",
+            title_row,
+            text=BRAND.short_name,
             text_color=THEME.fg_primary,
             font=ctk.CTkFont(size=16, weight="bold"),
-        ).pack(anchor="w")
+        ).pack(side="left")
 
         v = self.app.license
         cap = v.max_devices if v else 0
@@ -376,6 +427,16 @@ class DashboardPage(ctk.CTkFrame):
             "⚙️  ตั้งค่า",
             command=self.app.go_settings,
         ).pack(fill="x", pady=2)
+
+        # Admin-only: license-issuer console. Hidden on customer
+        # builds (no .private_key on disk), so the customer never
+        # sees a button they can't use.
+        if self.app.is_admin:
+            _ghost_button(
+                foot,
+                "🔑  ออกคีย์ลูกค้า",
+                command=self.app.go_admin,
+            ).pack(fill="x", pady=2)
 
         _ghost_button(
             foot,
@@ -1837,3 +1898,418 @@ class SettingsPage(ctk.CTkFrame):
         self.app.activation = None
         self.app.license = None
         self.app.go_activation()
+
+
+# ──────────────────────────────────────────────────────────────────
+#  AdminPage — admin-only license issuer + history
+# ──────────────────────────────────────────────────────────────────
+
+
+class AdminPage(ctk.CTkFrame):
+    """In-app license issuer (admin-only).
+
+    Visible only when ``app.is_admin`` is true (i.e. the
+    ``.private_key`` file lives on this machine). The page lets the
+    seller create a fresh license key, copy it to the clipboard for
+    pasting into Line, and review every key issued so far.
+
+    The page is intentionally read-mostly: we never delete history
+    entries (the JSON store is append-only). To revoke a key the
+    admin uses the "Revoke" button which simply flags the entry —
+    rotating the keypair (`init_keys.py --force`) is the only way
+    to *cryptographically* invalidate keys, and we don't expose
+    that from the UI because it nukes every customer at once.
+    """
+
+    def __init__(self, app) -> None:
+        super().__init__(app, fg_color=THEME.bg_main)
+        self.app = app
+
+        # Lazy import to avoid pulling license_history at module
+        # load on the customer build (the file should never be
+        # present there, but keeping it lazy is belt-and-braces).
+        from ..license_history import LicenseHistory
+
+        self.history = LicenseHistory.load()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # ── header ──────────────────────────────────────────────
+        head = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_columnconfigure(2, weight=1)
+
+        _ghost_button(
+            head, "← กลับ", command=self.app.go_dashboard,
+        ).grid(row=0, column=0, padx=14, pady=12)
+
+        ctk.CTkLabel(
+            head, text="🔑  ออกคีย์ลูกค้า",
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=1, padx=(0, 14), sticky="w")
+
+        ctk.CTkLabel(
+            head,
+            text=f"ADMIN ONLY · {self.history.count()} คีย์ที่ออกแล้ว",
+            text_color=THEME.warning,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).grid(row=0, column=2, padx=14, sticky="e")
+
+        # ── body — split into "issue" form (top) + history (below) ──
+        body = ctk.CTkScrollableFrame(self, fg_color=THEME.bg_main)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+
+        self._build_issuer(body)
+        self._build_history(body)
+
+    # ── issuer card ─────────────────────────────────────────────
+
+    def _build_issuer(self, parent: ctk.CTkScrollableFrame) -> None:
+        card = _card(parent)
+        card.grid(row=0, column=0, sticky="ew", padx=40, pady=(20, 10))
+        card.grid_columnconfigure(0, weight=1)
+
+        _h2(card, "ออกคีย์ใหม่").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(20, 4),
+        )
+        _muted(
+            card,
+            f"ดีฟอลต์: {BRAND.default_devices_per_key} เครื่อง / "
+            f"{BRAND.default_license_days} วัน · "
+            f"คีย์เซ็นด้วย Ed25519, ลูกค้า verify ได้ออฟไลน์",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 14))
+
+        form = ctk.CTkFrame(card, fg_color="transparent")
+        form.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
+        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(3, weight=1)
+
+        # Customer name
+        ctk.CTkLabel(
+            form, text="ชื่อลูกค้า",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            width=80, anchor="w",
+        ).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+        self.var_customer = ctk.StringVar()
+        ctk.CTkEntry(
+            form, textvariable=self.var_customer,
+            placeholder_text="เช่น คุณสมชาย / Acme TikTok",
+            fg_color=THEME.bg_input,
+            border_color=THEME.border,
+        ).grid(row=0, column=1, columnspan=3, sticky="ew", pady=4)
+
+        # Devices + days, side by side
+        ctk.CTkLabel(
+            form, text="จำนวนเครื่อง",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            width=80, anchor="w",
+        ).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="w")
+        self.var_devices = ctk.StringVar(
+            value=str(BRAND.default_devices_per_key)
+        )
+        ctk.CTkEntry(
+            form, textvariable=self.var_devices,
+            width=80,
+            fg_color=THEME.bg_input,
+            border_color=THEME.border,
+        ).grid(row=1, column=1, sticky="w", pady=4)
+
+        ctk.CTkLabel(
+            form, text="อายุ (วัน)",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+        ).grid(row=1, column=2, padx=(20, 8), pady=4, sticky="w")
+        self.var_days = ctk.StringVar(
+            value=str(BRAND.default_license_days)
+        )
+        ctk.CTkEntry(
+            form, textvariable=self.var_days,
+            width=80,
+            fg_color=THEME.bg_input,
+            border_color=THEME.border,
+        ).grid(row=1, column=3, sticky="w", pady=4)
+
+        # Note (free-form)
+        ctk.CTkLabel(
+            form, text="หมายเหตุ",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            width=80, anchor="w",
+        ).grid(row=2, column=0, padx=(0, 8), pady=4, sticky="w")
+        self.var_note = ctk.StringVar()
+        ctk.CTkEntry(
+            form, textvariable=self.var_note,
+            placeholder_text="เช่น เลขสลิป, Line, เบอร์โทร",
+            fg_color=THEME.bg_input,
+            border_color=THEME.border,
+        ).grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
+
+        # Actions
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 8))
+        _primary_button(
+            btns, "✓  สร้างคีย์", command=self._on_issue,
+        ).pack(side="left", padx=(0, 8))
+        _ghost_button(
+            btns, "ล้างฟอร์ม", command=self._reset_form,
+        ).pack(side="left")
+
+        # Result row (key + copy button)
+        self.result_card = ctk.CTkFrame(
+            card,
+            fg_color=THEME.bg_input,
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME.success,
+        )
+        self.result_card.grid(
+            row=4, column=0, sticky="ew", padx=20, pady=(8, 20),
+        )
+        self.result_card.grid_columnconfigure(0, weight=1)
+        self.result_card.grid_remove()  # hide until first issue
+
+        self.lbl_result_meta = ctk.CTkLabel(
+            self.result_card, text="",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            anchor="w", justify="left",
+        )
+        self.lbl_result_meta.grid(
+            row=0, column=0, sticky="ew", padx=12, pady=(10, 4),
+        )
+        self.lbl_result_key = ctk.CTkLabel(
+            self.result_card, text="",
+            text_color=THEME.success,
+            font=ctk.CTkFont(family="Menlo", size=12),
+            anchor="w", justify="left", wraplength=820,
+        )
+        self.lbl_result_key.grid(
+            row=1, column=0, sticky="ew", padx=12, pady=(0, 8),
+        )
+        copy_row = ctk.CTkFrame(self.result_card, fg_color="transparent")
+        copy_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 10))
+        _primary_button(
+            copy_row, "📋  ก๊อปคีย์",
+            command=self._copy_last_key,
+        ).pack(side="left", padx=4)
+        _ghost_button(
+            copy_row, "ก๊อปข้อความ Line",
+            command=self._copy_line_message,
+        ).pack(side="left", padx=4)
+
+        self._last_key: str = ""
+        self._last_meta: str = ""
+
+    # ── history list ────────────────────────────────────────────
+
+    def _build_history(self, parent: ctk.CTkScrollableFrame) -> None:
+        card = _card(parent)
+        card.grid(row=1, column=0, sticky="ew", padx=40, pady=10)
+        card.grid_columnconfigure(0, weight=1)
+
+        _h2(card, f"ประวัติ ({self.history.count()})").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(20, 4),
+        )
+        _muted(
+            card,
+            "บันทึกแบบ append-only ที่ vcam-pc/license_history.json — "
+            "ไฟล์นี้ไม่ติดไปกับ customer build",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        list_frame = ctk.CTkFrame(card, fg_color="transparent")
+        list_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 20))
+        list_frame.grid_columnconfigure(0, weight=1)
+
+        if self.history.count() == 0:
+            _muted(
+                list_frame,
+                "ยังไม่มีคีย์ที่ออก — ออกคีย์ใบแรกได้ที่ฟอร์มข้างบน",
+            ).grid(row=0, column=0, sticky="w", pady=8)
+            return
+
+        for i, ent in enumerate(self.history.recent(50)):
+            row = ctk.CTkFrame(
+                list_frame, fg_color=THEME.bg_input, corner_radius=8,
+            )
+            row.grid(row=i, column=0, sticky="ew", pady=3)
+            row.grid_columnconfigure(0, weight=1)
+
+            head_txt = (
+                f"{ent.customer}  ·  {ent.max_devices} เครื่อง  ·  "
+                f"หมดอายุ {ent.expiry}"
+            )
+            if ent.revoked:
+                head_txt += "  ·  REVOKED"
+            ctk.CTkLabel(
+                row, text=head_txt,
+                text_color=(
+                    THEME.danger if ent.revoked else THEME.fg_primary
+                ),
+                font=ctk.CTkFont(size=13, weight="bold"),
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
+
+            sub = f"ออกเมื่อ {ent.issued_at[:16].replace('T', ' ')}"
+            if ent.note:
+                sub += f"  ·  {ent.note}"
+            ctk.CTkLabel(
+                row, text=sub,
+                text_color=THEME.fg_muted,
+                font=ctk.CTkFont(size=11),
+                anchor="w",
+            ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 2))
+
+            ctk.CTkLabel(
+                row, text=ent.key,
+                text_color=THEME.fg_secondary,
+                font=ctk.CTkFont(family="Menlo", size=10),
+                anchor="w", justify="left", wraplength=820,
+            ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 4))
+
+            btns = ctk.CTkFrame(row, fg_color="transparent")
+            btns.grid(row=3, column=0, sticky="w", padx=8, pady=(0, 8))
+            _ghost_button(
+                btns, "ก๊อป",
+                command=lambda k=ent.key: self._copy_to_clipboard(k),
+            ).pack(side="left", padx=4)
+            if not ent.revoked:
+                _ghost_button(
+                    btns, "Mark revoked",
+                    command=lambda k=ent.key: self._on_revoke(k),
+                ).pack(side="left", padx=4)
+
+    # ── handlers ────────────────────────────────────────────────
+
+    def _on_issue(self) -> None:
+        from ..license_key import LicenseError, generate_key, verify_key
+
+        customer = self.var_customer.get().strip()
+        if not customer:
+            messagebox.showerror("ผิดพลาด", "กรุณากรอกชื่อลูกค้า")
+            return
+        if "|" in customer:
+            messagebox.showerror(
+                "ผิดพลาด", "ชื่อลูกค้าห้ามมีอักขระ '|'",
+            )
+            return
+        try:
+            devices = int(self.var_devices.get())
+            days = int(self.var_days.get())
+        except ValueError:
+            messagebox.showerror(
+                "ผิดพลาด", "จำนวนเครื่อง/อายุต้องเป็นตัวเลข",
+            )
+            return
+        if devices < 1 or devices > 100:
+            messagebox.showerror(
+                "ผิดพลาด", "จำนวนเครื่องต้องอยู่ระหว่าง 1–100",
+            )
+            return
+        if days < 1 or days > 3650:
+            messagebox.showerror(
+                "ผิดพลาด", "อายุต้องอยู่ระหว่าง 1–3650 วัน",
+            )
+            return
+
+        try:
+            key = generate_key(
+                customer=customer,
+                max_devices=devices,
+                days=days,
+            )
+            v = verify_key(key)  # round-trip sanity check
+        except LicenseError as e:
+            messagebox.showerror("ผิดพลาด", f"สร้างคีย์ไม่สำเร็จ: {e}")
+            return
+        except FileNotFoundError as e:
+            messagebox.showerror(
+                "ผิดพลาด",
+                f"private key ไม่พบ: {e}\n"
+                f"รัน 'python tools/init_keys.py' ก่อน",
+            )
+            return
+
+        # Persist to history first (we're append-only and fail-safe;
+        # losing a record while the customer already has the key
+        # would be worse than the user seeing the success dialog
+        # twice).
+        self.history.append(
+            customer=customer,
+            max_devices=devices,
+            expiry=v.expiry.isoformat(),
+            key=key,
+            note=self.var_note.get().strip(),
+        )
+        try:
+            self.history.save()
+        except OSError as e:
+            log.warning("history save failed: %s", e)
+
+        self._last_key = key
+        self._last_meta = (
+            f"ลูกค้า: {customer}  ·  "
+            f"{devices} เครื่อง  ·  หมดอายุ {v.expiry.isoformat()}  "
+            f"({v.days_left} วัน)"
+        )
+        self.lbl_result_meta.configure(text=self._last_meta)
+        self.lbl_result_key.configure(text=key)
+        self.result_card.grid()
+        # Auto-copy so the admin can paste straight into Line.
+        self._copy_to_clipboard(key)
+        log.info(
+            "issued license: customer=%r devices=%d days=%d expiry=%s",
+            customer, devices, days, v.expiry.isoformat(),
+        )
+
+    def _reset_form(self) -> None:
+        self.var_customer.set("")
+        self.var_devices.set(str(BRAND.default_devices_per_key))
+        self.var_days.set(str(BRAND.default_license_days))
+        self.var_note.set("")
+
+    def _copy_last_key(self) -> None:
+        if self._last_key:
+            self._copy_to_clipboard(self._last_key)
+
+    def _copy_line_message(self) -> None:
+        if not self._last_key:
+            return
+        msg = (
+            f"{BRAND.name} — License Key ของคุณ\n"
+            f"{self._last_meta}\n\n"
+            f"{self._last_key}\n\n"
+            f"วิธีใช้: เปิดโปรแกรม → กรอกคีย์ → กด 'เปิดใช้งาน'\n"
+            f"ติดต่อแอดมิน: Line {BRAND.line_oa}"
+        )
+        self._copy_to_clipboard(msg)
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        try:
+            self.app.clipboard_clear()
+            self.app.clipboard_append(text)
+            self.app.update_idletasks()
+        except Exception as e:
+            log.warning("clipboard copy failed: %s", e)
+            messagebox.showwarning("Clipboard",
+                                    f"ก๊อปไม่สำเร็จ: {e}")
+
+    def _on_revoke(self, key: str) -> None:
+        if not messagebox.askyesno(
+            "ยืนยัน",
+            "Mark คีย์นี้ว่าถูกเรียกคืน?\n"
+            "(เครื่องลูกค้ายังใช้คีย์ได้จนกว่าจะ rotate keypair — "
+            "นี่เป็นแค่ note ในระบบ)",
+        ):
+            return
+        if self.history.mark_revoked(key):
+            try:
+                self.history.save()
+            except OSError as e:
+                log.warning("history save failed: %s", e)
+            self.app.show_page(AdminPage)  # re-render

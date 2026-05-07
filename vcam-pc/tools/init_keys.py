@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Studio Pro — admin keypair initialiser (run ONCE).
+"""NP Create — admin keypair initialiser (run ONCE).
 
 Generates an Ed25519 keypair used for signing license keys::
 
@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     write_pubkey_module(pub)
 
     print()
-    print("  ╭─── Live Studio Pro — keypair initialised ────────────")
+    print("  ╭─── NP Create — keypair initialised ──────────────────")
     print(f"  │ Private : {PRIVATE_KEY_PATH.relative_to(PROJECT)}")
     print(f"  │           (HEX) {priv.hex()[:16]}…")
     print(f"  │ Public  : {PUBKEY_MODULE.relative_to(PROJECT)}")

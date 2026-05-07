@@ -45,19 +45,20 @@ def test_h264_baseline_for_compatibility() -> None:
 
 
 def test_rotation_appears_in_filter_chain() -> None:
+    # Default resolution is 720x1280 portrait (TikTok Live).
     cmd = _build(rotation="transpose=2,vflip")
     vf = cmd[cmd.index("-vf") + 1]
     assert vf.startswith("transpose=2,vflip,")
-    assert "scale=1280:720" in vf
+    assert "scale=720:1280" in vf
     assert "fps=30" in vf
-    assert "pad=1280:720" in vf
+    assert "pad=720:1280" in vf
 
 
 def test_rotation_none_omitted_from_filter_chain() -> None:
     cmd = _build(rotation="none")
     vf = cmd[cmd.index("-vf") + 1]
     assert not vf.startswith("transpose")
-    assert "scale=1280:720" in vf
+    assert "scale=720:1280" in vf
 
 
 def test_keyint_is_fps_times_seconds() -> None:

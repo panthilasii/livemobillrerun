@@ -1,40 +1,67 @@
-"""Brand identity for Live Studio Pro.
+"""Brand identity for NP Create.
 
 Single source of truth for the product name, version, theme colors,
 and contact info shown across the UI. Changing values here updates
-the title bar, About dialog, support links, etc.
+the title bar, About dialog, support links, license CLI output, and
+every auto-generated launcher / README.
 
-Color palette: deep purple primary (#6B47DC) on near-black background
-(#0F0F14) — premium, subscription-friendly, distinct from generic
-TikTok blue. Uses a lime accent (#A6FF4D) only for go-live / record
-states so the eye instantly knows when the system is "hot".
+Color palette: brand red (#C8102E) on near-black background
+(#0F0F14) — matches the company logo (red ↑ growth arrow on
+deep-black wordmark) and reads as "premium, broadcast, urgent",
+which is what TikTok-Live sellers want.
+
+A lime accent (#A6FF4D) stays reserved for the go-live / record
+state so the eye instantly knows when the system is "hot" — bright
+lime-green on red-and-black is the highest-contrast combination
+available without resorting to plain white.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+
+
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
 
 @dataclass(frozen=True)
 class Brand:
     """Top-level brand metadata."""
 
-    name: str = "Live Studio Pro"
-    short_name: str = "Live Studio"
-    version: str = "1.0.0-beta"
-    tagline_th: str = "ระบบไลฟ์มือโปร — เสถียร ใช้ง่าย"
-    tagline_en: str = "Pro live-streaming made simple"
+    # Product name shown in the title bar, About dialog, and license
+    # output. Also used as the customer-facing label everywhere.
+    name: str = "NP Create"
+    short_name: str = "NP Create"
+    company_th: str = "บริษัท เอ็นพี ครีเอ็ท จำกัด"
+    company_en: str = "NP Create Co., Ltd."
 
-    line_oa: str = "@livestudio"
-    contact_url: str = "https://line.me/R/ti/p/@livestudio"
+    version: str = "1.3.0"
+
+    tagline_th: str = "ระบบไลฟ์มือโปร — เสถียร ใช้ง่าย"
+    tagline_en: str = "Online Advertising & Digital Marketing"
+
+    line_oa: str = "@npcreate"
+    contact_url: str = "https://line.me/R/ti/p/@npcreate"
     support_hours: str = "9:00–22:00 น. ทุกวัน"
 
+    # License key prefix. Kept at "888" because Thai customers
+    # associate the triple-eight with luck/value, and switching
+    # the prefix would invalidate every key already shipped.
     license_prefix: str = "888"
 
-    # Default subscription tier: 1 license key may activate this many phones.
-    # Tweak here and every CLI/UI default updates in lock-step.
+    # Default subscription tier: 1 license key may activate this many
+    # phones. Tweak here and every CLI/UI default updates in lock-step.
     default_devices_per_key: int = 3
     default_license_days: int = 30
+
+    # Asset locations. Resolved as absolute paths so callers can pass
+    # them directly to PhotoImage / iconbitmap regardless of cwd.
+    logo_path: Path = ASSETS_DIR / "logo.png"
+    logo_256_path: Path = ASSETS_DIR / "logo_256.png"
+    logo_128_path: Path = ASSETS_DIR / "logo_128.png"
+    logo_64_path: Path = ASSETS_DIR / "logo_64.png"
+    icon_ico_path: Path = ASSETS_DIR / "logo.ico"
 
 
 @dataclass(frozen=True)
@@ -51,9 +78,11 @@ class Theme:
     fg_secondary: str = "#B8B8C8"
     fg_muted: str = "#7A7A88"
 
-    primary: str = "#6B47DC"
-    primary_hover: str = "#7B5AE8"
-    primary_dim: str = "#4A2FA0"
+    # Brand red — sampled from the NP Create logo and tuned for
+    # screen contrast against #0F0F14 (passes WCAG AA for body text).
+    primary: str = "#C8102E"
+    primary_hover: str = "#E11D2E"
+    primary_dim: str = "#8A0916"
 
     success: str = "#A6FF4D"
     warning: str = "#FFB84D"

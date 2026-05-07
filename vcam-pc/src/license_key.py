@@ -63,7 +63,7 @@ from .config import PROJECT_ROOT
 
 
 PRIVATE_KEY_PATH = PROJECT_ROOT / ".private_key"
-ACTIVATION_PATH = Path.home() / ".livestudio" / "activation.json"
+ACTIVATION_PATH = Path.home() / ".npcreate" / "activation.json"
 
 
 # ── key material ─────────────────────────────────────────────────

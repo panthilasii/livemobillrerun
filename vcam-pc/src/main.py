@@ -1,4 +1,4 @@
-"""Entry point for Live Studio Pro / vcam-pc.
+"""Entry point for NP Create / vcam-pc.
 
 Usage::
 
@@ -34,11 +34,11 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="livestudio")
+    p = argparse.ArgumentParser(prog="npcreate")
     p.add_argument(
         "--studio",
         action="store_true",
-        help="launch the Live Studio Pro customer UI (default)",
+        help="launch the NP Create customer UI (default)",
     )
     p.add_argument(
         "--legacy",

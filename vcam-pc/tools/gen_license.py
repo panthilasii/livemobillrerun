@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Studio Pro — admin license generator (Ed25519).
+"""NP Create — admin license generator (Ed25519).
 
 Usage::
 
@@ -139,15 +139,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print()
-    print(f"  ╭─── {BRAND.name} — License Key ───────────")
-    print(f"  │ ลูกค้า    : {v.customer}")
-    print(f"  │ จำนวน    : {v.max_devices} เครื่อง")
-    print(f"  │ หมดอายุ  : {v.expiry.isoformat()} ({v.days_left} วัน)")
-    print(f"  ├──────────────────────────────────────────")
+    print(f"  ╭─── {BRAND.name} — License Key ────────────────")
+    print(f"  │ ลูกค้า   : {v.customer}")
+    print(f"  │ จำนวน   : {v.max_devices} เครื่อง")
+    print(f"  │ หมดอายุ : {v.expiry.isoformat()} ({v.days_left} วัน)")
+    print(f"  ├────────────────────────────────────────────────")
     print(f"  │ {key}")
-    print(f"  ╰──────────────────────────────────────────")
+    print(f"  ╰────────────────────────────────────────────────")
     print()
-    print("  ก๊อปคีย์ส่งให้ลูกค้าใน Line ได้เลย")
+    print(f"  ก๊อปคีย์ส่งให้ลูกค้าใน Line ({BRAND.line_oa}) ได้เลย")
+    print(f"  หรือใช้หน้า '🔑 ออกคีย์ลูกค้า' ในตัวโปรแกรมก็ได้")
     print()
     return 0
 

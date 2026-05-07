@@ -11,7 +11,7 @@ ADB serial. We persist:
 * ``patched_at`` — when the user last ran "Patch & install TikTok"
 
 The whole library lives in a single JSON file at
-``~/.livestudio/devices.json`` so it follows the user across PC
+``~/.npcreate/devices.json`` so it follows the user across PC
 re-installs of the program but stays per-machine.
 
 Why a separate module from ``config.py``?
@@ -35,7 +35,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-LIBRARY_PATH = Path.home() / ".livestudio" / "devices.json"
+LIBRARY_PATH = Path.home() / ".npcreate" / "devices.json"
 
 
 @dataclass

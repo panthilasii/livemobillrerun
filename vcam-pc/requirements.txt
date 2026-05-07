@@ -1,4 +1,4 @@
-# Live Studio Pro — runtime dependencies
+# NP Create — runtime dependencies
 #
 # customtkinter  — modern dark-themed Tk wrapper for the Studio UI
 # Pillow         — image handling for previews + wizard illustrations
