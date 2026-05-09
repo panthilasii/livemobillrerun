@@ -263,9 +263,11 @@ def probe(
     #      vanilla TikTok cannot share LSPatch's keystore).
     #   b) Fingerprint prefix in our known-good list (covers
     #      legacy entries with no recorded baseline).
-    #   c) ``className`` in the manifest is the LSPatch loader
-    #      class (covers cases where signature parsing fails on
-    #      exotic ROMs but the manifest is still readable).
+    #   c) Manifest contains the LSPatch loader class /
+    #      ``appComponentFactory`` (covers cases where signature
+    #      parsing fails on exotic ROMs but the manifest is still
+    #      readable, AND covers LSPatch keystore rotations that
+    #      we haven't added prefixes for yet).
     #
     # Using OR semantics is intentional: each signal has a
     # different failure mode (regex parsing, OEM ROM quirks,
@@ -284,17 +286,25 @@ def probe(
                     patched = True
                     break
 
-    # Only trigger the className backup probe when fingerprint
-    # extraction returned NOTHING. If we successfully parsed a
-    # fingerprint and it just didn't match a known LSPatch prefix,
-    # that's a confident "unpatched" answer — running an extra
-    # adb roundtrip per probe would waste 200-400ms × N devices ×
-    # 8s tick, which adds up fast on a 5-phone install.
-    if not patched and not fingerprint:
+    # ALWAYS run the className backup probe when the signature
+    # signals come up empty. The previous "skip if any fingerprint
+    # was extracted" optimisation backfired on devices where the
+    # HyperOS / OneUI ``dumpsys`` output yields a hex string that
+    # happens to NOT match LSPatch's prefix (e.g. the regex caught
+    # an APK-ID instead of the cert digest). Those phones are
+    # genuinely patched but reported as "ยังไม่ Patch" because we
+    # short-circuited the only signal that could have caught them.
+    #
+    # Cost analysis: one extra ``adb shell dumpsys | grep`` per
+    # probe tick when not-patched. ~150 ms on USB / ~400 ms on
+    # WiFi. Acceptable because (a) we only run it on the SELECTED
+    # device, not every phone in the sidebar, and (b) it short-
+    # circuits the moment the customer's status flips to patched.
+    if not patched:
         rc2, app_out = _adb_shell(
             base,
             f"dumpsys package {chosen} | "
-            "grep -iE 'className=|application='",
+            "grep -iE 'className=|application=|appComponentFactory='",
             timeout=timeout,
         )
         if rc2 == 0 and app_out:
@@ -302,7 +312,28 @@ def probe(
             for cls_prefix in _LSPATCH_CLASS_PREFIXES:
                 if cls_prefix in lower:
                     patched = True
+                    log.info(
+                        "patched detected via className fallback "
+                        "(fingerprint=%r did not match any known "
+                        "LSPatch prefix; matched class prefix %r)",
+                        fingerprint[:16] or "(empty)", cls_prefix,
+                    )
                     break
+
+    # Diagnostic crumb: when the device LOOKS patched per className
+    # but the fingerprint we parsed isn't in our prefix list, that
+    # almost certainly means LSPatch's keystore has rotated and we
+    # need to add a new prefix to ``_KNOWN_LSPATCH_FINGERPRINT_PREFIXES``.
+    # Logging it here makes the next such rotation a 5-minute fix
+    # instead of a multi-day support thread.
+    if patched and fingerprint and not any(
+        fingerprint.startswith(p) for p in _KNOWN_LSPATCH_FINGERPRINT_PREFIXES
+    ):
+        log.warning(
+            "novel LSPatch-like fingerprint observed on %s pkg=%s: %s "
+            "(consider adding to _KNOWN_LSPATCH_FINGERPRINT_PREFIXES)",
+            serial or "(default)", chosen, fingerprint[:24],
+        )
 
     return HookStatus(
         installed=True,

@@ -59,14 +59,25 @@ from pathlib import Path
 
 from . import platform_tools
 from .config import PROJECT_ROOT, StreamConfig
+# Re-exported so the install pipeline and the live probe never
+# disagree about what counts as "TikTok". If you need to add a new
+# region/Lite/beta variant, edit ``hook_status.TIKTOK_PACKAGES`` and
+# both modules pick it up.
+from .hook_status import TIKTOK_PACKAGES
 
 log = logging.getLogger(__name__)
 
-# TikTok package candidates, in order of likelihood for our market.
-TIKTOK_PACKAGES = (
-    "com.ss.android.ugc.trill",     # TikTok International (TH/SEA)
-    "com.zhiliaoapp.musically",     # TikTok International (US/EU)
-    "com.ss.android.ugc.aweme",     # Douyin (CN) — unlikely but cheap to check
+# Patterns we use to *discover* TikTok-like packages that aren't in
+# the hard-coded list above. Some OEM stores, beta channels, and
+# regional builds ship under names like ``com.zhiliaoapp.musically.preload``
+# or ``com.tiktok.something`` — we'd rather find them than fail with
+# a misleading "no TikTok variant installed" message that pushes
+# the customer to uninstall+reinstall their working app.
+_TIKTOK_PKG_PATTERNS = re.compile(
+    r"^(?:com\.ss\.android\.ugc\.(?:trill|aweme|musically|tiktok)"
+    r"|com\.zhiliaoapp\.musically"
+    r"|com\.tiktok\.[\w.]+)"
+    r"(?:\.[\w]+)*$"
 )
 
 
@@ -112,6 +123,13 @@ class InstallResult:
     elapsed_s: float = 0.0
     error: str = ""
     fingerprint: str = ""
+    # When ``install-multiple`` of the patched bundle fails, the
+    # pipeline re-installs the original APKs to leave the device in
+    # a working state. These flags tell the GUI which message to
+    # show the customer.
+    rollback_attempted: bool = False
+    rollback_ok: bool = False
+    rollback_error: str = ""
 
 
 # ────────────────────────────────────────────────────────────
@@ -202,9 +220,40 @@ class LSPatchPipeline:
     # ──────────────────────────────
 
     def detect_tiktok(self, serial: str | None = None) -> str:
-        """Return the installed TikTok variant package name, or ''."""
+        """Return the installed TikTok variant package name, or ''.
+
+        Detection runs in two passes:
+
+        1. Fast path — exact match against the canonical
+           ``TIKTOK_PACKAGES`` list. ~99% of customers hit this.
+
+        2. Discovery path — list every installed package and match
+           against a pattern that covers regional/beta/OEM-store
+           variants we don't have hardcoded (e.g. preload SKUs that
+           come with some Xiaomi ROMs). This prevents the patch
+           pipeline from telling a customer "no TikTok variant
+           installed" when their TikTok is actually right there
+           under an unfamiliar package name.
+        """
         for pkg in TIKTOK_PACKAGES:
             if self._pkg_installed(pkg, serial):
+                return pkg
+
+        # Discovery path: scan installed packages for anything that
+        # *looks* like TikTok. ``pm list packages`` is much cheaper
+        # than calling ``pm path`` per candidate, and gives us the
+        # full inventory in one round-trip.
+        listing = self._adb_shell("pm list packages", serial)
+        for line in listing.splitlines():
+            line = line.strip()
+            if not line.startswith("package:"):
+                continue
+            pkg = line[len("package:"):].strip()
+            if _TIKTOK_PKG_PATTERNS.match(pkg):
+                log.info(
+                    "detect_tiktok: discovered non-canonical TikTok "
+                    "package %r on %s", pkg, serial or "default",
+                )
                 return pkg
         return ""
 
@@ -464,12 +513,26 @@ class LSPatchPipeline:
         patched_apks: list[Path],
         serial: str | None = None,
         uninstall_first: bool = True,
+        original_apks: list[Path] | None = None,
     ) -> InstallResult:
         """Uninstall the original, then `adb install-multiple` the patched bundle.
 
         IMPORTANT: this will log the user out of TikTok (different
         signing key → different sandbox). Always confirm with the user
         before calling.
+
+        Rollback safety
+        ---------------
+        If the patched ``install-multiple`` fails *after* we've already
+        uninstalled the original, the customer's phone is left without
+        TikTok entirely — a state that's both confusing and
+        irrecoverable from inside our app (Play Store sign-in, OTP,
+        etc. are all out-of-band). To prevent this, callers can pass
+        ``original_apks=`` (the same list ``pull_tiktok`` returned).
+        On failure we then re-install those originals so the customer's
+        phone is back to its pre-Patch state, and the GUI can show a
+        "rolled back, please retry" message instead of "TikTok is
+        gone, sorry".
         """
         adb = self.cfg.adb_path
         if not patched_apks:
@@ -496,13 +559,23 @@ class LSPatchPipeline:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=600, check=False)
         except subprocess.TimeoutExpired:
-            return InstallResult(False, elapsed_s=time.monotonic() - t0,
-                                 error="install-multiple timed out")
+            return self._rollback_install(
+                package=package,
+                original_apks=original_apks,
+                serial=serial,
+                t0=t0,
+                error="install-multiple timed out",
+            )
         elapsed = time.monotonic() - t0
         if r.returncode != 0 or "Success" not in (r.stdout or ""):
             tail = (r.stderr or r.stdout or "").strip().splitlines()[-5:]
-            return InstallResult(False, elapsed_s=elapsed,
-                                 error="\n".join(tail))
+            return self._rollback_install(
+                package=package,
+                original_apks=original_apks,
+                serial=serial,
+                t0=t0,
+                error="\n".join(tail),
+            )
 
         # Step 3: read back the new signature so we can show "patched"
         # in the GUI as confirmation. Uses the shared multi-pattern
@@ -519,6 +592,96 @@ class LSPatchPipeline:
         fp = _hs._extract_fingerprint(sig or "")
 
         return InstallResult(ok=True, elapsed_s=elapsed, fingerprint=fp)
+
+    def _rollback_install(
+        self,
+        *,
+        package: str,
+        original_apks: list[Path] | None,
+        serial: str | None,
+        t0: float,
+        error: str,
+    ) -> InstallResult:
+        """Try to re-install the original APKs after a failed patch install.
+
+        Returns an ``InstallResult(ok=False, ...)`` describing both the
+        primary failure and whether the rollback succeeded. The GUI
+        uses ``rollback_ok`` to show the customer either:
+
+        * "Patch failed but TikTok เดิมยังอยู่ — ลองใหม่ได้เลย" (rolled back)
+        * "Patch failed — TikTok หายไปจากเครื่อง โปรดลง TikTok ใหม่
+          จาก Play Store" (rollback skipped or failed)
+        """
+        elapsed = time.monotonic() - t0
+
+        # No originals to roll back to: bail with the primary error.
+        if not original_apks:
+            return InstallResult(
+                ok=False,
+                elapsed_s=elapsed,
+                error=error,
+                rollback_attempted=False,
+            )
+
+        # Some pulls dump APKs into ``self.pulled_dir`` which we wipe
+        # at the start of every pull. If the files have been deleted
+        # since (e.g. another pull happened in parallel), we can't
+        # roll back even though the caller passed the list.
+        existing = [p for p in original_apks if p.exists()]
+        if not existing:
+            log.warning(
+                "rollback skipped: pulled APKs missing on disk "
+                "(%d expected)", len(original_apks),
+            )
+            return InstallResult(
+                ok=False,
+                elapsed_s=elapsed,
+                error=error,
+                rollback_attempted=False,
+            )
+
+        adb = self.cfg.adb_path
+        cmd = [adb]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += ["install-multiple", "-r", *[str(p) for p in existing]]
+
+        log.warning(
+            "patch install failed (%s); attempting rollback of %d APKs",
+            error.splitlines()[0] if error else "unknown", len(existing),
+        )
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=600, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return InstallResult(
+                ok=False,
+                elapsed_s=time.monotonic() - t0,
+                error=error,
+                rollback_attempted=True,
+                rollback_ok=False,
+                rollback_error="rollback install-multiple timed out",
+            )
+
+        ok = r.returncode == 0 and "Success" in (r.stdout or "")
+        rb_err = ""
+        if not ok:
+            tail = (r.stderr or r.stdout or "").strip().splitlines()[-5:]
+            rb_err = "\n".join(tail) or "rollback failed (unknown)"
+            log.error("rollback failed: %s", rb_err)
+        else:
+            log.info("rollback succeeded — original TikTok restored")
+
+        return InstallResult(
+            ok=False,
+            elapsed_s=time.monotonic() - t0,
+            error=error,
+            rollback_attempted=True,
+            rollback_ok=ok,
+            rollback_error=rb_err,
+        )
 
     # ──────────────────────────────
     #  status

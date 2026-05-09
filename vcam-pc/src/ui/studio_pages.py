@@ -27,6 +27,7 @@ Conventions
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 import time
 import webbrowser
@@ -1826,8 +1827,18 @@ class DashboardPage(ctk.CTkFrame):
                 return
             pull = ls.pull_tiktok(serial=serial)
             if not pull.ok:
-                self.after(0, lambda: messagebox.showerror(
-                    "Re-Patch ล้มเหลว", f"pull: {pull.error}",
+                err_lower = (pull.error or "").lower()
+                if "no tiktok variant" in err_lower:
+                    err_msg = (
+                        "ไม่พบ TikTok ในเครื่อง\n\n"
+                        "TikTok อาจถูกถอนระหว่าง patch ครั้งก่อน "
+                        "กรุณาลง TikTok ใหม่จาก Play Store แล้ว "
+                        "ลอง Re-Patch อีกครั้ง"
+                    )
+                else:
+                    err_msg = f"pull: {pull.error}"
+                self.after(0, lambda m=err_msg: messagebox.showerror(
+                    "Re-Patch ล้มเหลว", m,
                 ))
                 return
             patched_version = pull.version_name or ""
@@ -1841,10 +1852,33 @@ class DashboardPage(ctk.CTkFrame):
                 package=pull.package,
                 patched_apks=patched.patched_apks,
                 serial=serial,
+                # Roll back to the pulled originals if the install
+                # bombs after we've already uninstalled the previous
+                # patched build — same safety net as the main Patch
+                # button.
+                original_apks=pull.apks,
             )
             if not inst.ok:
-                self.after(0, lambda: messagebox.showerror(
-                    "Re-Patch ล้มเหลว", f"install: {inst.error}",
+                if inst.rollback_attempted and inst.rollback_ok:
+                    err_msg = (
+                        f"install: {inst.error}\n\n"
+                        "✓ กู้ TikTok เดิมกลับเรียบร้อยแล้ว — "
+                        "ลอง Re-Patch อีกครั้งได้"
+                    )
+                elif inst.rollback_attempted:
+                    err_msg = (
+                        f"install: {inst.error}\n\n"
+                        f"⚠️  กู้ TikTok ไม่สำเร็จ: {inst.rollback_error}\n"
+                        "กรุณาลง TikTok ใหม่จาก Play Store"
+                    )
+                else:
+                    err_msg = (
+                        f"install: {inst.error}\n\n"
+                        "⚠️  TikTok เดิมอาจหายจากเครื่อง — "
+                        "กรุณาลงใหม่จาก Play Store"
+                    )
+                self.after(0, lambda m=err_msg: messagebox.showerror(
+                    "Re-Patch ล้มเหลว", m,
                 ))
                 return
             patched_signature = (inst.fingerprint or "").lower()
@@ -1891,140 +1925,101 @@ class DashboardPage(ctk.CTkFrame):
     # ── live control card ────────────────────────────────────────
 
     def _build_live_control_card(self, parent: ctk.CTkFrame) -> None:
-        """Daily-driver "🔴 เริ่มไลฟ์ / ⏹ จบไลฟ์" toggle.
+        """Mirror-control card — the customer's daily-driver tool.
+
+        History
+        -------
+        Earlier versions of this card surfaced a "🔴 เริ่มไลฟ์"
+        toggle that drove TikTok's Go-Live flow over uiautomator.
+        We pulled it out in v1.7.7 because it created more support
+        tickets than it saved time:
+
+        * The auto-control flow gave up at the first un-keyworded
+          button (e.g. "Go Live" with no accessibility label, or
+          the Korean-region's extra confirmation dialog) — so
+          customers tapped it and saw "ระบบกดให้ไม่สำเร็จ", which
+          felt broken even though they could finish the broadcast
+          manually.
+        * Customers regularly hit the big red button by accident,
+          shipping a half-prepared live to their followers.
+        * The cumulative "ไลฟ์รวม" stat and "จับเวลาเอง" link
+          encouraged "let me click to see what happens" exploration
+          that didn't help anyone.
+
+        Mirror, on the other hand, is unambiguously useful:
+
+        * Lets the customer drive the broadcast end-to-end from PC
+          (mouse + keyboard) without picking up the phone — the
+          ergonomic backbone of "วางมือถือไว้เฉยๆ ใช้คอมทำงาน".
+        * Phone OLED stays dark via scrcpy's ``--turn-screen-off``,
+          which saves battery across multi-hour streams.
+        * Works for offline preparation too — read comments, scroll
+          products, even before going live.
+
+        The live-tracking module (``live_control``,
+        ``DeviceEntry.live_started_at``) still exists for future
+        integration with the admin dashboard's session-time
+        analytics, but no UI surface in this app triggers it
+        right now.
 
         Layout
         ------
-
-        * Title row: emoji + "ควบคุมไลฟ์".
-        * Status line: "พร้อมไลฟ์" / "ไลฟ์อยู่ — 00:25:43" /
-          "กำลังเริ่ม...".
-        * Action row: a single big toggle button (text + colour
-          flip when state changes) + a smaller cumulative-stats
-          line ("ไลฟ์รวมทั้งหมด: 12:34 ชม.").
-
-        State source of truth is ``DeviceEntry.live_started_at``,
-        a string ISO timestamp persisted in ``customer_devices.json``.
-        We DON'T cache duration in the widget -- a 1 s tick re-reads
-        from the entry so closing+reopening the app still surfaces
-        the correct elapsed minutes for any ongoing broadcast.
+        Row 0 — Title (🪞  Mirror หน้าจอเครื่อง)
+        Row 1 — Status line (พร้อมใช้งาน / Mirror เปิดอยู่ Nm /
+                 เครื่อง offline / scrcpy ยังไม่ติดตั้ง)
+        Row 2 — Big primary toggle button
+        Row 3 — Hint label
+        Row 4 — Power-user shortcuts tip
         """
         title_row = ctk.CTkFrame(parent, fg_color="transparent")
         title_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 4))
         title_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            title_row, text="🎬  ควบคุมไลฟ์",
+            title_row, text="🪞  Mirror หน้าจอเครื่อง",
             text_color=THEME.fg_primary,
             font=ctk.CTkFont(size=14, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
 
-        # Lifetime accumulated minutes -- shown as a soft hint at
-        # the right of the title row. Cosmetic; nice for "how
-        # productive was each phone this month" comparisons.
-        self.lbl_live_total = ctk.CTkLabel(
-            title_row, text="",
-            text_color=THEME.fg_muted,
-            font=ctk.CTkFont(size=11),
-        )
-        self.lbl_live_total.grid(row=0, column=1, sticky="e")
-
-        # Big status / timer label -- this is the line the customer
-        # glances at to know whether the phone is broadcasting.
-        # We change colour from neutral to red when live.
-        self.lbl_live_status = ctk.CTkLabel(
+        # Status line — driven entirely by ``_render_mirror_state``.
+        # Default text below is what the customer sees in the brief
+        # window between widget construction and the first 1 s
+        # tick (so the card never flashes a blank line).
+        self.lbl_mirror_status = ctk.CTkLabel(
             parent,
-            text="พร้อมไลฟ์",
+            text="พร้อมใช้งาน",
             text_color=THEME.fg_secondary,
             font=ctk.CTkFont(size=13),
             anchor="w",
         )
-        self.lbl_live_status.grid(
+        self.lbl_mirror_status.grid(
             row=1, column=0, sticky="w", padx=20, pady=(0, 8),
         )
 
-        # Toggle button. Text + fg_color flip in
-        # ``_render_live_control_state``.
-        self.btn_live_toggle = ctk.CTkButton(
+        # Big primary mirror button. Bumped from the previous
+        # 34 px secondary style (when it sat under the live
+        # button) to 48 px now that it's the card's main action.
+        # ``btn_live_mirror`` keeps its historical name so
+        # ``_render_mirror_state`` and the scrcpy_mirror
+        # subscribe-callback don't need touching.
+        self.btn_live_mirror = ctk.CTkButton(
             parent,
-            text="🔴  เริ่มไลฟ์",
+            text="🪞  เปิด Mirror",
             fg_color=THEME.primary,
             hover_color=THEME.primary_hover,
             text_color="white",
             corner_radius=8,
-            height=44,
+            height=48,
             font=ctk.CTkFont(size=14, weight="bold"),
-            command=self._on_toggle_live,
-        )
-        self.btn_live_toggle.grid(
-            row=2, column=0, sticky="ew", padx=20, pady=(0, 4),
-        )
-
-        # Smaller hint line beneath the button -- explains what
-        # the toggle is going to do RIGHT NOW so customers don't
-        # accidentally end a live by mistake.
-        self.lbl_live_hint = ctk.CTkLabel(
-            parent, text="กดเพื่อเริ่ม Live → Screen Share อัตโนมัติ",
-            text_color=THEME.fg_muted,
-            font=ctk.CTkFont(size=11),
-            anchor="w",
-        )
-        self.lbl_live_hint.grid(
-            row=3, column=0, sticky="w", padx=20, pady=(0, 4),
-        )
-
-        # Manual timer link. Hidden when a live is already running.
-        # The fallback path is for customers whose TikTok build
-        # doesn't expose its "Go Live" button to the accessibility
-        # tree (a few Aweme variants and the Korean-region build):
-        # they tap the last button on the phone themselves, then
-        # press THIS link to start the PC-side timer. Cheaper than
-        # adding 50 more keyword variants every TikTok release.
-        self.btn_live_manual = ctk.CTkButton(
-            parent,
-            text="▶  จับเวลาเอง (ฉันกดไลฟ์เองบนเครื่อง)",
-            fg_color="transparent",
-            hover_color=THEME.bg_hover,
-            text_color=THEME.fg_secondary,
-            border_color=THEME.border,
-            border_width=1,
-            corner_radius=6,
-            height=30,
-            font=ctk.CTkFont(size=11),
-            command=self._on_manual_timer_toggle,
-        )
-        self.btn_live_manual.grid(
-            row=4, column=0, sticky="ew", padx=20, pady=(0, 4),
-        )
-
-        # ── Mirror หน้าจอเครื่อง ──
-        # Streams the phone display into a separate window via
-        # scrcpy; the customer can drive TikTok with mouse +
-        # keyboard from the PC while the phone lies face-down on
-        # the desk. This is the ergonomic backbone for "วางมือถือ
-        # ไว้เฉยๆ ใช้คอมทำงาน" — without it the customer has to
-        # pick up the phone every time they want to scroll comments
-        # or fix a typo in the live title.
-        self.btn_live_mirror = ctk.CTkButton(
-            parent,
-            text="🪞  Mirror หน้าจอเครื่อง (คุมผ่าน PC)",
-            fg_color="transparent",
-            hover_color=THEME.bg_hover,
-            text_color=THEME.fg_secondary,
-            border_color=THEME.border,
-            border_width=1,
-            corner_radius=6,
-            height=34,
-            font=ctk.CTkFont(size=12, weight="bold"),
             command=self._on_mirror_toggle,
         )
         self.btn_live_mirror.grid(
-            row=5, column=0, sticky="ew", padx=20, pady=(4, 4),
+            row=2, column=0, sticky="ew", padx=20, pady=(0, 6),
         )
 
-        # Hint line — explains what mirror does AND, if scrcpy is
-        # missing, points at the install page so the customer
-        # isn't stranded wondering why the button "doesn't work".
+        # Hint line — what the button is going to do right now.
+        # ``_render_mirror_state`` rewrites this for the offline
+        # / scrcpy-missing / mirroring states.
         self.lbl_mirror_hint = ctk.CTkLabel(
             parent,
             text="วางโทรศัพท์เฉยๆ • ใช้เมาส์/คีย์บอร์ดควบคุมจาก PC ได้เลย",
@@ -2035,30 +2030,54 @@ class DashboardPage(ctk.CTkFrame):
             wraplength=520,
         )
         self.lbl_mirror_hint.grid(
-            row=6, column=0, sticky="w", padx=20, pady=(0, 16),
+            row=3, column=0, sticky="w", padx=20, pady=(0, 6),
         )
+
+        # Power-user shortcut tip. Surfaced inline so customers
+        # discover scrcpy's killer features without reading a
+        # manual. The list is short on purpose — three items max
+        # is the useful-vs-noise threshold based on the help-desk
+        # tickets we get ("how do I send a video to the phone?"
+        # is by far the most common, hence drag-and-drop first).
+        ctk.CTkLabel(
+            parent,
+            text=(
+                "💡  ลากไฟล์เข้าหน้าต่าง = ส่งไฟล์เข้ามือถือ  •  "
+                "Ctrl+Shift+P = ปิด/เปิดจอมือถือ  •  "
+                "Ctrl+Home = ปลุกหน้าจอ"
+            ),
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=10),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 16))
 
         # Subscribe to scrcpy session lifecycle so closing the
         # mirror window externally re-renders the button label.
-        # Tk callbacks must marshal back to the main thread.
+        # Tk callbacks fire on the reaper thread; marshal back
+        # via ``after(0, ...)`` so widget updates land on the
+        # main thread.
         from .. import scrcpy_mirror as _scm
         def _mirror_changed(_adb_id: str) -> None:
             try:
-                self.after(0, self._render_live_control_state)
+                self.after(0, self._render_mirror_state)
             except Exception:
                 log.debug("mirror change after() failed", exc_info=True)
         _scm.subscribe(_mirror_changed)
 
-        # In-flight guard. Prevents the customer from double-
-        # clicking start/stop while the previous tap is still
-        # being driven through TikTok via uiautomator.
+        # Legacy in-flight guard. The Mirror toggle does its own
+        # disable-during-spawn dance (see _on_mirror_toggle), but
+        # leaving the attribute alive keeps any background helpers
+        # that still reference it (admin dashboard analytics path)
+        # from raising AttributeError on older builds.
         self._live_action_inflight = False
 
-        # Kick off the per-second timer that re-renders the elapsed
-        # display + sync any state changes from the device library
-        # (e.g. another tab updated us). The poll is cheap (in-
-        # memory dict lookup) so we just always run while the
-        # dashboard is mounted.
+        # Kick off the per-second tick. Mirror state is event-
+        # driven via the subscribe callback above for the common
+        # case (window opened/closed) — the tick exists to keep
+        # the elapsed-minutes counter in the status line
+        # incrementing while a session is alive.
         self._schedule_live_tick()
 
     def _schedule_live_tick(self) -> None:
@@ -2077,383 +2096,57 @@ class DashboardPage(ctk.CTkFrame):
             self._live_tick_handle = None
 
     def _render_live_control_state(self) -> None:
-        """Sync widget appearance to the selected device's
-        ``DeviceEntry.live_started_at``. Called every second from
-        the tick + on demand after toggle clicks."""
-        if not hasattr(self, "btn_live_toggle"):
-            return
+        """Backwards-compatible alias for ``_render_mirror_state``.
 
-        from .. import live_control
+        The live-control card is now Mirror-only (see
+        ``_build_live_control_card``). This wrapper still exists
+        because:
 
-        # Refresh the Mirror sub-widget regardless of the live state
-        # below — Mirror is independent of broadcast state (you can
-        # mirror an offline phone too, as long as ADB sees it).
+        * The 1 s tick (``_schedule_live_tick``) calls it, and we
+          don't want to rename the tick infra in a UI-only patch.
+        * A handful of background paths (e.g. the post-patch
+          dialog handlers in ``studio_app``) call it after device
+          state changes to force an immediate refresh.
+
+        Once the live-control codepaths are confirmed dead, the
+        whole pair can be renamed in a follow-up cleanup PR.
+        """
         self._render_mirror_state()
 
-        e = self.app.selected_entry()
-        if e is None:
-            self.lbl_live_status.configure(
-                text="(เลือกเครื่องก่อน)",
-                text_color=THEME.fg_muted,
-            )
-            self.btn_live_toggle.configure(
-                state="disabled",
-                text="🔴  เริ่มไลฟ์",
-                fg_color=THEME.primary,
-            )
-            self.lbl_live_total.configure(text="")
-            return
-
-        # Cumulative stat -- always show, regardless of state.
-        total_h = e.total_live_seconds // 3600
-        total_m = (e.total_live_seconds % 3600) // 60
-        if e.total_live_seconds > 0:
-            self.lbl_live_total.configure(
-                text=f"ไลฟ์รวม: {total_h:d}:{total_m:02d} ชม.",
-            )
-        else:
-            self.lbl_live_total.configure(text="")
-
-        # Decide what state we're in.
-        is_online = self.app.is_online(e.serial)
-
-        if e.is_live():
-            elapsed = e.live_elapsed_seconds()
-            self.lbl_live_status.configure(
-                text=f"🔴 ไลฟ์อยู่ — {live_control.format_elapsed(elapsed)}",
-                text_color=THEME.danger,
-            )
-            self.btn_live_toggle.configure(
-                state=("normal" if not self._live_action_inflight else "disabled"),
-                text="⏹  จบไลฟ์",
-                fg_color="#3A0408",  # darker red so it reads as "active state, click to end"
-                hover_color=THEME.primary_dim,
-            )
-            self.lbl_live_hint.configure(
-                text="กดเพื่อจบไลฟ์ + บันทึกระยะเวลา",
-            )
-            # While we're tracking a live, the manual button becomes
-            # an "emergency stop the timer" — handy if the customer
-            # finished the broadcast on the phone and the auto-stop
-            # path can't find the End-confirmation dialog.
-            if hasattr(self, "btn_live_manual"):
-                self.btn_live_manual.configure(
-                    text="⏸  หยุดจับเวลาเอง (จบไลฟ์บนเครื่องเอง)",
-                    state=("normal" if not self._live_action_inflight else "disabled"),
-                )
-        else:
-            self.lbl_live_status.configure(
-                text="พร้อมไลฟ์" if is_online else "เครื่อง offline — เชื่อมต่อก่อน",
-                text_color=THEME.fg_secondary if is_online else THEME.fg_muted,
-            )
-            self.btn_live_toggle.configure(
-                state=("normal" if (is_online and not self._live_action_inflight) else "disabled"),
-                text="🔴  เริ่มไลฟ์",
-                fg_color=THEME.primary,
-                hover_color=THEME.primary_hover,
-            )
-            self.lbl_live_hint.configure(
-                text="กดเพื่อเริ่ม Live → Screen Share อัตโนมัติ",
-            )
-            if hasattr(self, "btn_live_manual"):
-                self.btn_live_manual.configure(
-                    text="▶  จับเวลาเอง (ฉันกดไลฟ์เองบนเครื่อง)",
-                    state=("normal" if (is_online and not self._live_action_inflight) else "disabled"),
-                )
-
-    def _on_toggle_live(self) -> None:
-        e = self.app.selected_entry()
-        if e is None or self._live_action_inflight:
-            return
-
-        if e.is_live():
-            self._on_stop_live(e)
-        else:
-            # Real-time refresh closes the "just plugged in, clicked
-            # within 2s" race against the background poller cadence.
-            self.app.refresh_devices_now()
-            if not self.app.is_online(e.serial):
-                messagebox.showwarning(
-                    "เครื่อง offline",
-                    "เสียบ USB หรือเชื่อม WiFi แล้วลองใหม่",
-                )
-                return
-            # Confirm BEFORE actually starting -- "เริ่มไลฟ์" is
-            # not idempotent (it broadcasts to the customer's
-            # follower base). Better one extra click than an
-            # accidental live.
-            if not messagebox.askyesno(
-                "ยืนยันเริ่มไลฟ์",
-                (
-                    f"เริ่มไลฟ์บนเครื่อง {e.display_name()}?\n\n"
-                    "ระบบจะ:\n"
-                    "  1. เปิด TikTok\n"
-                    "  2. ไปแท็บ Live\n"
-                    "  3. กด Go Live\n"
-                    "  4. เลือก Screen Share\n"
-                    "  5. กด Start Now\n\n"
-                    "(ใช้เวลาประมาณ 15-30 วินาที)"
-                ),
-            ):
-                return
-            self._on_start_live(e)
-
-    def _on_start_live(self, entry) -> None:
-        self._live_action_inflight = True
-        self.btn_live_toggle.configure(
-            state="disabled", text="กำลังเริ่ม Live...",
-        )
-        self.lbl_live_status.configure(
-            text="กำลังกด Live → Screen Share → Start...",
-            text_color=THEME.warning,
-        )
-
-        def _worker():
-            from .. import live_control
-            adb_id = self.app.adb_id_for(entry)
-
-            # Forward live progress messages from the controller to
-            # ``lbl_live_status`` so the customer sees ‘→ tapped Live
-            # tab’ etc. while the (~20 s) flow runs, instead of
-            # staring at a static ‘กำลังกด...’ for half a minute and
-            # assuming the app froze. Tk widgets are not thread-safe,
-            # so we hop back onto the UI thread via ``self.after``.
-            def _progress(msg: str) -> None:
-                # Only surface the human-readable lines (lines that
-                # start with → or ✗). The "couldn't dump UI (try N)"
-                # internal retries are noise to a customer.
-                stripped = msg.strip()
-                if not (stripped.startswith("→") or stripped.startswith("✗")):
-                    return
-
-                def _apply():
-                    if not hasattr(self, "lbl_live_status"):
-                        return
-                    self.lbl_live_status.configure(
-                        text=stripped, text_color=THEME.warning,
-                    )
-
-                try:
-                    self.after(0, _apply)
-                except Exception:
-                    log.debug("live progress after() failed", exc_info=True)
-
-            try:
-                result = live_control.start_live(
-                    self.app.cfg.adb_path,
-                    adb_id,
-                    log_cb=_progress,
-                )
-            except Exception as exc:
-                log.exception("start_live crashed")
-                result = live_control.StartLiveResult(
-                    ok=False, summary=f"crash: {exc}",
-                )
-
-            def _ui():
-                self._live_action_inflight = False
-                if result.ok:
-                    # Record start in the library AFTER ADB
-                    # confirmed Start Now was tapped. Persisting
-                    # earlier and then bailing on a TikTok-side
-                    # error would leave the customer with a fake
-                    # timer ticking against nothing.
-                    self.app.devices_lib.start_live(entry.serial)
-                    self.app.save_devices()
-                    self.lbl_live_status.configure(
-                        text="🔴 ไลฟ์อยู่ — 00:00",
-                        text_color=THEME.danger,
-                    )
-                else:
-                    # Auto-control couldn't finish the flow (most
-                    # commonly: "Go Live" button labelled in a way
-                    # we don't have a keyword for, OR TikTok showed
-                    # a permission dialog we didn't anticipate).
-                    # The customer often finishes the last 1-2 taps
-                    # manually on the phone — at that point they
-                    # ARE live but the PC wouldn't know unless we
-                    # ask. Offer to start the timer anyway so they
-                    # don't lose tracking of the session.
-                    self.lbl_live_status.configure(
-                        text=result.summary, text_color=THEME.danger,
-                    )
-                    if self._offer_manual_live_start(entry, result):
-                        self.app.devices_lib.start_live(entry.serial)
-                        self.app.save_devices()
-                        self.lbl_live_status.configure(
-                            text="🔴 ไลฟ์อยู่ — 00:00 (เริ่มเอง)",
-                            text_color=THEME.danger,
-                        )
-                self._render_live_control_state()
-                # Notify sidebar dot to refresh.
-                self._refresh_sidebar()
-
-            self.after(0, _ui)
-
-        threading.Thread(
-            target=_worker, name="np-live-start", daemon=True,
-        ).start()
-
-    def _on_stop_live(self, entry) -> None:
-        self._live_action_inflight = True
-        self.btn_live_toggle.configure(
-            state="disabled", text="กำลังจบไลฟ์...",
-        )
-
-        def _worker():
-            from .. import live_control
-            adb_id = self.app.adb_id_for(entry)
-            pkg = (
-                entry.tiktok_package
-                or "com.ss.android.ugc.trill"
-            )
-            try:
-                result = live_control.stop_live(
-                    self.app.cfg.adb_path, adb_id, pkg,
-                )
-            except Exception as exc:
-                log.exception("stop_live crashed")
-                result = live_control.StopLiveResult(
-                    ok=False, strategy="best_effort",
-                    summary=f"crash: {exc}",
-                )
-
-            def _ui():
-                self._live_action_inflight = False
-                # Always mark live=False locally even if ADB
-                # didn't confirm: a stuck phone shouldn't pin our
-                # timer at "ไลฟ์อยู่" forever. The customer can
-                # always manually finish in TikTok itself.
-                duration = self.app.devices_lib.stop_live(entry.serial)
-                self.app.save_devices()
-                if result.ok:
-                    self.lbl_live_status.configure(
-                        text=(
-                            f"✅ จบไลฟ์ ({live_control.format_elapsed(duration)})"
-                            + (
-                                "  ⚠️ Force-stop"
-                                if result.strategy == "force_stop"
-                                else ""
-                            )
-                        ),
-                        text_color=THEME.success,
-                    )
-                else:
-                    self.lbl_live_status.configure(
-                        text=result.summary, text_color=THEME.danger,
-                    )
-                self._render_live_control_state()
-                self._refresh_sidebar()
-
-            self.after(0, _ui)
-
-        threading.Thread(
-            target=_worker, name="np-live-stop", daemon=True,
-        ).start()
-
-    # ── manual fallback: timer-only mode ─────────────────────────
-
-    def _offer_manual_live_start(self, entry, result) -> bool:
-        """Pop a recovery dialog after the auto-control flow failed.
-
-        Why this exists
-        ---------------
-
-        The TikTok auto-control gives up at the FIRST step it can't
-        execute — usually "Go Live" because the button has no
-        accessibility label, or the customer's region has the
-        broadcast confirmation behind an extra dialog we don't
-        recognise. In every customer report so far, the customer
-        finished the last 1-2 taps manually on the phone and IS now
-        broadcasting; they just want the PC-side timer to start.
-
-        Returning True means: yes, the customer says they're
-        live; please record ``start_live`` so the dashboard timer
-        ticks. Returning False means: cancel — they want to retry
-        or give up. We let the caller persist the device library
-        because that side already has the lock and ``save_devices``
-        plumbing.
-        """
-        # Trim the (sometimes-very-long) controller summary so the
-        # message body stays readable on small laptop screens.
-        reason = (result.summary or "").strip()
-        if len(reason) > 140:
-            reason = reason[:140].rstrip() + "…"
-
-        prompt = (
-            f"ระบบกดให้ไม่สำเร็จ:\n\n{reason}\n\n"
-            "ถ้าตอนนี้คุณกดไลฟ์เองบนเครื่อง "
-            f"{entry.display_name()} แล้ว — กด Yes\n"
-            "เพื่อเริ่มจับเวลาบน PC\n\n"
-            "(ถ้ายังไม่ได้เริ่มไลฟ์ ให้กด No)"
-        )
-        try:
-            return bool(messagebox.askyesno("ไลฟ์เริ่มแล้วใช่ไหม?", prompt))
-        except Exception:
-            log.exception("manual-live-start dialog failed")
-            return False
-
-    def _on_manual_timer_toggle(self) -> None:
-        """Standalone "▶ จับเวลาเอง / ⏸ หยุดจับเวลา" button.
-
-        Doesn't talk to TikTok at all — it just flips the device
-        library's ``live_started_at``. Used when the customer
-        prefers to drive TikTok by hand and only wants the PC for
-        time tracking. The button text reflects current state via
-        ``_render_live_control_state``."""
-        e = self.app.selected_entry()
-        if e is None or self._live_action_inflight:
-            return
-
-        from .. import live_control
-
-        if e.is_live():
-            # Stopping the manual timer doesn't try to ADB-stop
-            # TikTok; the customer is driving the broadcast end on
-            # the phone themselves.
-            duration = self.app.devices_lib.stop_live(e.serial)
-            self.app.save_devices()
-            self.lbl_live_status.configure(
-                text=(
-                    f"⏸ หยุดจับเวลา "
-                    f"({live_control.format_elapsed(duration)})"
-                ),
-                text_color=THEME.success,
-            )
-            self._render_live_control_state()
-            self._refresh_sidebar()
-            return
-
-        # Start manual timer. We still confirm because starting a
-        # session is "you have one minute of accountability now"
-        # and doing it accidentally screws up the cumulative stat.
-        if not messagebox.askyesno(
-            "เริ่มจับเวลาเอง",
-            (
-                f"เริ่มจับเวลาบนเครื่อง {e.display_name()}?\n\n"
-                "ระบบจะ NOT แตะ TikTok เลย — คุณเป็นคนกดไลฟ์เอง\n"
-                "แล้วระบบจะนับเวลาให้บน PC อย่างเดียว"
-            ),
-        ):
-            return
-
-        if not self.app.devices_lib.start_live(e.serial):
-            return
-        self.app.save_devices()
-        self.lbl_live_status.configure(
-            text="🔴 ไลฟ์อยู่ — 00:00 (เริ่มเอง)",
-            text_color=THEME.danger,
-        )
-        self._render_live_control_state()
-        self._refresh_sidebar()
+    # ── live-control handlers (removed in v1.7.7) ────────────────
+    #
+    # The "🔴 เริ่มไลฟ์" / "⏹ จบไลฟ์" / "▶ จับเวลาเอง" buttons
+    # used to live in this card. They drove TikTok Live over
+    # uiautomator and persisted ``DeviceEntry.live_started_at``.
+    # Removed because customers reported the auto-control failed
+    # too often (region-specific TikTok dialogs, button labels
+    # without accessibility text) and the misleading half-success
+    # state ("ระบบกดให้ไม่สำเร็จ" while they ARE actually live)
+    # generated more support tickets than the feature saved.
+    #
+    # The underlying ``live_control`` module is intact and can be
+    # re-introduced later behind the admin dashboard, where the
+    # scope is "track live minutes for billing analytics" rather
+    # than "drive TikTok end-to-end from a customer's PC".
 
     def _render_mirror_state(self) -> None:
-        """Sync the Mirror button label + colour to the current
-        scrcpy session for the selected device.
+        """Sync the Mirror status line + button + hint to the
+        current scrcpy session for the selected device.
 
-        Called from the 1-second live-tick AND from the scrcpy
-        change-callback (so closing the mirror window externally
-        flips the button back without waiting for the tick)."""
+        Drives three widgets together so the card never shows a
+        torn state (e.g. status saying "offline" while the button
+        still reads "เปิด Mirror"):
+
+        * ``lbl_mirror_status`` — the headline state line at the
+          top of the card.
+        * ``btn_live_mirror`` — the big primary action button.
+        * ``lbl_mirror_hint`` — the secondary explainer beneath
+          the button.
+
+        Called from the 1 s live-tick AND from the scrcpy
+        change-callback so closing the mirror window externally
+        flips the button back without waiting for the tick.
+        """
         if not hasattr(self, "btn_live_mirror"):
             return
 
@@ -2461,9 +2154,18 @@ class DashboardPage(ctk.CTkFrame):
 
         e = self.app.selected_entry()
         if e is None:
+            if hasattr(self, "lbl_mirror_status"):
+                self.lbl_mirror_status.configure(
+                    text="(เลือกเครื่องก่อน)",
+                    text_color=THEME.fg_muted,
+                )
             self.btn_live_mirror.configure(
                 state="disabled",
-                text="🪞  Mirror หน้าจอเครื่อง (คุมผ่าน PC)",
+                text="🪞  เปิด Mirror",
+                fg_color=THEME.primary,
+                hover_color=THEME.primary_hover,
+                text_color="white",
+                border_color=THEME.primary,
             )
             self.lbl_mirror_hint.configure(
                 text="วางโทรศัพท์เฉยๆ • ใช้เมาส์/คีย์บอร์ดควบคุมจาก PC ได้เลย",
@@ -2471,18 +2173,26 @@ class DashboardPage(ctk.CTkFrame):
             )
             return
 
-        # scrcpy not on PATH → grey out + actionable hint. We don't
-        # disable the button — the dialog the click triggers is the
-        # entire user-education path for this case.
+        # scrcpy not on PATH → orange status + grey-styled button.
+        # We don't fully disable the button: the dialog the click
+        # triggers is the entire user-education path for this
+        # case (auto-install or open the install URL).
         if not scm.is_available():
+            if hasattr(self, "lbl_mirror_status"):
+                self.lbl_mirror_status.configure(
+                    text="⚠️  ยังไม่ได้ติดตั้ง scrcpy — กดปุ่มเพื่อให้ระบบติดตั้งให้",
+                    text_color=THEME.warning,
+                )
             self.btn_live_mirror.configure(
                 state="normal",
-                text="🪞  Mirror (ต้องติดตั้ง scrcpy)",
-                text_color=THEME.warning,
+                text="🪞  ติดตั้ง scrcpy แล้วเปิด Mirror",
+                fg_color=THEME.warning,
+                hover_color=THEME.warning,
+                text_color="#1A1206",
                 border_color=THEME.warning,
             )
             self.lbl_mirror_hint.configure(
-                text="ยังไม่พบ scrcpy บนเครื่อง — กดปุ่มเพื่อดูวิธีติดตั้ง (ใช้คำสั่งเดียว)",
+                text="ใช้คำสั่งเดียว ไม่ต้องลงเอง",
                 text_color=THEME.warning,
             )
             return
@@ -2501,6 +2211,11 @@ class DashboardPage(ctk.CTkFrame):
                 int((__import__("time").time() - sess.started_at) // 60)
                 if sess else 0
             )
+            if hasattr(self, "lbl_mirror_status"):
+                self.lbl_mirror_status.configure(
+                    text=f"🟢  Mirror เปิดอยู่ — {since_min} นาที",
+                    text_color=THEME.success,
+                )
             self.btn_live_mirror.configure(
                 state="normal",
                 text="⏹  ปิด Mirror",
@@ -2510,26 +2225,34 @@ class DashboardPage(ctk.CTkFrame):
                 border_color=THEME.success,
             )
             self.lbl_mirror_hint.configure(
-                text=(
-                    f"✓ Mirror เปิดอยู่ ({since_min} นาที) — "
-                    "หน้าจอมือถือถูกปิดเพื่อประหยัดแบต"
-                ),
+                text="หน้าจอมือถือถูกปิดเพื่อประหยัดแบต — ภาพยังสตรีมต่อเหมือนเดิม",
                 text_color=THEME.success,
             )
         else:
+            if hasattr(self, "lbl_mirror_status"):
+                self.lbl_mirror_status.configure(
+                    text=(
+                        f"พร้อมใช้งาน ({e.display_name()})"
+                        if is_online
+                        else "เครื่อง offline — เชื่อมต่อก่อน"
+                    ),
+                    text_color=(
+                        THEME.fg_secondary if is_online else THEME.fg_muted
+                    ),
+                )
             self.btn_live_mirror.configure(
                 state=("normal" if is_online else "disabled"),
-                text="🪞  Mirror หน้าจอเครื่อง (คุมผ่าน PC)",
-                fg_color="transparent",
-                hover_color=THEME.bg_hover,
-                text_color=THEME.fg_secondary,
-                border_color=THEME.border,
+                text="🪞  เปิด Mirror",
+                fg_color=THEME.primary,
+                hover_color=THEME.primary_hover,
+                text_color="white",
+                border_color=THEME.primary,
             )
             self.lbl_mirror_hint.configure(
                 text=(
                     "วางโทรศัพท์เฉยๆ • ใช้เมาส์/คีย์บอร์ดควบคุมจาก PC ได้เลย"
                     if is_online
-                    else "เครื่อง offline — เชื่อมต่อก่อนถึงจะเปิด Mirror ได้"
+                    else "เสียบสาย USB หรือเชื่อม WiFi ADB ก่อนเปิด Mirror"
                 ),
                 text_color=THEME.fg_muted,
             )
@@ -3595,6 +3318,16 @@ class DashboardPage(ctk.CTkFrame):
                 "ให้อัตโนมัติได้\n\nกรุณาเสียบสาย USB แล้วลองใหม่",
             )
             return
+
+        # Pre-flight: refuse to even start the patch flow if the
+        # phone has no TikTok installed. The pipeline would fail at
+        # the first step ("pull ล้มเหลว: no TikTok variant installed"),
+        # but customers misread that as our app being broken.
+        # Showing a clear, actionable dialog here saves a support
+        # ticket and stops users from re-running Patch in confusion.
+        if not self._ensure_tiktok_present(e.serial):
+            return
+
         if not messagebox.askyesno(
             "ยืนยัน Patch TikTok",
             "ขั้นตอนนี้จะถอน TikTok เดิม ติดตั้งเวอร์ชัน patched ใหม่. "
@@ -3607,6 +3340,87 @@ class DashboardPage(ctk.CTkFrame):
             args=(e.serial,),
             daemon=True,
         ).start()
+
+    def _ensure_tiktok_present(self, serial: str) -> bool:
+        """Verify TikTok is installed on ``serial`` before patching.
+
+        Returns ``True`` if patching can proceed. Returns ``False``
+        and shows a friendly recovery dialog (with a button to launch
+        Play Store on the device) if no TikTok variant is detected.
+        """
+        try:
+            pkg = self.app.lspatch.detect_tiktok(serial)
+        except Exception:
+            log.exception("detect_tiktok crashed; allowing patch to proceed")
+            # If detection itself crashes, don't block the user — the
+            # pipeline will surface the real error a few seconds later.
+            return True
+
+        if pkg:
+            return True
+
+        # No TikTok found — offer the Play Store path. The customer's
+        # device is the one with Play Store credentials, OTP, etc., so
+        # all we can do from PC is launch the right intent.
+        choice = messagebox.askyesno(
+            "ยังไม่มี TikTok ในเครื่อง",
+            (
+                "ไม่พบ TikTok ที่ลงในเครื่องนี้\n\n"
+                "ก่อน Patch ต้องลง TikTok บนมือถือก่อน "
+                "(ผ่าน Play Store ก็ได้) แล้วค่อยกลับมากด Patch อีกครั้ง\n\n"
+                "ต้องการให้เปิด Play Store บนเครื่องนี้ "
+                "เพื่อค้นหา TikTok ให้ตอนนี้ไหม?"
+            ),
+        )
+        if choice:
+            self._open_play_store_search(serial, "TikTok")
+        return False
+
+    def _open_play_store_search(self, serial: str, query: str) -> None:
+        """Send an `am start` intent to open Play Store to a search query.
+
+        This is the smoothest recovery path when the phone is missing
+        TikTok: the customer doesn't have to type the search themselves
+        on a tiny screen, and we can't sign in to their Google account
+        for them anyway.
+        """
+        adb = self.app.cfg.adb_path
+        intent_uri = f"market://search?q={query}"
+        try:
+            r = subprocess.run(
+                [adb, "-s", serial, "shell",
+                 "am", "start",
+                 "-a", "android.intent.action.VIEW",
+                 "-d", intent_uri],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if r.returncode != 0:
+                log.warning("Play Store launch returncode=%s stderr=%r",
+                            r.returncode, r.stderr[:200])
+                # Fallback to web URL if market:// scheme isn't handled
+                # (rare — only on devices without Play Store at all).
+                subprocess.run(
+                    [adb, "-s", serial, "shell",
+                     "am", "start",
+                     "-a", "android.intent.action.VIEW",
+                     "-d",
+                     f"https://play.google.com/store/search?q={query}"],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+            messagebox.showinfo(
+                "เปิด Play Store แล้ว",
+                "Play Store เปิดบนมือถือแล้ว\n\n"
+                "1. กด \"Install\" ที่ TikTok\n"
+                "2. รอจนลงเสร็จ + เปิด TikTok ดูว่าใช้งานได้\n"
+                "3. กลับมาที่ NP Create แล้วกด Patch ใหม่อีกครั้ง",
+            )
+        except Exception as ex:
+            log.exception("open Play Store failed")
+            messagebox.showerror(
+                "เปิด Play Store ไม่สำเร็จ",
+                f"กรุณาเปิด Play Store บนมือถือเอง แล้วค้นหา {query}\n\n"
+                f"รายละเอียด: {ex}",
+            )
 
     def _run_patch(self, serial: str) -> None:
         ls = self.app.lspatch
@@ -3622,7 +3436,19 @@ class DashboardPage(ctk.CTkFrame):
                 return
             pull = ls.pull_tiktok(serial=serial)
             if not pull.ok:
-                self._patch_done(serial, False, f"pull ล้มเหลว: {pull.error}")
+                # Translate the most common pull errors into customer
+                # language so they know exactly what to fix without
+                # reading the raw subprocess stderr.
+                err_lower = (pull.error or "").lower()
+                if "no tiktok variant" in err_lower:
+                    msg = (
+                        "ไม่พบ TikTok ในเครื่อง\n\n"
+                        "กรุณาลง TikTok บนมือถือก่อน (ผ่าน Play Store) "
+                        "แล้วค่อยกด Patch อีกครั้ง"
+                    )
+                else:
+                    msg = f"pull ล้มเหลว: {pull.error}"
+                self._patch_done(serial, False, msg)
                 return
             # Capture the TikTok versionName we're about to patch so
             # the drift watcher can flag auto-updates later.
@@ -3635,9 +3461,38 @@ class DashboardPage(ctk.CTkFrame):
                 package=pull.package,
                 patched_apks=patched.patched_apks,
                 serial=serial,
+                # Pass the originally pulled APKs so the pipeline can
+                # roll back to a working TikTok install if our patched
+                # bundle fails to install. This is what prevents the
+                # "Patch กดแล้ว TikTok หายไปจากเครื่อง" failure mode.
+                original_apks=pull.apks,
             )
             if not inst.ok:
-                self._patch_done(serial, False, f"install ล้มเหลว: {inst.error}")
+                # Build a customer-friendly message that distinguishes
+                # the two very different post-failure states:
+                #   1. Rollback OK → TikTok เดิมยังอยู่ — ลองใหม่ได้
+                #   2. Rollback ไม่สำเร็จ / ไม่ได้ทำ → TikTok หาย, ต้อง
+                #      ลงใหม่จาก Play Store ก่อนค่อย Patch ใหม่
+                if inst.rollback_attempted and inst.rollback_ok:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        "✓ กู้ TikTok เดิมกลับเรียบร้อยแล้ว — "
+                        "เครื่องยังใช้งานได้ปกติ\n"
+                        "ลองกด Patch อีกครั้งได้เลย"
+                    )
+                elif inst.rollback_attempted:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        f"⚠️  กู้ TikTok เดิมไม่สำเร็จ: {inst.rollback_error}\n"
+                        "กรุณาลง TikTok ใหม่จาก Play Store แล้วค่อย Patch อีกครั้ง"
+                    )
+                else:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        "⚠️  TikTok เดิมอาจหายไปจากเครื่อง — "
+                        "กรุณาลง TikTok ใหม่จาก Play Store"
+                    )
+                self._patch_done(serial, False, msg)
                 return
             # Persist the install-time signature as the per-device
             # patched-detection baseline. The hook-status probe
@@ -4008,7 +3863,15 @@ class WizardPage(ctk.CTkFrame):
                 return
             pull = ls.pull_tiktok(serial=serial)
             if not pull.ok:
-                self._wizard_patch_done(False, f"pull ล้มเหลว: {pull.error}")
+                err_lower = (pull.error or "").lower()
+                if "no tiktok variant" in err_lower:
+                    msg = (
+                        "ไม่พบ TikTok ในเครื่อง — กรุณาลง TikTok "
+                        "บนมือถือก่อน (ผ่าน Play Store) แล้วกด \"ลองใหม่\""
+                    )
+                else:
+                    msg = f"pull ล้มเหลว: {pull.error}"
+                self._wizard_patch_done(False, msg)
                 return
             patched_version = pull.version_name or ""
             patched = ls.patch(pull.apks)
@@ -4019,9 +3882,29 @@ class WizardPage(ctk.CTkFrame):
                 package=pull.package,
                 patched_apks=patched.patched_apks,
                 serial=serial,
+                # Same rollback safety net as the dashboard Patch button.
+                original_apks=pull.apks,
             )
             if not inst.ok:
-                self._wizard_patch_done(False, f"install ล้มเหลว: {inst.error}")
+                if inst.rollback_attempted and inst.rollback_ok:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        "✓ กู้ TikTok เดิมกลับเรียบร้อย — "
+                        "กด \"ลองใหม่\" ได้เลย"
+                    )
+                elif inst.rollback_attempted:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        f"⚠️ กู้ TikTok ไม่สำเร็จ: {inst.rollback_error}\n"
+                        "กรุณาลง TikTok ใหม่จาก Play Store"
+                    )
+                else:
+                    msg = (
+                        f"install ล้มเหลว: {inst.error}\n\n"
+                        "⚠️ TikTok เดิมอาจหายจากเครื่อง — "
+                        "กรุณาลงใหม่จาก Play Store"
+                    )
+                self._wizard_patch_done(False, msg)
                 return
             patched_signature = (inst.fingerprint or "").lower()
         except Exception as ex:

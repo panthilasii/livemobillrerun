@@ -277,9 +277,15 @@ class TestProbePreferredPackage:
 
 
 class TestProbeClassNameBackup:
-    """When signature extraction returns NOTHING (exotic ROM, weird
-    dumpsys redaction), fall back to checking the application
-    className for the LSPatch loader class."""
+    """The className backup probe is the safety net for devices
+    where signature extraction succeeds but yields a hex string
+    that doesn't match a known LSPatch keystore prefix (HyperOS,
+    OneUI 6, OEM keystore-rotation forks, etc.). Before 1.7.8 we
+    only ran this probe when the sig parse returned nothing — but
+    that path missed the most common failure mode in the field
+    (sig parse returns a *non-LSPatch* hex), so 1.7.8 widened the
+    rule to "always run when patched=False". These tests pin the
+    new behaviour."""
 
     def test_className_backup_kicks_in_when_sig_empty(self):
         # Empty sig dump — backup className probe sees the loader.
@@ -298,22 +304,33 @@ class TestProbeClassNameBackup:
             "className backup should detect LSPatch loader"
         )
 
-    def test_className_backup_skipped_when_sig_extracted(self):
-        """Steady-state perf: when the cheap sig parse succeeds,
-        we MUST NOT fire the extra className adb call. Verifies
-        the queue is fully drained (no extra responses pending)."""
+    def test_className_backup_runs_even_with_unmatched_fingerprint(self):
+        """1.7.8 regression test: HyperOS / OneUI dumpsys output
+        sometimes makes ``_extract_fingerprint`` return a non-LSPatch
+        hex string (e.g. it caught an APK ID instead of the cert
+        digest). The previous "skip className when fingerprint
+        non-empty" optimisation reported these patched phones as
+        unpatched. The probe must now ALWAYS consult the className
+        when the fingerprint check came up negative."""
         seq = _Sequence(
             _result(0, "package:com.ss.android.ugc.trill\n"),
             _result(0, "    signatures:[deadbeef12345678]"),  # parses, no LSPatch
             _result(0, "    versionName=39.5.4"),
             _result(1, ""),
+            _result(0,
+                "    appComponentFactory="
+                "org.lsposed.lspatch.metaloader.LSPAppComponentFactory\n"
+            ),
         )
         with patch.object(subprocess, "run", side_effect=seq):
             r = hs.probe("adb")
-        assert r.patched is False
-        # Exactly 4 calls — no className probe since sig parsed.
-        assert len(seq.calls) == 4, (
-            f"expected 4 adb calls, saw {len(seq.calls)}"
+        assert r.patched is True, (
+            "className backup must catch LSPatch even when sig parse "
+            "extracted an unrelated hex string"
+        )
+        # The full call sequence must include the 5th (className) probe.
+        assert len(seq.calls) == 5, (
+            f"expected 5 adb calls (incl. className probe), saw {len(seq.calls)}"
         )
 
     def test_className_backup_no_loader_means_unpatched(self):
@@ -327,6 +344,25 @@ class TestProbeClassNameBackup:
         with patch.object(subprocess, "run", side_effect=seq):
             r = hs.probe("adb")
         assert r.patched is False
+
+    def test_className_backup_skipped_when_already_patched(self):
+        """When the LSPatch prefix matches we've already proven the
+        APK is patched — the extra className adb call would be wasted
+        work. Locks in the short-circuit so a future refactor doesn't
+        accidentally double the per-probe latency."""
+        prefix = hs._KNOWN_LSPATCH_FINGERPRINT_PREFIXES[0]
+        seq = _Sequence(
+            _result(0, "package:com.ss.android.ugc.trill\n"),
+            _result(0, f"    signatures:[{prefix}cafebabe]"),
+            _result(0, "    versionName=39.5.4"),
+            _result(0, "98765\n"),
+        )
+        with patch.object(subprocess, "run", side_effect=seq):
+            r = hs.probe("adb")
+        assert r.patched is True
+        assert len(seq.calls) == 4, (
+            "className probe must NOT run when LSPatch prefix already matched"
+        )
 
 
 class TestProbeKnownLSPatchPrefixes:

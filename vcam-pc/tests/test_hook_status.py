@@ -80,12 +80,18 @@ class TestProbeUnpatchedInstalled:
     def test_installed_signed_by_play_store(self):
         # Customer has TikTok but never patched it. Signing
         # fingerprint is whatever Google issued (definitely NOT
-        # the LSPatch debug-keystore prefix).
+        # the LSPatch debug-keystore prefix). Since 1.7.8 the
+        # probe ALWAYS runs a className backup probe when the
+        # signature signals come up empty, so we feed a 5th
+        # response showing TikTok's vanilla application class.
         seq = _Sequence(
             _result(0, "package:com.ss.android.ugc.trill\n"),
             _result(0, "    signatures:[1234abcd5678]"),
             _result(0, "    versionName=29.5.3"),
             _result(1, ""),  # pidof: not running
+            _result(0,
+                "    className=com.ss.android.ugc.aweme.app.AwemeApplication\n"
+            ),
         )
         with patch.object(subprocess, "run", side_effect=seq):
             r = hs.probe("adb")
@@ -152,6 +158,9 @@ class TestProbeMultipleVariants:
             _result(0, "    signatures:[deadcafe]"),
             _result(0, "    versionName=29.5.3"),
             _result(1, ""),
+            # 5th call (1.7.8+): className backup probe always runs
+            # for unpatched-looking probes; vanilla TikTok class.
+            _result(0, "    className=com.ss.android.ugc.aweme.app.App\n"),
         )
         with patch.object(subprocess, "run", side_effect=seq):
             r = hs.probe("adb")
