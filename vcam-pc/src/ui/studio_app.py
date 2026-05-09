@@ -179,6 +179,19 @@ class StudioApp(ctk.CTk):
         self.devices_lib = DeviceLibrary.load()
         self.no_adb_reverse = no_adb_reverse
 
+        # If adb is unreachable, the wizard will sit on
+        # "🔄 รอเครื่องเชื่อมต่อ…" forever with no hint as to why —
+        # which was the v1.7.8 / v1.7.9 customer-facing symptom of
+        # the bundled adb.exe lookup being broken. Detect that here
+        # and surface a clear dialog the moment the main window
+        # opens, with a pointer to the diagnostic file the support
+        # team can read. We don't *quit* — the rest of the UI is
+        # still useful (browse files, license, settings) — we just
+        # tell the customer up front that USB onboarding can't work
+        # in the current state.
+        self._adb_resolution_warned = False
+        self.after(800, self._check_adb_or_warn)
+
         # ── runtime state
         self.license: VerifiedLicense | None = None
         self.activation: dict | None = None
@@ -607,6 +620,65 @@ class StudioApp(ctk.CTk):
         from ..license_key import PRIVATE_KEY_PATH
 
         return PRIVATE_KEY_PATH.is_file()
+
+    # ── adb sanity check ─────────────────────────────────────────
+
+    def _check_adb_or_warn(self) -> None:
+        """Pop a one-shot dialog if the bundled adb is missing.
+
+        Runs ~0.8 s after the main window appears (so the dialog
+        opens *over* a real, drawn window — not a half-painted
+        loading screen). If the resolved ``adb_path`` doesn't exist
+        on disk OR ``adb version`` fails, the customer is told what
+        broke and where the diagnostic file lives. Without this,
+        the wizard's Step 2 just shows "🔄 รอเครื่อง" forever and
+        the customer pings support with "doesn't work".
+        """
+        if self._adb_resolution_warned:
+            return
+        try:
+            adb_path = Path(self.adb.adb_path)
+        except Exception:
+            adb_path = None  # type: ignore[assignment]
+
+        broken_reason: str | None = None
+        if not adb_path or (
+            adb_path.is_absolute() and not adb_path.is_file()
+        ):
+            broken_reason = (
+                f"ไม่พบ adb.exe ที่ตำแหน่ง:\n  {adb_path}"
+            )
+        elif not self.adb.is_available():
+            broken_reason = (
+                "พบ adb.exe แต่รันไม่ได้ (อาจถูก antivirus กักหรือ\n"
+                "ขาด Visual C++ Redistributable)"
+            )
+
+        if broken_reason is None:
+            return
+
+        from tkinter import messagebox
+
+        from .._startup_diagnostic import DIAGNOSTIC_FILENAME
+        from ..config import PROJECT_ROOT
+
+        diag_path = PROJECT_ROOT / "logs" / DIAGNOSTIC_FILENAME
+
+        self._adb_resolution_warned = True
+        messagebox.showwarning(
+            "NP Create — adb ไม่พร้อมใช้งาน",
+            (
+                "ไม่สามารถใช้งาน adb.exe ที่บันเดิลมาในโปรแกรมได้ครับ\n"
+                "หน้า 'เพิ่มเครื่อง' จะค้างที่ 'รอเครื่อง...' เพราะเหตุนี้\n\n"
+                f"{broken_reason}\n\n"
+                "วิธีช่วยแก้ไข\n"
+                "1. รีสตาร์ทเครื่อง แล้วเปิด NP Create อีกครั้ง\n"
+                "2. ตรวจสอบว่า Windows Defender ไม่กัก adb.exe ไว้\n"
+                "3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+                f"   {diag_path}\n\n"
+                "ติดต่อ Line OA: @npcreate"
+            ),
+        )
 
     # ── device polling ───────────────────────────────────────────
 

@@ -94,33 +94,64 @@ def _tools_root_base() -> Path:
     bundled adb.exe is unreachable. So this is the single canonical
     source of truth.
 
-    Mode A — Dev / portable customer ZIP
-    ------------------------------------
-    Running ``python -m src.main`` (or via run.bat / run.command).
-    ``sys.frozen`` is False. ``PROJECT_ROOT`` resolves via
-    ``Path(__file__).parent.parent`` to ``vcam-pc/`` itself. The
-    workspace root that contains ``.tools/`` sits one directory
-    above, so we use ``PROJECT_ROOT.parent``.
+    Layouts we have to satisfy
+    --------------------------
 
-    Mode B — PyInstaller frozen build (Inno Setup .exe / .dmg .app)
-    ---------------------------------------------------------------
-    The Inno Setup installer (``installer.iss``) and the macOS
-    ``build_dmg.sh`` both lay ``.tools/<os>/`` **next to the
-    executable** (i.e. inside the install dir / .app bundle root,
-    NOT one level up). For Inno that's
-    ``%LOCALAPPDATA%\\NP Create\\.tools\\windows\\`` and for the
-    .app it's ``NP-Create.app/Contents/MacOS/.tools/macos/``.
-    ``PROJECT_ROOT`` already points at that directory because
-    ``config._resolve_project_root`` anchors on
-    ``Path(sys.executable).parent`` in frozen mode. So we use
-    ``PROJECT_ROOT`` itself, NOT its parent — the parent walks
-    one level too high and silently misses the bundled tools,
-    which is exactly the symptom that broke v1.7.8 customer
-    installs (https://… — "no popup on phone after USB plug").
+    * **Dev tree / portable customer ZIP** (run.bat → python -m
+      src.main). ``sys.frozen`` is False. ``PROJECT_ROOT`` resolves
+      via ``Path(__file__).parent.parent`` to ``vcam-pc/``. The
+      ``.tools/`` dir sits at ``vcam-pc/../.tools/`` — i.e. parent
+      of PROJECT_ROOT.
+
+    * **Inno Setup install** (``installer.iss`` lays ``.tools/`` at
+      ``{app}\\.tools\\``, sibling of NP-Create.exe). Frozen mode,
+      ``PROJECT_ROOT`` = install dir = ``{app}``. ``.tools/`` sits
+      *inside* PROJECT_ROOT.
+
+    * **macOS .app drag-to-Applications** (``build_dmg.sh`` lays
+      ``.tools/`` at ``Contents/MacOS/.tools/``). Frozen mode,
+      ``PROJECT_ROOT`` = ``Contents/MacOS/``. ``.tools/`` sits
+      inside PROJECT_ROOT.
+
+    * **Portable ZIP with PyInstaller bundle in app/** (some
+      customers double-click ``app/NP-Create.exe`` from inside the
+      portable ZIP instead of using ``run.bat``). Frozen mode,
+      ``PROJECT_ROOT`` = ``<bundle>/app/``. ``.tools/`` sits at
+      ``<bundle>/.tools/`` — *parent* of PROJECT_ROOT.
+
+    Defensive walk
+    --------------
+    Rather than hard-code one rule per mode and pray we covered
+    every distribution combo, we *walk up* from the natural
+    starting point looking for the first directory that has a
+    ``.tools/`` child. This handles all four layouts with a single
+    code path and silently absorbs any future installer layout we
+    haven't thought of yet.
+
+    The walk is bounded (3 levels) so a missing ``.tools/`` falls
+    through to a sensible default rather than wandering into the
+    user's home directory and picking up a stale toolchain there.
     """
     if getattr(sys, "frozen", False):
-        return PROJECT_ROOT
-    return PROJECT_ROOT.parent
+        # Frozen: start at the .exe / .app dir and walk up.
+        # PyInstaller --onefile bootloader sets sys.executable to the
+        # installer-dropped binary path, so PROJECT_ROOT is the
+        # install directory.
+        start = PROJECT_ROOT
+    else:
+        # Source / portable ZIP via run.bat: PROJECT_ROOT is
+        # vcam-pc/, ``.tools/`` is one level up.
+        start = PROJECT_ROOT.parent
+
+    candidates = [start, start.parent, start.parent.parent]
+    for cand in candidates:
+        if (cand / ".tools").is_dir():
+            return cand
+
+    # Nothing on disk yet — return the most-likely answer for this
+    # mode so the resolver can still report a useful "not found"
+    # path in error messages.
+    return start
 
 
 # .tools/ root: workspace root in dev / portable, install dir when

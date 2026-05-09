@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +36,50 @@ class AdbController:
 
     @staticmethod
     def _resolve(adb_path: str) -> str:
-        """Resolve ``adb_path`` to an actual binary, falling back to
-        the bundled ``.tools/<os>/platform-tools/adb`` if the user's
-        PATH doesn't have ``adb``. Keeps the configured value if it
-        already works, so power users can override via config.json."""
+        """Resolve ``adb_path`` to an actual binary.
+
+        Resolution order
+        ----------------
+
+        1. ``adb_path`` *if* it's an absolute path that points at a
+           real file on disk — power users can override via
+           ``config.json`` to use a custom adb (e.g. a newer Google
+           Android platform-tools install).
+
+        2. **Frozen-mode bundled adb** — when the app is running as
+           the Inno Setup / .dmg PyInstaller bundle, the customer
+           almost certainly does *not* have a working adb on their
+           system PATH. Even if some other Android tool happened to
+           drop an adb on PATH (e.g. a stale Genymotion install),
+           we *deliberately* prefer the bundled one — its version
+           matches the lspatch / scrcpy combo we ship and is
+           known-good. v1.7.8 lacked this preference, which let a
+           broken system adb shadow the bundled one and silently
+           prevented the "Allow USB Debugging" popup from firing.
+
+        3. ``shutil.which(adb_path)`` — non-frozen + non-default
+           setups (a developer with adb on PATH).
+
+        4. ``platform_tools.find_adb()`` — last-ditch fallback,
+           also covers the case where ``adb_path`` was the bare
+           string ``"adb"`` (the shipping default).
+        """
+        if adb_path and Path(adb_path).is_absolute() and Path(adb_path).is_file():
+            return adb_path
+
+        if getattr(sys, "frozen", False):
+            try:
+                from . import platform_tools
+
+                bundled = platform_tools.find_adb()
+                if bundled is not None:
+                    return str(bundled)
+            except Exception:
+                # Fall through to the original lookup chain so a
+                # bug in platform_tools never strands the customer
+                # with no adb at all.
+                pass
+
         if adb_path and shutil.which(adb_path) is not None:
             return adb_path
         try:

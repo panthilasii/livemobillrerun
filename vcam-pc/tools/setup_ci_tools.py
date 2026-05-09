@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """NP Create — CI helper: download every tool the customer install
-needs (platform-tools, JDK 21, lspatch.jar) into ``.tools/<os>/``.
+needs (platform-tools, JDK 21, lspatch.jar, ffmpeg) into
+``.tools/<os>/``.
 
 Why this exists separately from ``setup_windows_tools.py`` and
 ``setup_macos_tools.py``
@@ -19,9 +20,20 @@ that grabs every artifact straight from upstream:
   https://dl.google.com/android/repository/
 * **JDK 21**         — Adoptium Temurin from GitHub releases
 * **lspatch.jar**    — JingMatrix/LSPatch GitHub releases
+* **ffmpeg**         — gyan.dev (Windows) / osxexperts.net (macOS)
 
 scrcpy is handled by the sibling ``setup_scrcpy.py`` (already
 wired into release.yml). This script complements it.
+
+Why ffmpeg landed here in v1.7.10
+---------------------------------
+v1.7.6 portable ZIP shipped with ffmpeg.exe because the admin's
+dev workspace had it pre-populated by ``setup_ffmpeg.py``. v1.7.8
++ v1.7.9 builds came out of fresh CI runners that *never* invoked
+``setup_ffmpeg.py``, so the customer Setup.exe / portable ZIP were
+ffmpeg-less. The Hook → Live pipeline silently degraded to "stream
+fails to start" with no popup. Folding ffmpeg into this CI helper
+guarantees both distribution channels carry the binary.
 
 Usage::
 
@@ -96,6 +108,24 @@ PT_URLS = {
 LSPATCH_RELEASE_API = (
     "https://api.github.com/repos/JingMatrix/LSPatch/releases/latest"
 )
+
+# ffmpeg "static" / "essentials" builds. Same upstreams as
+# ``tools/setup_ffmpeg.py``; we duplicate the constants instead of
+# importing because that file lives next door but isn't a package
+# and importing across ``tools/`` would force sys.path gymnastics
+# in CI for no real win.
+FFMPEG_URLS = {
+    "windows": (
+        "https://www.gyan.dev/ffmpeg/builds/"
+        "ffmpeg-release-essentials.zip"
+    ),
+    "macos": "https://www.osxexperts.net/ffmpeg711arm.zip",
+}
+# Path inside each archive that maps to the ``ffmpeg`` binary.
+FFMPEG_BIN_IN_ARCHIVE = {
+    "windows": "bin/ffmpeg.exe",
+    "macos":   "ffmpeg",
+}
 
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -251,6 +281,62 @@ def install_jdk(os_name: str, force: bool) -> None:
         _extract_tar(cache_path, dest, strip_first=True)
 
 
+def install_ffmpeg(os_name: str, force: bool) -> None:
+    """Download a static ffmpeg build and drop it at
+    ``.tools/<os>/ffmpeg{.exe}``.
+
+    ``platform_tools.find_ffmpeg`` walks both that exact path and
+    the ``bin/ffmpeg`` subpath inside the per-OS dir, so either
+    layout would work — but flat at the per-OS root is what
+    ``setup_ffmpeg.py`` produces, and what v1.7.6 customers had,
+    so we preserve that layout for byte-for-byte parity with the
+    last known-good build.
+    """
+    print()
+    print("[ffmpeg]")
+    sfx = ".exe" if os_name == "windows" else ""
+    dest_dir = WORKSPACE / ".tools" / os_name
+    dest_bin = dest_dir / f"ffmpeg{sfx}"
+    if dest_bin.is_file() and not force:
+        size_mb = dest_bin.stat().st_size / 1024 / 1024
+        print(f"  [OK] already at {dest_bin.relative_to(WORKSPACE)} "
+              f"({size_mb:,.1f} MB)")
+        return
+    url = FFMPEG_URLS[os_name]
+    cache_path = CACHE / f"ffmpeg-{os_name}.zip"
+    _download(url, cache_path, force)
+    member = FFMPEG_BIN_IN_ARCHIVE[os_name]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  -> extracting {member} -> {dest_bin.relative_to(WORKSPACE)}")
+    # Both upstream archives are .zip but the ffmpeg binary lives
+    # at a fixed path inside (gyan.dev nests under
+    # ``ffmpeg-<v>-essentials_build/bin/ffmpeg.exe``). Search by
+    # filename suffix so we don't have to keep up with version
+    # bumps in the archive's top-level dir name.
+    target_basename = Path(member).name
+    with zipfile.ZipFile(cache_path) as zf:
+        # Find the first member whose basename matches.
+        chosen = None
+        for info in zf.infolist():
+            if Path(info.filename).name == target_basename:
+                chosen = info
+                break
+        if chosen is None:
+            raise SystemExit(
+                f"ffmpeg binary not found in {cache_path.name} "
+                f"(looking for any path ending with {target_basename})"
+            )
+        with zf.open(chosen) as src, dest_bin.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    if os_name != "windows":
+        # Preserve +x; macOS / Linux ZIP doesn't carry mode bits in
+        # all cases, so set it unconditionally.
+        dest_bin.chmod(dest_bin.stat().st_mode | 0o755)
+    size_mb = dest_bin.stat().st_size / 1024 / 1024
+    print(f"  [OK] installed {dest_bin.relative_to(WORKSPACE)} "
+          f"({size_mb:,.1f} MB)")
+
+
 def install_lspatch(os_name: str, force: bool) -> None:
     print()
     print("[lspatch]")
@@ -284,6 +370,7 @@ def _verify(os_name: str) -> int:
     checks: list[tuple[str, Path]] = [
         ("platform-tools/adb", base / "platform-tools" / f"adb{sfx}"),
         ("lspatch.jar       ", base / "lspatch" / "lspatch.jar"),
+        ("ffmpeg            ", base / f"ffmpeg{sfx}"),
     ]
     if os_name == "windows":
         checks.append(("jdk-21/bin/java   ", base / "jdk-21" / "bin" / "java.exe"))
@@ -317,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--skip", action="append", default=[],
-        choices=("platform-tools", "jdk", "lspatch"),
+        choices=("platform-tools", "jdk", "lspatch", "ffmpeg"),
         help="skip a specific tool (repeatable)",
     )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
@@ -347,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
         install_jdk(os_name, args.force)
     if "lspatch" not in args.skip:
         install_lspatch(os_name, args.force)
+    if "ffmpeg" not in args.skip:
+        install_ffmpeg(os_name, args.force)
 
     rc = _verify(os_name)
     if rc == 0:

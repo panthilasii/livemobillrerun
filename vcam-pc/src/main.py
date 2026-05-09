@@ -155,6 +155,19 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     _setup_logging(args.verbose)
 
+    # Always emit a startup diagnostic. This is the file we ask
+    # customers to send when "the wizard never finds my phone" —
+    # it captures every path the resolver picked plus a live
+    # ``adb version`` / ``adb devices`` probe, so support can
+    # tell which layer broke without bouncing screenshots back
+    # and forth. See ``_startup_diagnostic.py`` for the rationale.
+    try:
+        from ._startup_diagnostic import write_diagnostic
+        write_diagnostic()
+    except Exception:
+        # Diagnostic must never block startup.
+        pass
+
     use_legacy = args.legacy or args.gui
 
     # Default to the Studio UI. CLI mode is opt-in only (--cli) so
