@@ -49,6 +49,16 @@ jobs:
   # ---------------------------------------------------------------
   build-windows:
     runs-on: windows-latest
+    # Force every Python invocation to use UTF-8 for stdio.
+    # Without this, the runner inherits cp1252 (Windows default) and
+    # any ``print("→ downloading…")`` in our build helpers crashes
+    # with ``UnicodeEncodeError: 'charmap' codec can't encode``.
+    # PYTHONUTF8=1 is honoured by Python 3.7+ and is the cleanest
+    # one-knob fix; adding ``encoding='utf-8'`` to every print would
+    # be 50+ touches across tools/.
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +139,13 @@ jobs:
   # ---------------------------------------------------------------
   build-macos:
     runs-on: macos-14    # ARM64 / Apple Silicon
+    # macOS terminals default to UTF-8 so PYTHONUTF8 is mostly belt-
+    # and-suspenders here; PYTHONIOENCODING normalises the python
+    # subprocess stdio so log capture in the runner doesn't trip
+    # over emoji / arrow chars used by some build helpers.
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
 

@@ -248,19 +248,19 @@ def install_one(os_name: str, force: bool = False) -> Path:
 
     if archive_path.is_file() and not force:
         size_mb = archive_path.stat().st_size / 1024 / 1024
-        print(f"  ✓ cached {archive_path.name} ({size_mb:,.1f} MB)")
+        print(f"  [OK] cached {archive_path.name} ({size_mb:,.1f} MB)")
     else:
-        print(f"  → downloading {asset.url}")
+        print(f"  -> downloading {asset.url}")
         _safe_download(asset.url, archive_path)
         size_mb = archive_path.stat().st_size / 1024 / 1024
-        print(f"  ✓ wrote {archive_path.name} ({size_mb:,.1f} MB)")
+        print(f"  [OK] wrote {archive_path.name} ({size_mb:,.1f} MB)")
 
-    print(f"  → verifying sha256...")
+    print(f"  -> verifying sha256...")
     _verify_sha256(archive_path, asset.sha256)
-    print(f"  ✓ sha256 OK")
+    print(f"  [OK] sha256 OK")
 
     dest = WORKSPACE / ".tools" / os_name / "scrcpy"
-    print(f"  → extracting to {dest}")
+    print(f"  -> extracting to {dest}")
     _extract_into(archive_path, asset.kind, dest)
     _post_install_chmod(dest, os_name)
 
@@ -276,7 +276,7 @@ def install_one(os_name: str, force: bool = False) -> Path:
             )
         binary = hits[0]
     size_mb = binary.stat().st_size / 1024 / 1024
-    print(f"  ✓ installed {binary.relative_to(WORKSPACE)} ({size_mb:,.1f} MB)")
+    print(f"  [OK] installed {binary.relative_to(WORKSPACE)} ({size_mb:,.1f} MB)")
     return binary
 
 
