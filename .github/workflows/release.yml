@@ -1,0 +1,246 @@
+# NP Create -- automated release builds.
+#
+# Triggers
+# --------
+# * Push a tag matching ``v*`` (e.g. ``git tag v1.7.6 && git push --tags``).
+#   The workflow builds Windows + macOS bundles and publishes them
+#   to a GitHub Release named after the tag.
+# * ``workflow_dispatch`` -- manual trigger from the Actions tab,
+#   useful for testing without bumping a tag.
+#
+# Outputs
+# -------
+# Each release ships four artifacts:
+#
+#   Windows
+#     * NP-Create-Setup-<v>.exe          single-file Inno Setup installer
+#     * NP-Create-customer-windows-<v>.zip   power-user portable bundle
+#
+#   macOS
+#     * NP-Create-<v>.dmg                drag-to-Applications disk image
+#     * NP-Create-customer-macos-<v>.zip     power-user portable bundle
+#
+# Why two formats per OS
+# ----------------------
+# Non-technical customers want the installer/.dmg ("Next Next Finish").
+# Power users on shared / sandboxed machines (e.g. shop floors with
+# locked-down Windows accounts) prefer the unzip-and-run portable
+# bundle. Both share the same NP-Create.exe / .app inside; only the
+# wrapper differs, so build cost is marginal once PyInstaller has run.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (defaults to branding.py)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write    # needed to create the GitHub Release
+
+jobs:
+  # ---------------------------------------------------------------
+  # Windows: PyInstaller .exe + Inno Setup .exe + portable .zip
+  # ---------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller==6.10.0
+          python -m pip install -r vcam-pc/requirements.txt
+        shell: pwsh
+
+      - name: Read app version from branding.py
+        id: version
+        working-directory: vcam-pc
+        run: |
+          $ver = python -c "import sys; sys.path.insert(0, 'src'); from branding import BRAND; print(BRAND.version)"
+          Write-Host "Version: $ver"
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        shell: pwsh
+
+      - name: Set up Inno Setup
+        # Inno Setup ships pre-installed on the windows-latest runner
+        # in C:\Program Files (x86)\Inno Setup 6\. If GitHub ever
+        # removes it, replace with `choco install innosetup -y`.
+        run: |
+          if (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") {
+            Write-Host "Inno Setup already installed."
+          } else {
+            choco install innosetup --no-progress -y
+          }
+        shell: pwsh
+
+      - name: Bundle scrcpy + adb (.tools/windows/)
+        # Pre-populates the workspace's `.tools/windows/scrcpy/`
+        # directory with the GitHub-released scrcpy zip plus its
+        # bundled `adb.exe`. The installer.iss + build_release.py
+        # both read from `.tools/windows/` so this step is a hard
+        # prerequisite for both downstream artifacts. SHA256 is
+        # verified inside setup_scrcpy.py.
+        working-directory: vcam-pc
+        run: python tools/setup_scrcpy.py --os windows
+        shell: pwsh
+
+      - name: Build PyInstaller .exe
+        working-directory: vcam-pc
+        run: python tools/build_pyinstaller.py
+        shell: pwsh
+
+      - name: Build Inno Setup installer
+        working-directory: vcam-pc
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" tools\installer.iss
+        shell: pwsh
+
+      - name: Build portable customer ZIP (Windows)
+        working-directory: vcam-pc
+        run: python tools/build_release.py --target customer --os windows
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-builds
+          path: |
+            vcam-pc/dist/installer/NP-Create-Setup-*.exe
+            dist/NP-Create-customer-windows-*.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # macOS: PyInstaller .app + .dmg + portable .zip
+  # ---------------------------------------------------------------
+  build-macos:
+    runs-on: macos-14    # ARM64 / Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller==6.10.0
+          python -m pip install -r vcam-pc/requirements.txt
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Bundle scrcpy + adb (.tools/macos/)
+        working-directory: vcam-pc
+        run: python tools/setup_scrcpy.py --os macos
+
+      - name: Build PyInstaller .app
+        working-directory: vcam-pc
+        run: python tools/build_pyinstaller.py
+
+      - name: Build .dmg
+        working-directory: vcam-pc
+        # Force C locale so create-dmg's hdiutil retry heuristics
+        # work on runners with non-English locales.
+        env:
+          LC_ALL: C
+          LANG: C
+        run: bash tools/build_dmg.sh
+
+      - name: Build portable customer ZIP (macOS)
+        working-directory: vcam-pc
+        run: python tools/build_release.py --target customer --os macos
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-builds
+          path: |
+            vcam-pc/dist/installer/NP-Create-*.dmg
+            dist/NP-Create-customer-macos-*.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # Publish: collect all artifacts and attach to a GitHub Release
+  # ---------------------------------------------------------------
+  publish:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download Windows builds
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-builds
+          path: artifacts
+
+      - name: Download macOS builds
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-builds
+          path: artifacts
+
+      - name: Show artifact tree
+        run: ls -la artifacts && find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: NP Create ${{ github.ref_name }}
+          body: |
+            ## NP Create ${{ github.ref_name }}
+
+            ### ดาวน์โหลด
+
+            **Windows** (แนะนำลูกค้าใหม่ — ดับเบิ้ลคลิกติดตั้งได้เลย)
+            - `NP-Create-Setup-*.exe` — Installer แบบไฟล์เดียว Next-Next-Finish
+            - `NP-Create-customer-windows-*.zip` — แบบ portable (ไม่ต้องติดตั้ง)
+
+            **macOS**
+            - `NP-Create-*.dmg` — ลาก `NP Create.app` ไปที่ Applications
+            - `NP-Create-customer-macos-*.zip` — แบบ portable
+
+            ### วิธีติดตั้ง (Windows)
+
+            1. ดาวน์โหลด `NP-Create-Setup-<version>.exe`
+            2. ดับเบิ้ลคลิก → คลิก "Yes" ถ้า Windows ถาม
+            3. คลิก "ถัดไป" / "Next" จนเสร็จ
+            4. หา NP Create ในเดสก์ท็อปหรือ Start Menu
+
+            ### วิธีติดตั้ง (macOS)
+
+            1. ดาวน์โหลด `NP-Create-<version>.dmg`
+            2. ดับเบิ้ลคลิก → ลาก `NP Create` ไปที่ `Applications`
+            3. เปิด Applications → คลิกขวา NP Create → "Open"
+               (ครั้งแรกเท่านั้น เพราะ Gatekeeper)
+
+            ### หมายเหตุ
+            - ดูคู่มือเต็มใน `MANUAL_TH.md` ที่อยู่ในไฟล์
+            - ติดต่อแอดมิน Line OA: @npcreate
+          files: |
+            artifacts/**/NP-Create-Setup-*.exe
+            artifacts/**/NP-Create-*.dmg
+            artifacts/**/NP-Create-customer-*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

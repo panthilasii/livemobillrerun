@@ -1,0 +1,286 @@
+<!doctype html>
+<!--
+  NP Create -- TikTok Shop sales dashboard.
+
+  Single-file static UI: HTML + Tailwind via CDN + Chart.js via CDN.
+  No build step, no node_modules; the customer doesn't need anything
+  beyond what the FastAPI server already serves from /static.
+
+  Localised in Thai because the entire customer base is Thai. Layout
+  reads top-down on mobile and as a 3-column grid on desktop.
+-->
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NP Create — Dashboard ยอดขาย</title>
+
+  <!-- Tailwind via CDN. The "play CDN" emits Tailwind at runtime;
+       a real prod build would precompile, but CDN keeps the
+       customer install footprint at zero extra MB. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Chart.js for the revenue/hour line chart. Pinned to a major
+       version so a future breaking release can't regress the
+       customer's running build. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: 'Sarabun', system-ui, sans-serif; }
+    /* Brand red. Matches THEME.primary in the desktop app's
+       branding.py so the two surfaces feel like one product. */
+    .brand-red { color: #C8102E; }
+    .bg-brand  { background: #C8102E; }
+    .bg-brand-soft { background: rgba(200,16,46,0.08); }
+    .border-brand { border-color: #C8102E; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+
+<header class="border-b border-slate-200 bg-white">
+  <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-brand text-white flex items-center justify-center font-bold">NP</div>
+      <div>
+        <div class="font-bold text-lg">NP Create — Dashboard</div>
+        <div class="text-xs text-slate-500" id="header-sub">ยอดขาย TikTok Shop</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 text-sm">
+      <span class="text-slate-400" id="last-updated">—</span>
+      <button id="btn-refresh"
+              class="px-3 py-1.5 rounded-md border border-slate-300 hover:bg-slate-100">
+        ↻ รีเฟรช
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- Empty-state banner: shown only when there are zero orders in
+       the database, so the user understands they need to either
+       seed demo data or hook up TikTok Shop OAuth. -->
+  <section id="empty-state" class="hidden bg-white rounded-xl border border-slate-200 p-6">
+    <h2 class="text-lg font-semibold mb-2">ยังไม่มีข้อมูลยอดขาย</h2>
+    <p class="text-slate-600 text-sm mb-4">
+      เลือก 1 ใน 2 ทาง:
+    </p>
+    <div class="grid md:grid-cols-2 gap-3">
+      <button id="btn-seed" class="text-left p-4 border border-slate-200 rounded-lg hover:border-brand">
+        <div class="font-semibold mb-1">📊 ใส่ข้อมูลตัวอย่าง</div>
+        <div class="text-sm text-slate-500">
+          ระบบจะสร้างยอดขาย 7 วันย้อนหลังให้คุณดูตัวอย่าง — เหมาะสำหรับเช็คว่าหน้านี้ทำงานยังไง
+        </div>
+      </button>
+      <div class="text-left p-4 border border-slate-200 rounded-lg">
+        <div class="font-semibold mb-1">🔗 เชื่อม TikTok Shop จริง</div>
+        <div class="text-sm text-slate-500">
+          ต้องสมัคร TikTok Developer ก่อน (ใช้เวลาอนุมัติ 1-2 สัปดาห์)<br>
+          จากนั้นกรอก app_key / app_secret ในหน้า Settings — เร็ว ๆ นี้
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Top KPIs -->
+  <section class="grid md:grid-cols-3 gap-4">
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <div class="text-sm text-slate-500 mb-1">ยอดขายวันนี้</div>
+      <div class="text-3xl font-bold brand-red" id="kpi-today">—</div>
+      <div class="text-xs text-slate-500 mt-1" id="kpi-today-sub">— ออเดอร์</div>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <div class="text-sm text-slate-500 mb-1">ยอดขายสัปดาห์นี้</div>
+      <div class="text-3xl font-bold" id="kpi-week">—</div>
+      <div class="text-xs text-slate-500 mt-1" id="kpi-week-sub">— ออเดอร์</div>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <div class="text-sm text-slate-500 mb-1">ยอดขาย 30 วัน</div>
+      <div class="text-3xl font-bold" id="kpi-month">—</div>
+      <div class="text-xs text-slate-500 mt-1" id="kpi-month-sub">— ออเดอร์</div>
+    </div>
+  </section>
+
+  <!-- Revenue chart -->
+  <section class="bg-white rounded-xl border border-slate-200 p-5">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold">ยอดขายราย ชม. — 7 วันย้อนหลัง</h2>
+      <select id="chart-range" class="text-sm border border-slate-300 rounded px-2 py-1">
+        <option value="1">1 วัน</option>
+        <option value="3">3 วัน</option>
+        <option value="7" selected>7 วัน</option>
+        <option value="30">30 วัน</option>
+      </select>
+    </div>
+    <div class="h-64"><canvas id="chart-revenue"></canvas></div>
+  </section>
+
+  <!-- Top products -->
+  <section class="bg-white rounded-xl border border-slate-200 p-5">
+    <h2 class="font-semibold mb-3">สินค้าขายดี — Top 10 (7 วัน)</h2>
+    <div id="top-products" class="divide-y divide-slate-100">
+      <div class="text-sm text-slate-400 py-4">กำลังโหลด…</div>
+    </div>
+  </section>
+
+  <p class="text-center text-xs text-slate-400 pt-4">
+    NP Create — Dashboard <span id="footer-version">—</span>
+  </p>
+</main>
+
+<script>
+  // ── tiny fetch helper ──────────────────────────────────────────
+  // We don't pull in a JS client library -- everything's same-origin
+  // and the only failure mode worth showing the user is "server
+  // dropped while you were here", which reload fixes.
+  async function api(path) {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`${path} → ${res.status}`);
+    return res.json();
+  }
+
+  function fmtBaht(s) {
+    // server returns plain decimal strings ("12345.00"). We want
+    // grouping commas + the ฿ prefix the way Thai sellers
+    // intuitively read it.
+    const n = parseFloat(s);
+    if (!isFinite(n)) return '—';
+    return '฿' + n.toLocaleString('th-TH', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+  }
+
+  function fmtNumber(n) {
+    return n.toLocaleString('th-TH');
+  }
+
+  let chart = null;
+
+  async function refreshSummary() {
+    const s = await api('/api/summary');
+    document.getElementById('kpi-today').textContent = fmtBaht(s.today.revenue_baht);
+    document.getElementById('kpi-today-sub').textContent =
+      `${fmtNumber(s.today.orders)} ออเดอร์ · เฉลี่ย ${fmtBaht(s.today.avg_order_baht)}/ออเดอร์`;
+    document.getElementById('kpi-week').textContent = fmtBaht(s.week.revenue_baht);
+    document.getElementById('kpi-week-sub').textContent = `${fmtNumber(s.week.orders)} ออเดอร์`;
+    document.getElementById('kpi-month').textContent = fmtBaht(s.month.revenue_baht);
+    document.getElementById('kpi-month-sub').textContent = `${fmtNumber(s.month.orders)} ออเดอร์`;
+
+    // Empty-state banner toggle
+    const isEmpty = (s.month.orders | 0) === 0;
+    document.getElementById('empty-state').classList.toggle('hidden', !isEmpty);
+  }
+
+  async function refreshChart(days = 7) {
+    const data = await api('/api/revenue/hourly?days=' + days);
+    const labels = data.buckets.map(b => {
+      const d = new Date(b.ts * 1000);
+      // Show "DD/MM HH:00" in BKK time. The server already gave us
+      // UTC ts of the bucket boundary; we render in client tz which
+      // for our user base IS Asia/Bangkok.
+      const dd = String(d.getDate()).padStart(2, '0');
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      return `${dd}/${mm} ${hh}:00`;
+    });
+    const values = data.buckets.map(b => parseFloat(b.revenue_baht));
+
+    const ctx = document.getElementById('chart-revenue').getContext('2d');
+    if (chart) chart.destroy();
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'ยอดขาย (บาท)',
+          data: values,
+          borderColor: '#C8102E',
+          backgroundColor: 'rgba(200,16,46,0.12)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+        }],
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { autoSkip: true, maxTicksLimit: 10 } },
+          y: {
+            beginAtZero: true,
+            ticks: { callback: v => '฿' + v.toLocaleString('th-TH') },
+          },
+        },
+      },
+    });
+  }
+
+  async function refreshTopProducts() {
+    const data = await api('/api/products/top?days=7&limit=10');
+    const root = document.getElementById('top-products');
+    if (!data.items.length) {
+      root.innerHTML = '<div class="text-sm text-slate-400 py-4">ยังไม่มีออเดอร์ในช่วง 7 วัน</div>';
+      return;
+    }
+    root.innerHTML = data.items.map((p, i) => `
+      <div class="flex items-center gap-3 py-3">
+        <div class="text-slate-300 font-bold w-6 text-center">${i + 1}</div>
+        <img src="${p.image_url || ''}"
+             onerror="this.style.visibility='hidden'"
+             class="w-12 h-12 rounded object-cover bg-slate-100">
+        <div class="flex-1 min-w-0">
+          <div class="font-medium truncate">${p.name}</div>
+          <div class="text-xs text-slate-500">ขายไป ${fmtNumber(p.qty)} ชิ้น</div>
+        </div>
+        <div class="text-right">
+          <div class="font-semibold">${fmtBaht(p.revenue_baht)}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  async function refreshAll() {
+    document.getElementById('btn-refresh').disabled = true;
+    try {
+      const [meta] = await Promise.all([
+        api('/api/health'),
+        refreshSummary(),
+        refreshChart(parseInt(document.getElementById('chart-range').value, 10)),
+        refreshTopProducts(),
+      ]);
+      document.getElementById('footer-version').textContent = 'v' + meta.version;
+      const now = new Date();
+      document.getElementById('last-updated').textContent =
+        'อัปเดตล่าสุด ' + now.toLocaleTimeString('th-TH');
+    } catch (e) {
+      console.error(e);
+      document.getElementById('last-updated').textContent = 'โหลดข้อมูลไม่สำเร็จ';
+    } finally {
+      document.getElementById('btn-refresh').disabled = false;
+    }
+  }
+
+  document.getElementById('btn-refresh').addEventListener('click', refreshAll);
+  document.getElementById('chart-range').addEventListener('change', e => {
+    refreshChart(parseInt(e.target.value, 10));
+  });
+  document.getElementById('btn-seed').addEventListener('click', async () => {
+    const r = await fetch('/api/demo/seed', { method: 'POST' });
+    const j = await r.json();
+    alert(`สร้างข้อมูลตัวอย่างเรียบร้อย: ${j.seeded} ออเดอร์`);
+    refreshAll();
+  });
+
+  // Auto-refresh every 60 s so the dashboard "feels live" while the
+  // seller has it open in the background. Cheap on localhost.
+  refreshAll();
+  setInterval(refreshAll, 60_000);
+</script>
+</body>
+</html>

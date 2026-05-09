@@ -1,0 +1,42 @@
+# Caddy reverse proxy for NP Create.
+#
+# Caddy automatically obtains + renews a Let's Encrypt cert for
+# {$DOMAIN} on first request, so the operator does NOT manage
+# certbot. ``DOMAIN`` is read from docker-compose's environment.
+#
+# We:
+# * proxy everything to the FastAPI app on port 8000 (internal),
+# * compress responses (gzip + zstd),
+# * forward the real client IP via X-Forwarded-For so
+#   ``public_activate._client_ip`` records meaningful values,
+# * write access logs in JSON so they're greppable on the VPS.
+
+{$DOMAIN} {
+    encode zstd gzip
+
+    # Long-running uploads (support log zips) — bump from default
+    # 10 s so a 50 MB upload from a slow Thai 3G mobile hotspot
+    # doesn't time out.
+    request_body {
+        max_size 60MB
+    }
+
+    @publicWrite path /api/v1/support/upload
+    handle @publicWrite {
+        reverse_proxy app:8000 {
+            transport http {
+                read_timeout  5m
+                write_timeout 5m
+            }
+        }
+    }
+
+    handle {
+        reverse_proxy app:8000
+    }
+
+    log {
+        output file /data/access.log
+        format json
+    }
+}

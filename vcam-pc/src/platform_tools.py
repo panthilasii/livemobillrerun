@@ -164,13 +164,98 @@ def find_lspatch_jar() -> Path | None:
     return _first_existing(["lspatch/lspatch.jar"])
 
 
+def find_scrcpy() -> Path | None:
+    """Locate the ``scrcpy`` binary used for the on-PC mirror window.
+
+    scrcpy is the Genymobile project (https://github.com/Genymobile/scrcpy)
+    that streams an Android screen over the same ADB transport we
+    already use. We **auto-install** it on first Mirror click via
+    :mod:`scrcpy_installer` so customers don't have to know what
+    Homebrew or scoop are.
+
+    Lookup order, first hit wins:
+
+    1. ``.tools/<os>/scrcpy/scrcpy(.exe)`` — bundled inside the
+       customer zip by ``tools/build_release.py``. New customers
+       get this for free, no first-click download.
+    2. ``~/.npcreate/tools/scrcpy-<version>/.../scrcpy(.exe)``
+       — installed by ``scrcpy_installer.install()`` on first
+       Mirror click. This is the path existing customers (who got
+       NP Create before bundling shipped) end up on.
+    3. ``shutil.which("scrcpy")`` — power users on Linux who
+       prefer their distro's package over our auto-installer.
+    4. Well-known Windows install dirs scoop/choco use even when
+       PATH hasn't been refreshed in the current shell.
+
+    Returns ``None`` if absolutely nothing is on disk; the UI then
+    pops the auto-install dialog.
+    """
+    sfx = exe_suffix()
+    bundled = _first_existing([f"scrcpy/scrcpy{sfx}", f"scrcpy{sfx}"])
+    if bundled:
+        return bundled
+
+    # Imported lazily to avoid a circular import — scrcpy_installer
+    # imports platform_tools indirectly via the rest of the package
+    # tree on some module-load orders.
+    try:
+        from . import scrcpy_installer
+        user_installed = scrcpy_installer.find_user_installed()
+        if user_installed is not None:
+            return user_installed.resolve()
+    except Exception:
+        # Never let a bug in the installer-lookup hide a
+        # system-installed scrcpy from the rest of the resolver.
+        pass
+
+    sys_scrcpy = shutil.which("scrcpy")
+    if sys_scrcpy:
+        return Path(sys_scrcpy).resolve()
+
+    # Windows-only: scoop/choco install to predictable spots that
+    # often aren't on PATH for a fresh GUI launch (PATH is read at
+    # explorer-process start time, not at install time). We probe
+    # the well-known dirs so customers don't have to log out + back
+    # in just to mirror their phone.
+    if os.name == "nt":
+        for env in ("USERPROFILE", "LOCALAPPDATA", "PROGRAMFILES"):
+            base = os.environ.get(env, "")
+            if not base:
+                continue
+            for rel in (
+                r"scoop\apps\scrcpy\current\scrcpy.exe",
+                r"scoop\shims\scrcpy.exe",
+                r"chocolatey\bin\scrcpy.exe",
+                r"scrcpy\scrcpy.exe",
+            ):
+                p = Path(base) / rel
+                if p.is_file():
+                    return p.resolve()
+    return None
+
+
 def find_vcam_apk() -> Path | None:
     """Return Path to the prebuilt vcam-app APK shipped alongside the
     customer bundle, falling back to the dev `gradlew assembleDebug`
-    output."""
+    output.
+
+    Search order matters -- this list MUST stay in sync with what
+    ``tools/build_release.py`` writes into the ZIP (see
+    ``vcam-app-release.apk`` rename comment in that file). We keep
+    ``vcam-app.apk`` in the list as a backstop for the legacy 1.4.5
+    bundles already in customer hands; from 1.4.6 onward the
+    ``-release`` name is canonical.
+    """
     candidates = [
+        # 1.4.6+ canonical name (what build_release.py writes)
         PROJECT_ROOT.parent / "apk" / "vcam-app-release.apk",
         PROJECT_ROOT.parent / "apk" / "vcam-app-debug.apk",
+        # Legacy 1.4.5 customer bundles -- accepted so updating to
+        # 1.4.6 doesn't break customers who copy in just the new
+        # src/ folder over an existing extract.
+        PROJECT_ROOT.parent / "apk" / "vcam-app.apk",
+        # Dev workspace (gradle output) -- used when running from
+        # the source tree, not from a customer ZIP.
         PROJECT_ROOT.parent
         / "vcam-app/app/build/outputs/apk/release/app-release.apk",
         PROJECT_ROOT.parent

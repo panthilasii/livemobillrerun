@@ -1,0 +1,32 @@
+# NP Create license/admin server runtime deps.
+#
+# Pinned to caret-style ranges that we know work; bumping a major
+# version requires re-running the test suite.
+
+# --- HTTP layer ---
+fastapi>=0.115,<0.117
+uvicorn[standard]>=0.32,<0.36
+# Form parsing for login + file uploads. FastAPI's UploadFile needs
+# python-multipart; the wheel is tiny.
+python-multipart>=0.0.20,<0.1
+
+# --- Auth + crypto ---
+# bcrypt for admin password hashing. We deliberately avoid passlib
+# because its bcrypt backend triggers a deprecation warning on every
+# import in modern Python — the raw bcrypt package is 1 import line.
+bcrypt>=4.2,<5.0
+# itsdangerous powers the signed-cookie session middleware. Tiny,
+# zero-dep, used for decades by Flask.
+itsdangerous>=2.2,<3.0
+
+# --- Templates ---
+# We prefer Tailwind+Alpine in the static HTML, but the login flash
+# and a couple of admin pages need server-side rendering for clarity
+# (auth gating, CSRF tokens). Jinja2 is the obvious choice and ships
+# with FastAPI's docs.
+jinja2>=3.1,<4.0
+
+# --- Tests ---
+pytest>=8.3,<9.0
+httpx>=0.28,<0.29   # ASGI test client for FastAPI
+pytest-asyncio>=0.24,<1.0

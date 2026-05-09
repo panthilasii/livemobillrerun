@@ -93,15 +93,45 @@ class TestLauncherSyntax:
         assert body.lstrip().startswith("@echo off")
         assert "%~dp0" in body
         assert "py -3" in body or "python " in body
-        assert "--studio" in body
-        # Final pause so a customer who double-clicks and hits an
-        # error sees the error before the window vanishes.
-        assert body.rstrip().endswith("pause")
+        # The .bat hands off to ``src._winlauncher`` (see that module
+        # for the rationale — cmd.exe parses .bat with the OEM
+        # codepage so any Thai byte in the file blows up parsing).
+        # The actual ``--studio`` arg lives inside the Python
+        # launcher, so we verify the handoff path here instead.
+        assert "src._winlauncher" in body, (
+            "Windows .bat must hand off to src._winlauncher so all "
+            "Thai user messaging happens in Python (where UTF-8 is "
+            "explicit). Putting Thai bytes in a .bat triggers cmd.exe "
+            "parser errors like 'xxx is not recognized as an internal "
+            "or external command'."
+        )
+        # Pause must appear when Python is missing so the customer
+        # actually sees the install instructions before the cmd.exe
+        # window auto-closes.
+        assert "pause" in body
+        assert "chcp 65001" in body, "must set UTF-8 codepage for Thai output"
+        # The .bat itself MUST be ASCII-only, otherwise cmd.exe parses
+        # it under the OEM codepage and crashes with "'xxx' is not
+        # recognized as an internal or external command".
+        try:
+            body.encode("ascii")
+        except UnicodeEncodeError as exc:  # pragma: no cover
+            raise AssertionError(
+                "run.bat must be pure ASCII — non-ASCII bytes break "
+                f"cmd.exe parsing on customer machines: {exc}"
+            )
 
     def test_macos_launcher_is_bash(self):
         body = self.br._launcher_body("macos")
         assert body.startswith("#!/usr/bin/env bash")
-        assert 'set -e' in body
+        # Either `set -e` (exit-on-error) or `set -u` (unset-var-error)
+        # is acceptable — both make typos blow up loudly during the
+        # 30-second first-run install instead of silently doing
+        # nothing. We deliberately do *not* require both because
+        # `set -e` interferes with our explicit error dialog flow.
+        assert ("set -e" in body) or ("set -u" in body), (
+            "macOS launcher should opt in to a strict bash mode"
+        )
         # Self-locate so a double-click doesn't depend on cwd.
         assert '$(dirname "$0")' in body
         assert "--studio" in body
@@ -129,19 +159,96 @@ class TestBundleAudit:
         cls.br = importlib.import_module("tools.build_release")
 
     def test_admin_tools_blocklist(self):
-        # Every script that can sign or rotate a key must be in
-        # ADMIN_TOOLS so build_release.py drops it from customer ZIPs.
+        # Every script that can sign keys, rotate the keypair, build
+        # bundles, fetch external binaries, or otherwise expose the
+        # admin's workflow must be in ADMIN_TOOLS so build_release.py
+        # drops it from customer ZIPs.
         must_block = {
             "gen_license.py",
             "init_keys.py",
             "build_release.py",
+            "build_pyinstaller.py",
+            "_pyinstaller_entry.py",
+            "_download_helper.py",
             "setup_windows_tools.py",
+            "setup_macos_tools.py",
             "setup_ffmpeg.py",
         }
         missing = must_block - self.br.ADMIN_TOOLS
         assert not missing, (
             f"these scripts should be admin-only but aren't blocked: "
             f"{missing}"
+        )
+
+    def test_admin_tools_set_covers_every_script_in_tools_dir(self):
+        """Catch the easy mistake of adding a new tools/ helper and
+        forgetting to add it to ADMIN_TOOLS *or* explicitly mark it
+        as customer-safe. Default = block (safer).
+
+        We scan Python, shell, batch, Inno Setup, and adjacent text
+        files because every one of those formats can leak admin
+        workflow / dev-only assumptions / EULA-source-of-truth into
+        the customer ZIP.
+        """
+        from pathlib import Path
+
+        tools_dir = (
+            Path(__file__).resolve().parent.parent / "tools"
+        )
+        # Files deliberately shipped to customers. ``__init__.py`` is
+        # always fine — package marker, no executable code we care
+        # about. Add a new entry here only after a deliberate review.
+        CUSTOMER_SAFE: set[str] = {"__init__.py"}
+
+        # Glob every executable + text format we currently keep under
+        # tools/. Add new patterns when introducing new file types.
+        candidates: list[Path] = []
+        for pat in ("*.py", "*.sh", "*.bat", "*.iss", "*.txt"):
+            candidates.extend(tools_dir.glob(pat))
+
+        for f in candidates:
+            name = f.name
+            if name in CUSTOMER_SAFE:
+                continue
+            assert name in self.br.ADMIN_TOOLS, (
+                f"{name} sits in tools/ but is neither in "
+                f"ADMIN_TOOLS nor declared customer-safe — "
+                f"this would leak into customer bundles. "
+                f"Add it to ADMIN_TOOLS in build_release.py."
+            )
+
+    def test_apk_ship_name_resolvable_at_runtime(self):
+        """``build_release.py`` writes the vcam-app APK under one
+        specific filename inside the customer ZIP, and
+        ``platform_tools.find_vcam_apk()`` searches a hard-coded
+        list of names at runtime. If those two drift, customers see
+        "patch failed" with no useful error -- the runtime can't
+        locate the Xposed module APK shipped right next to it.
+
+        This regression actually reached the field in 1.4.5
+        (Windows customer reported "render ผ่าน adb ไม่ได้").
+        Pin the alignment so it can't slip again.
+        """
+        import inspect
+        from src import platform_tools
+
+        src = inspect.getsource(platform_tools.find_vcam_apk)
+        # The shipped name from build_release.py:
+        ship_name = "vcam-app-release.apk"
+        assert ship_name in src, (
+            f"build_release.py writes apk/{ship_name} but "
+            f"find_vcam_apk() does not search for that name. "
+            f"Customers will see 'patch failed' on Windows."
+        )
+
+        # Also assert the matching constant is in build_release.py
+        # itself -- read it as a string so it survives black/ruff
+        # reformatting.
+        from pathlib import Path as _Path
+        br_src = _Path(self.br.__file__).read_text(encoding="utf-8")
+        assert f'"{{prefix}}/apk/{ship_name}"' in br_src, (
+            f"build_release.py must write apk/{ship_name} so the "
+            f"runtime resolver can find it."
         )
 
     def test_ship_tools_patterns_dont_drag_dev_only(self):

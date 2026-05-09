@@ -12,7 +12,6 @@ In CLI mode, Ctrl+C stops cleanly.
 from __future__ import annotations
 
 import argparse
-import logging
 import signal
 import sys
 import time
@@ -21,16 +20,24 @@ from pathlib import Path
 from .adb import AdbController
 from .config import PROJECT_ROOT, ProfileLibrary, StreamConfig
 from .health import HealthMonitor
+from .log_setup import configure_logging
 from .playlist import list_videos, write_playlist
 from .tcp_server import TcpStreamServer
 
 
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    """Configure root logging with a rotating on-disk file handler
+    in addition to console output.
+
+    The on-disk log is critical for non-technical customer support:
+    when something breaks at 11pm during a TikTok Live, the customer
+    can't paste a stack trace into Line OA; they CAN attach
+    ``logs/npcreate.log`` (or the diagnostic ZIP we generate from
+    Settings → "ส่ง Log ให้แอดมิน"). All log-config knobs --
+    rotation size, retention, redaction policy -- live in
+    ``log_setup`` so they're testable in isolation.
+    """
+    configure_logging(verbose=verbose)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

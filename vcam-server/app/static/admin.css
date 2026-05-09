@@ -1,0 +1,18 @@
+/* Tiny stylesheet — Tailwind handles ~99 % of the styling, this
+   file only houses the few rules that are awkward to express as
+   utility classes.
+
+   `[x-cloak]` keeps Alpine.js-controlled elements hidden until the
+   framework boots, preventing the "flash of unstyled content"
+   where every tab section is visible for ~50 ms before
+   `x-show` evaluates. */
+
+[x-cloak] { display: none !important; }
+
+/* Slightly tighter table cells than the default Tailwind line-
+   height. Looks more "spreadsheet-y" which matches admin
+   workflows. */
+table td, table th {
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
+}

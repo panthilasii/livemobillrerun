@@ -57,12 +57,102 @@ class DeviceEntry:
     wifi_ip: str = ""
     wifi_port: int = 5555
     last_seen_via: str = ""        # "usb" | "wifi" | ""
+    # ── TikTok variant detection ────────────────────────────────
+    # Different customers run different TikTok builds (regular,
+    # Lite, Business, Douyin). We probe ``pm list packages`` per
+    # device and remember which package the customer actually has
+    # installed. The hook pipeline targets THIS package when it
+    # pushes ``vcam_final.mp4``; without per-device detection we'd
+    # be writing to ``com.ss.android.ugc.trill/files/`` on a phone
+    # that only has TikTok Lite (``com.zhiliaoapp.musically.go``)
+    # installed, and the Live preview would stay black.
+    # Empty = "use the default" (legacy entries that pre-date this
+    # field; resolved at hook time by ``hook_status.probe`` if the
+    # device is online).
+    tiktok_package: str = ""
+    # ── TikTok version drift watch ──────────────────────────────
+    # ``patched_tiktok_version`` is the ``versionName`` we recorded
+    # on the phone *immediately after* a successful Patch (e.g.
+    # "39.5.4"). The background hook-status probe re-reads
+    # versionName on every visit; if it diverges, we know TikTok
+    # auto-updated itself out from under us and the customer's
+    # vcam stops working until they re-patch.
+    #
+    # Why this matters: TikTok's in-app "Update available" prompt
+    # is one tap away from replacing our LSPatched APK with a
+    # vanilla one (it goes through Play Store / TikTok CDN, neither
+    # of which know about LSPatch). The customer typically taps
+    # "OK" without reading and only finds out their live broadcast
+    # is showing the front camera again.
+    #
+    # We surface drift in the sidebar (⚠️ badge) and offer a
+    # one-click "Re-patch" so they can recover without an admin
+    # call. Empty string for entries that haven't been patched yet.
+    patched_tiktok_version: str = ""
+    # APK signature fingerprint (lowercase hex) recorded the moment
+    # we successfully installed the patched APK. Used by the hook
+    # status probe as the *primary* "is this patched?" check —
+    # exact match against a known-good baseline is the only signal
+    # that survives Android-version / OEM-ROM differences in
+    # ``dumpsys package`` output without false negatives.
+    #
+    # Empty string for legacy entries; the probe falls back to a
+    # list of known LSPatch keystore prefixes in that case.
+    patched_signature: str = ""
+    # Last time we showed the customer the "TikTok updated, please
+    # re-patch" warning dialog. Used to rate-limit so we don't nag
+    # every 2-second probe — once per session is plenty annoying.
+    tiktok_drift_warned_at: str = ""
+    # ── Live session tracking ───────────────────────────────────
+    # ISO 8601 timestamp of the moment the customer clicked
+    # "เริ่มไลฟ์" on this device. Empty = not currently live.
+    # Persisted to disk so closing the desktop app mid-broadcast
+    # doesn't lose the timer; on next launch we restore the
+    # value and resume counting from the original start instant.
+    # We deliberately store start-time only (not duration) -- a
+    # crash + restart still surfaces the correct elapsed minutes
+    # because the wall clock is the source of truth.
+    live_started_at: str = ""
+    # Total minutes broadcast lifetime-to-date for this phone --
+    # cosmetic ("เครื่องนี้ไลฟ์ไปทั้งหมด 12:34 ชม.") + lets the
+    # customer compare phones without a separate analytics DB.
+    # Updated at stop_live() time.
+    total_live_seconds: int = 0
 
     def display_name(self) -> str:
         return self.label or self.model or self.serial
 
     def is_patched(self) -> bool:
         return bool(self.patched_at)
+
+    def is_live(self) -> bool:
+        """``True`` if a Live session is currently in progress on
+        this phone according to our local state. The actual
+        TikTok broadcast might have ended without us noticing
+        (network hiccup, force-quit), so this is best-effort --
+        UI code should rate-limit any actions that depend on it."""
+        return bool(self.live_started_at)
+
+    def live_elapsed_seconds(self, now: "datetime | None" = None) -> int:
+        """Seconds since this phone went live, or 0 when not
+        currently broadcasting. Returns 0 (not negative) on a
+        malformed timestamp -- never crash a UI tick."""
+        if not self.live_started_at:
+            return 0
+        try:
+            t0 = datetime.fromisoformat(self.live_started_at)
+        except (ValueError, TypeError):
+            return 0
+        ref = now or datetime.now()
+        if t0.tzinfo is None and ref.tzinfo is not None:
+            # Naive started_at compared against aware now -- normalize
+            # by stripping the tz of the reference. Both are local
+            # wall-clock-ish in our app.
+            ref = ref.replace(tzinfo=None)
+        elif t0.tzinfo is not None and ref.tzinfo is None:
+            ref = ref.astimezone(t0.tzinfo)
+        delta = (ref - t0).total_seconds()
+        return max(0, int(delta))
 
     def has_audio_override(self) -> bool:
         return bool(self.last_audio)
@@ -112,6 +202,18 @@ class DeviceLibrary:
                     wifi_ip=str(raw.get("wifi_ip", "")),
                     wifi_port=int(raw.get("wifi_port", 5555) or 5555),
                     last_seen_via=str(raw.get("last_seen_via", "")),
+                    tiktok_package=str(raw.get("tiktok_package", "")),
+                    patched_tiktok_version=str(
+                        raw.get("patched_tiktok_version", "")
+                    ),
+                    patched_signature=str(
+                        raw.get("patched_signature", "")
+                    ),
+                    tiktok_drift_warned_at=str(
+                        raw.get("tiktok_drift_warned_at", "")
+                    ),
+                    live_started_at=str(raw.get("live_started_at", "")),
+                    total_live_seconds=int(raw.get("total_live_seconds", 0) or 0),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)
@@ -201,11 +303,98 @@ class DeviceLibrary:
             if mirror_v is not None:
                 e.mirror_v = bool(mirror_v)
 
-    def mark_patched(self, serial: str) -> None:
+    def mark_patched(
+        self,
+        serial: str,
+        tiktok_version: str = "",
+        signature: str = "",
+    ) -> None:
+        """Record a successful Patch + (optionally) the TikTok
+        ``versionName`` and APK signature we just installed.
+
+        Storing the version is what enables the drift watcher in
+        ``hook_status`` — at runtime it compares the live
+        versionName on the phone to this value and warns the
+        customer if TikTok has auto-updated itself out from under
+        our LSPatch overlay.
+
+        Storing the signature is what makes the patched/unpatched
+        detection *reliable* across Android versions: the probe
+        compares the live signature against this baseline by
+        exact match, eliminating false negatives caused by
+        ``dumpsys package`` output format differences between
+        AOSP / MIUI / HyperOS / ColorOS / OneUI etc.
+
+        Calling without ``tiktok_version`` / ``signature`` (the
+        legacy single-arg form) is still supported for back-compat
+        with older code paths; in that case the probe falls back
+        to its known-prefix list, which is less precise but still
+        useful for legacy entries.
+        """
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is None:
+                return
+            e.patched_at = datetime.now().isoformat(timespec="seconds")
+            e.patched_tiktok_version = (tiktok_version or "").strip()
+            e.patched_signature = (signature or "").strip().lower()
+            # Reset the drift-warning rate-limit so the next genuine
+            # update event triggers a fresh warning rather than
+            # being suppressed by a stale "warned at <date>" stamp
+            # from before the user re-patched.
+            e.tiktok_drift_warned_at = ""
+
+    def reconcile_observed_patched(
+        self,
+        serial: str,
+        signature: str = "",
+        tiktok_version: str = "",
+    ) -> bool:
+        """Auto-heal: the hook-status probe just observed that this
+        device IS patched (signature matches a known-good prefix
+        or the recorded baseline), but our entry has no
+        ``patched_at`` timestamp. Set one now so the rest of the UI
+        (sidebar status, dashboard "พร้อมใช้งาน" badge, encode
+        gating) lights up correctly without forcing the customer
+        to re-run a Patch they already did.
+
+        Two real-world triggers for this path:
+
+        1. Customer migrated their ``devices.json`` (or it got
+           wiped) but the actual phone is still patched.
+        2. Customer Patched from a different machine, then plugged
+           the same phone into this PC.
+
+        Returns ``True`` when we mutated state (caller should
+        ``save_devices()`` after).
+        """
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is None or e.patched_at:
+                return False
+            e.patched_at = datetime.now().isoformat(timespec="seconds")
+            sig_clean = (signature or "").strip().lower()
+            ver_clean = (tiktok_version or "").strip()
+            # Don't overwrite a richer existing baseline (rare —
+            # patched_at empty but signature non-empty would only
+            # happen via a manual file edit), but DO record the
+            # observed values when the entry is otherwise blank.
+            if sig_clean and not e.patched_signature:
+                e.patched_signature = sig_clean
+            if ver_clean and not e.patched_tiktok_version:
+                e.patched_tiktok_version = ver_clean
+            return True
+
+    def mark_tiktok_drift_warned(self, serial: str) -> None:
+        """Stamp the rate-limit so the drift dialog won't reopen
+        every 2-second probe tick. UI calls this right after the
+        customer dismisses the warning."""
         with self._lock:
             e = self.entries.get(serial)
             if e is not None:
-                e.patched_at = datetime.now().isoformat(timespec="seconds")
+                e.tiktok_drift_warned_at = datetime.now().isoformat(
+                    timespec="seconds",
+                )
 
     def update_wifi(
         self,
@@ -228,6 +417,57 @@ class DeviceLibrary:
             if e is not None:
                 e.wifi_ip = ""
                 e.last_seen_via = "usb" if e.last_seen_via == "wifi" else e.last_seen_via
+
+    # ── live session helpers ────────────────────────────────────
+
+    def start_live(self, serial: str) -> str:
+        """Mark ``serial`` as currently live and return the ISO
+        timestamp we recorded. Idempotent: if the device is
+        already marked live, we *keep* the original start time --
+        clicking "Start" twice doesn't reset the elapsed counter
+        and lose the customer's first hour of broadcast.
+        """
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is None:
+                e = DeviceEntry(serial=serial)
+                e.added_at = datetime.now().isoformat(timespec="seconds")
+                self.entries[serial] = e
+            if not e.live_started_at:
+                e.live_started_at = datetime.now().isoformat(timespec="seconds")
+            return e.live_started_at
+
+    def stop_live(self, serial: str) -> int:
+        """Clear the live flag and accumulate the session length
+        into ``total_live_seconds``. Returns the duration we just
+        recorded (0 if the device wasn't marked live)."""
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is None or not e.live_started_at:
+                return 0
+            elapsed = e.live_elapsed_seconds()
+            e.live_started_at = ""
+            e.total_live_seconds = int(e.total_live_seconds or 0) + elapsed
+            return elapsed
+
+    def list_live_serials(self) -> list[str]:
+        """All device serials currently in a live session. Used
+        by the sidebar to paint the 🔴 dot."""
+        with self._lock:
+            return [s for s, e in self.entries.items() if e.is_live()]
+
+    def update_tiktok_package(self, serial: str, package: str) -> None:
+        """Remember which TikTok variant the device has installed.
+
+        Called by the dashboard's hook-status probe whenever it
+        successfully resolves a package, and by the patch wizard
+        right after a successful install. Pass an empty string to
+        clear (rare; only useful if the customer uninstalls
+        TikTok entirely)."""
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                e.tiktok_package = (package or "").strip()
 
     def mark_seen_via(self, serial: str, transport: str) -> None:
         """``transport`` ∈ {"usb","wifi"}. Pure cosmetic — drives the

@@ -3,9 +3,25 @@
 # customtkinter  — modern dark-themed Tk wrapper for the Studio UI
 # Pillow         — image handling for previews + wizard illustrations
 # pytest         — test suite
+# fastapi        — embedded sales-dashboard webapp ("Dashboard" button)
+# uvicorn        — ASGI server that hosts FastAPI on localhost:8765
+# httpx          — async HTTP client used to call the TikTok Shop API
+# certifi        — Mozilla CA bundle so urllib TLS verification works
+#                  on machines without an OS-level cert store (notably
+#                  Python.org's macOS installer, which is what most
+#                  customers end up with). Used by scrcpy_installer +
+#                  announcements fetch + license_server.
+#
+# Note: FastAPI/uvicorn/httpx are pinned to versions that ship pure-
+# Python wheels for both macOS and Windows so the installer doesn't
+# pull in a C compiler on the customer's machine.
 #
 # To install:
 #   pip install -r requirements.txt
 customtkinter>=5.2.2
 Pillow>=10.4.0
 pytest>=8.0
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+certifi>=2024.7.4

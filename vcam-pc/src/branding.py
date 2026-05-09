@@ -36,7 +36,7 @@ class Brand:
     company_th: str = "บริษัท เอ็นพี ครีเอ็ท จำกัด"
     company_en: str = "NP Create Co., Ltd."
 
-    version: str = "1.3.0"
+    version: str = "1.7.6"
 
     tagline_th: str = "ระบบไลฟ์มือโปร — เสถียร ใช้ง่าย"
     tagline_en: str = "Online Advertising & Digital Marketing"
@@ -55,6 +55,15 @@ class Brand:
     default_devices_per_key: int = 3
     default_license_days: int = 30
 
+    # URL of the central admin server (`vcam-server/`) that handles
+    # phone-home activations + revocation broadcasts. Empty string =
+    # offline-only mode (the customer app falls back to pure local
+    # license verification, exactly like before the server existed).
+    # Once we deploy the server publicly, change this to e.g.
+    # ``"https://admin.np-create.com"`` and rebuild the customer
+    # bundle.
+    license_server_url: str = ""
+
     # Asset locations. Resolved as absolute paths so callers can pass
     # them directly to PhotoImage / iconbitmap regardless of cwd.
     logo_path: Path = ASSETS_DIR / "logo.png"
@@ -62,6 +71,7 @@ class Brand:
     logo_128_path: Path = ASSETS_DIR / "logo_128.png"
     logo_64_path: Path = ASSETS_DIR / "logo_64.png"
     icon_ico_path: Path = ASSETS_DIR / "logo.ico"
+    icon_icns_path: Path = ASSETS_DIR / "logo.icns"
 
 
 @dataclass(frozen=True)

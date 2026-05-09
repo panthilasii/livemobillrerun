@@ -505,12 +505,18 @@ class LSPatchPipeline:
                                  error="\n".join(tail))
 
         # Step 3: read back the new signature so we can show "patched"
-        # in the GUI as confirmation.
+        # in the GUI as confirmation. Uses the shared multi-pattern
+        # parser from ``hook_status`` so we don't drift between the
+        # install-time fingerprint and the runtime probe — they MUST
+        # extract the same hex string for the per-device baseline to
+        # match on subsequent probes.
+        from . import hook_status as _hs
         sig = self._adb_shell(
-            f"dumpsys package {package} | grep -m1 signatures", serial
+            f"dumpsys package {package} | "
+            "grep -iE -A2 'signatures|signingInfo|signers|cert digests'",
+            serial,
         )
-        m = re.search(r"signatures:\[(\w+)\]", sig)
-        fp = m.group(1) if m else ""
+        fp = _hs._extract_fingerprint(sig or "")
 
         return InstallResult(ok=True, elapsed_s=elapsed, fingerprint=fp)
 
@@ -538,16 +544,25 @@ class LSPatchPipeline:
             m = re.search(r"versionName=(\S+)", ver)
             out["version"] = m.group(1) if m else "?"
 
+            from . import hook_status as _hs
             sig = self._adb_shell(
-                f"dumpsys package {pkg} | grep -m1 signatures", serial)
-            m = re.search(r"signatures:\[(\w+)\]", sig)
-            out["fingerprint"] = m.group(1) if m else ""
+                f"dumpsys package {pkg} | "
+                "grep -iE -A2 'signatures|signingInfo|signers|cert digests'",
+                serial,
+            )
+            out["fingerprint"] = _hs._extract_fingerprint(sig or "")
 
-            # LSPatch's debug-keystore self-signed cert produces a known
-            # fingerprint prefix "e0b8d3e5" on every run because the
-            # bundled keystore is a constant.
-            out["patched"] = "yes" if out["fingerprint"].startswith("e0b8d3e5") \
-                else "no"
+            # LSPatch's debug-keystore self-signed cert produces one
+            # of a small set of known fingerprint prefixes (the
+            # tuple is maintained centrally in hook_status). Match
+            # against the whole list so legacy + current LSPatch
+            # builds both detect as patched.
+            fp = out["fingerprint"]
+            patched = any(
+                fp.startswith(p)
+                for p in _hs._KNOWN_LSPATCH_FINGERPRINT_PREFIXES
+            )
+            out["patched"] = "yes" if patched else "no"
             break
         return out
 

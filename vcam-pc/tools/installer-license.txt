@@ -1,0 +1,89 @@
+﻿NP Create — License Agreement / ข้อตกลงการใช้งาน
+==================================================
+Version 1.0 — May 2026
+
+
+ภาษาไทย
+=======
+
+1. ลิขสิทธิ์
+   ซอฟต์แวร์ NP Create ("ซอฟต์แวร์") เป็นกรรมสิทธิ์ของ
+   บริษัท เอ็นพี ครีเอ็ท จำกัด ("บริษัท") การติดตั้งและใช้งาน
+   หมายถึงการยอมรับเงื่อนไขในเอกสารฉบับนี้
+
+2. การใช้งานที่ได้รับอนุญาต
+   - ใช้งานได้กับ License Key ที่บริษัทออกให้เท่านั้น
+   - 1 License Key ใช้กับเครื่องมือถือไม่เกิน 3 เครื่อง
+     (เปลี่ยนเครื่องได้ตามจำนวน slot ที่เหลือ)
+   - ใช้ในเชิงพาณิชย์ส่วนตัวได้
+
+3. ข้อห้าม
+   - ห้ามแจกจ่าย ขายต่อ หรือ reverse-engineer ซอฟต์แวร์
+   - ห้ามแชร์ License Key ให้บุคคลที่สาม
+   - ห้ามใช้เพื่อการกระทำผิดกฎหมาย รวมถึงการละเมิดลิขสิทธิ์
+     ผู้อื่น การฉ้อโกง หรือเนื้อหาที่ผิดกฎหมาย
+
+4. ความรับผิดของลูกค้าต่อแพลตฟอร์ม TikTok
+   ซอฟต์แวร์นี้ใช้เทคนิคที่อาจขัดต่อ Terms of Service ของ
+   TikTok ลูกค้ารับทราบและยอมรับว่า:
+   - การใช้งานอาจส่งผลให้บัญชี TikTok ถูกระงับ
+   - บริษัทไม่รับผิดชอบต่อการระงับบัญชีหรือเนื้อหาที่สูญหาย
+
+5. การรับประกันและความรับผิด
+   ซอฟต์แวร์ให้บริการ "ตามสภาพ" บริษัทไม่รับประกันว่า
+   จะใช้งานได้กับมือถือทุกรุ่นทุกเวอร์ชัน Android ขอบเขต
+   ความรับผิดของบริษัทไม่เกินค่า License Key ที่ลูกค้าจ่าย
+   ในเดือนล่าสุด
+
+6. การยกเลิก
+   - บริษัทมีสิทธิ์ยกเลิก License โดยไม่คืนเงินหากตรวจพบ
+     การละเมิดข้อ 3
+   - ลูกค้าขอคืนเงินได้ภายใน 7 วันแรก เฉพาะกรณีที่ระบบใช้
+     งานไม่ได้และทีมแอดมินไม่สามารถแก้ไขได้
+
+7. การติดต่อ
+   Line OA: @npcreate
+   เวลาทำการ: 9:00 - 22:00 น. ทุกวัน
+
+
+English
+=======
+
+1. Copyright
+   The NP Create software ("Software") is owned by NP Create
+   Co., Ltd. ("Company"). Installation constitutes acceptance
+   of these terms.
+
+2. Permitted Use
+   - Use only with a License Key issued by the Company.
+   - One License Key permits up to 3 mobile device activations
+     concurrently (slots may be transferred as available).
+   - Personal commercial use is permitted.
+
+3. Prohibitions
+   - No redistribution, resale, or reverse engineering.
+   - No sharing of License Key with third parties.
+   - No use for unlawful activities, copyright infringement,
+     fraud, or illegal content.
+
+4. TikTok Platform Risks
+   This Software employs techniques that may violate TikTok's
+   Terms of Service. Customer acknowledges and accepts:
+   - Use may result in TikTok account suspension.
+   - Company is not liable for account loss or content damage.
+
+5. Warranty and Liability
+   The Software is provided "AS IS". The Company makes no
+   warranty that it works on every device or Android version.
+   Company's liability is limited to the License Key fee paid
+   by Customer in the most recent billing month.
+
+6. Termination
+   - Company may terminate License without refund if Section 3
+     is violated.
+   - Customer may request refund within 7 days only when the
+     Software fails and admin support cannot resolve.
+
+7. Contact
+   Line OA: @npcreate
+   Hours: 09:00 - 22:00 daily (UTC+7)

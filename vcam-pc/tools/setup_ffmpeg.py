@@ -20,10 +20,7 @@ under ``.tools/<os>/ffmpeg{.exe}`` and the resolver in
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 import sys
-import urllib.request
 import zipfile
 from pathlib import Path
 from tarfile import TarFile
@@ -33,6 +30,10 @@ PROJECT = HERE.parent
 WORKSPACE = PROJECT.parent
 
 CACHE = WORKSPACE / ".cache" / "ffmpeg"
+
+# See setup_windows_tools.py for the rationale behind this helper.
+sys.path.insert(0, str(HERE))
+from _download_helper import download as _safe_download  # noqa: E402
 
 # Pinned URLs. Each tarball/zip exposes a single ``ffmpeg`` (or
 # ``ffmpeg.exe``) binary that runs without any system libs other
@@ -68,12 +69,8 @@ def _download(url: str, dst: Path, force: bool = False) -> Path:
         size_mb = dst.stat().st_size / 1024 / 1024
         print(f"  ✓ cached {dst.name} ({size_mb:,.1f} MB)")
         return dst
-    dst.parent.mkdir(parents=True, exist_ok=True)
     print(f"  → downloading {url}")
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    with urllib.request.urlopen(url) as resp, tmp.open("wb") as f:
-        shutil.copyfileobj(resp, f, length=1 << 20)
-    tmp.replace(dst)
+    _safe_download(url, dst)
     print(
         f"  ✓ wrote {dst.name} "
         f"({dst.stat().st_size / 1024 / 1024:,.1f} MB)"

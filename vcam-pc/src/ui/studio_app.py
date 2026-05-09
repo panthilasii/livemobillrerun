@@ -204,6 +204,41 @@ class StudioApp(ctk.CTk):
         )
         self._poller.start()
 
+        # ── embedded sales dashboard server (lazy)
+        # Started on demand when the user clicks the "Dashboard"
+        # sidebar button. Kept on the app instance (not the page)
+        # so re-rendering Dashboard / Settings doesn't re-bind 8765
+        # or kill the running uvicorn loop.
+        self._dashboard_handle = None  # type: ignore[var-annotated]
+
+        # ── announcements (server-pushed news / alerts)
+        # Polls the signed JSON feed in a daemon thread; the
+        # callback re-routes to the Tk thread via ``after(0, ...)``
+        # so widget updates never race the main loop. Failure
+        # modes (DNS down, JSON malformed, sig mismatch) are silent
+        # logs -- the app must NEVER refuse to launch because of
+        # the announcement subsystem.
+        from .. import announcements as _ann_mod
+        self.announcements = _ann_mod.AnnouncementPoller(
+            app_version=BRAND.version,
+            on_update=self._on_announcements_updated,
+        )
+        self.announcements.start()
+        self._latest_announcements: list = []
+
+        # ── auto-update poller
+        # Same threading model as announcements: signed JSON feed,
+        # background polls, callback bounces to the Tk thread. We
+        # keep the latest manifest so that any time the dashboard
+        # is rebuilt (page switch, language change), we can
+        # re-show the banner without waiting for the 6 h tick.
+        from .. import auto_update as _au
+        self._latest_update = None  # type: ignore[var-annotated]
+        self.update_poller = _au.UpdatePoller(
+            on_update=self._on_update_available,
+        )
+        self.update_poller.start()
+
         # ── window close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -424,6 +459,79 @@ class StudioApp(ctk.CTk):
         page.pack(fill="both", expand=True)
         self._current_page = page
 
+        # If we just rebuilt the dashboard, hand it any pending
+        # announcement so the banner doesn't go blank between page
+        # switches. Page-construction is synchronous so the widget
+        # tree exists by the time we get here.
+        self._refresh_dashboard_announcement()
+        self._refresh_dashboard_update()
+
+    def _on_announcements_updated(self, anns: list) -> None:
+        """Background poller callback. ``anns`` is the *visible*
+        list (already filtered for dismissal / expiry / version
+        applicability) sorted by the feed.
+
+        We just snapshot the list here and trampoline UI work to
+        the Tk loop -- the poller thread must never touch widgets
+        directly.
+        """
+        self._latest_announcements = list(anns)
+        try:
+            self.after(0, self._refresh_dashboard_announcement)
+        except Exception:
+            log.exception("could not schedule announcement refresh")
+
+    # ── auto-update plumbing ─────────────────────────────────────
+
+    def _on_update_available(self, manifest) -> None:
+        """Background-poller callback (NOT on the Tk thread).
+
+        Snapshot the manifest and trampoline a UI refresh onto the
+        main loop. We never touch widgets from the poller thread.
+        """
+        self._latest_update = manifest
+        try:
+            self.after(0, self._refresh_dashboard_update)
+        except Exception:
+            log.exception("could not schedule update banner refresh")
+
+    def _refresh_dashboard_update(self) -> None:
+        """If the dashboard is currently mounted, push the latest
+        manifest into its banner. Idempotent -- safe to call after
+        every page transition."""
+        page = self._current_page
+        from .studio_pages import DashboardPage
+        if not isinstance(page, DashboardPage):
+            return
+        if not hasattr(page, "set_update"):
+            return
+        page.set_update(self._latest_update)
+
+    def _refresh_dashboard_announcement(self) -> None:
+        """If the dashboard is the currently-displayed page, push
+        the highest-priority announcement into its banner. We pick
+        critical > warning > info, then earliest published_at as
+        the tiebreaker. The other announcements simply queue up;
+        when the user dismisses one, ``refresh_now`` re-evaluates
+        and surfaces the next."""
+        page = self._current_page
+        from .studio_pages import DashboardPage
+        if not isinstance(page, DashboardPage):
+            return
+        if not self._latest_announcements:
+            page.set_announcement(None)
+            return
+
+        sev_rank = {"critical": 0, "warning": 1, "info": 2}
+        ranked = sorted(
+            self._latest_announcements,
+            key=lambda a: (
+                sev_rank.get(a.severity, 99),
+                a.published_at or "",
+            ),
+        )
+        page.set_announcement(ranked[0])
+
     # ── shortcuts the pages use as navigation actions ────────────
 
     def go_dashboard(self) -> None:
@@ -453,6 +561,41 @@ class StudioApp(ctk.CTk):
         from .studio_pages import AdminPage
 
         self.show_page(AdminPage)
+
+    def open_dashboard(self) -> None:
+        """Start the embedded FastAPI server (idempotent) and open
+        the customer's default browser at the dashboard URL.
+
+        Raises ``RuntimeError`` if the webapp dependencies are
+        missing -- the caller turns that into a friendly Thai
+        message rather than letting the import error bubble up.
+        """
+        try:
+            from .. import webapp  # type: ignore[no-redef]
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "ไม่พบไลบรารี FastAPI / uvicorn"
+            ) from exc
+
+        # Reuse the existing server if it's still alive. Otherwise
+        # start a fresh one. The handle is None on first call and
+        # also after the user explicitly stopped it (rare path).
+        h = self._dashboard_handle
+        if h is None or not h.is_alive():
+            try:
+                h = webapp.server.start_in_thread()
+            except OSError as exc:
+                # Address-already-in-use, etc.
+                raise RuntimeError(
+                    f"เปิดเซิร์ฟเวอร์ Dashboard ไม่ได้: {exc}"
+                ) from exc
+            self._dashboard_handle = h
+
+        import webbrowser as _wb
+        try:
+            _wb.open(h.url)
+        except Exception:
+            log.exception("could not open browser")
 
     @property
     def is_admin(self) -> bool:
@@ -539,6 +682,47 @@ class StudioApp(ctk.CTk):
 
     def is_online(self, serial: str) -> bool:
         return serial in self.online_serials
+
+    def refresh_devices_now(self, timeout: float = 3.0) -> bool:
+        """Force a synchronous ``adb devices -l`` refresh and update
+        the cached state immediately.
+
+        The background poller only runs every ~2 seconds. That's
+        fine for Dashboard rendering, but action handlers gated on
+        ``is_online`` / ``transport_of`` (Patch, Mirror, Start
+        Live, etc.) hit a race window: customer plugs in the
+        cable, immediately clicks the action button within ~2s,
+        and gets a misleading "เครื่องไม่ได้เชื่อมต่อ" or
+        "ต้องเสียบสาย USB" warning even though ``adb devices``
+        already lists the device.
+
+        Calling this method right before the gate-keeping check
+        closes the race. Side-effects:
+
+        * ``self.live_devices`` updated.
+        * ``self.online_serials`` / ``self.transport_for`` /
+          ``self.adb_id_for_serial`` updated.
+        * Any subscribed page's ``on_devices_changed`` re-fires.
+
+        Returns True on success, False on adb-side failure (in
+        which case the cached state is left intact — better to
+        gate against stale-but-real than to nuke the cache and
+        guess wrong).
+        """
+        try:
+            devs = self.adb.devices()
+        except Exception:
+            log.exception("refresh_devices_now: adb.devices() raised")
+            return False
+        # Fold WiFi rows + propagate the same way the poller does
+        # so the two paths can never disagree about what "online"
+        # means.
+        try:
+            self._on_devices_polled(devs)
+            return True
+        except Exception:
+            log.exception("refresh_devices_now: _on_devices_polled raised")
+            return False
 
     def adb_id_for(self, entry_or_serial) -> str:
         """Return the adb id (USB serial or ``IP:port``) we should
@@ -653,5 +837,28 @@ class StudioApp(ctk.CTk):
             self._poller.stop()
         except Exception:
             pass
+        try:
+            self.announcements.stop()
+        except Exception:
+            pass
+        try:
+            self.update_poller.stop()
+        except Exception:
+            pass
+        try:
+            if self._dashboard_handle is not None:
+                self._dashboard_handle.stop()
+        except Exception:
+            pass
+        # Tear down any active scrcpy mirror windows so we don't
+        # leak orphan subprocesses after the dashboard exits. Each
+        # mirror is its own native window and would otherwise keep
+        # showing a frozen frame until the customer manually killed
+        # it via the dock / task manager.
+        try:
+            from .. import scrcpy_mirror
+            scrcpy_mirror.stop_all()
+        except Exception:
+            log.exception("scrcpy mirror cleanup on shutdown failed")
         self.save_devices()
         self.destroy()

@@ -77,3 +77,23 @@ vcam-pc/.license_secret
 # Customer activation files (per-user, machine-bound)
 .npcreate/
 .livestudio/
+
+# NP Create — runtime state (regenerated every launch, contains
+# device IDs / patch fingerprints / live session metadata that we
+# do NOT want in version control)
+#
+# SQLite WAL/SHM journals (the admin dashboard's session DB).
+# `*.sqlite3` covers the main DB; `-shm` / `-wal` are SQLite's
+# write-ahead log siblings — committing them would cause merge
+# pain on every dashboard run.
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite
+
+# Encoded video preview cache. ffmpeg writes here on every encode;
+# files are 5-50 MB each and entirely regeneratable from the
+# customer's source clip plus the rotation/crop profile. Safe to
+# delete at any time.
+vcam-pc/cache/
+vcam-pc/.encode_cache/

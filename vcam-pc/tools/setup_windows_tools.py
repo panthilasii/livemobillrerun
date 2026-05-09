@@ -22,15 +22,19 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import subprocess
 import sys
-import urllib.request
 import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
 WORKSPACE = PROJECT.parent
+
+# Local helper kept beside this script — see the docstring of
+# ``_download_helper`` for why we need a CA-store-tolerant downloader
+# instead of vanilla ``urllib.request.urlopen``.
+sys.path.insert(0, str(HERE))
+from _download_helper import download as _safe_download  # noqa: E402
 
 WIN_TOOLS = WORKSPACE / ".tools" / "windows"
 
@@ -47,12 +51,8 @@ def _download(url: str, dst: Path, force: bool = False) -> Path:
     if dst.is_file() and not force:
         print(f"  ✓ cached {dst.name} ({dst.stat().st_size / 1024 / 1024:,.1f} MB)")
         return dst
-    dst.parent.mkdir(parents=True, exist_ok=True)
     print(f"  → downloading {url}")
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    with urllib.request.urlopen(url) as resp, tmp.open("wb") as f:
-        shutil.copyfileobj(resp, f, length=1 << 20)
-    tmp.replace(dst)
+    _safe_download(url, dst)
     print(f"  ✓ wrote {dst.name} ({dst.stat().st_size / 1024 / 1024:,.1f} MB)")
     return dst
 

@@ -1,0 +1,75 @@
+# Production deploy of NP Create license server.
+#
+# Two services:
+#   1. ``app``   — FastAPI behind uvicorn on port 8000 (internal).
+#   2. ``caddy`` — reverse proxy + auto HTTPS via Let's Encrypt on
+#                  ports 80/443.
+#
+# The signing seed lives in a host-mounted bind directory (NOT a
+# named volume) so the operator can ``chmod 600`` it directly and
+# back it up to a password manager without ``docker volume inspect``
+# gymnastics.
+#
+# Usage::
+#
+#     # On the VPS
+#     git clone <repo> /opt/npcreate && cd /opt/npcreate/vcam-server
+#     mkdir -p data
+#     cp .env.example .env && nano .env       # set DOMAIN + ADMIN creds
+#     docker compose run --rm app python -m app.cli init-db
+#     docker compose run --rm app python -m app.cli init-keys
+#     docker compose run --rm app python -m app.cli create-admin \
+#         --email you@np.local --password $(openssl rand -base64 18)
+#     docker compose up -d
+#
+# Then point an A record for ``DOMAIN`` at the VPS IP and Caddy
+# fetches a certificate within ~30 s on first request.
+
+services:
+
+  app:
+    build: .
+    image: npc-server:latest
+    container_name: npc-app
+    restart: unless-stopped
+    environment:
+      # Cookies must be HTTPS-only in prod; Caddy terminates TLS.
+      COOKIE_SECURE: "1"
+      DATA_DIR: /var/lib/npcreate
+      # Persistent secret — pulled from .env so the operator doesn't
+      # have to remember to rotate it. If empty, the app falls back
+      # to a generated-on-disk secret in DATA_DIR.
+      SESSION_SECRET: "${SESSION_SECRET:-}"
+    volumes:
+      # Bind mount: the operator can ``ls`` / back up / chmod the
+      # signing seed without docker plumbing.
+      - ./data:/var/lib/npcreate
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "/venv/bin/python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: npc-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # cert storage (Let's Encrypt accounts/keys)
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

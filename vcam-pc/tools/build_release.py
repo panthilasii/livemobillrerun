@@ -64,12 +64,51 @@ SRC_BLOCKLIST: set[str] = set()
 CUSTOMER_TOOLS: set[str] = set()
 
 # Admin-only tools (signing, key rotation, packaging).
+# Anything here is *removed* from customer bundles but kept in admin
+# bundles. When you add a new helper script under ``tools/`` decide
+# at write-time whether the customer needs it; if not, list it here.
 ADMIN_TOOLS: set[str] = {
+    # Python — admin signing, packaging, dev test
     "gen_license.py",
     "init_keys.py",
     "build_release.py",
+    "build_pyinstaller.py",
+    "_pyinstaller_entry.py",
+    "_download_helper.py",
     "setup_windows_tools.py",
+    "setup_macos_tools.py",
     "setup_ffmpeg.py",
+    "setup_scrcpy.py",
+    "fake_phone.py",
+    "publish_announcement.py",
+    # Auto-update publisher: signs and packages new patch ZIPs for
+    # the in-app updater. Customers must NEVER receive this --
+    # they'd be able to mint manifests... if they had the
+    # ``.private_key`` (which they don't), but defence-in-depth
+    # still says to keep the script itself off their disks.
+    "publish_update.py",
+    # Shell — dev environment bootstrap and smoke tests. Customers
+    # don't need any of these (the launcher's pip install handles
+    # runtime dependencies). Shipping them would just confuse a
+    # non-technical customer who tries to "fix" things by running
+    # them blindly.
+    "bootstrap_macos.sh",
+    "check_phone.sh",
+    "install_jdk21.sh",
+    "install_lspatch.sh",
+    "install_python_macos.sh",
+    "make_sample_video.sh",
+    "phone_smoke.sh",
+    "smoke_test.sh",
+    "build_installer.bat",
+    "build_dmg.sh",
+    # Inno Setup script + EULA -- both are part of the *installer*
+    # build pipeline (run on admin host), never shipped to customers.
+    # Inside the installer the EULA gets renamed to LICENSE_TH.txt
+    # and dropped into the install dir; the .iss source itself stays
+    # private to the build pipeline.
+    "installer.iss",
+    "installer-license.txt",
 }
 
 # Top-level project files always shipped.
@@ -128,6 +167,12 @@ SHIP_TOOLS_PATTERNS = (
     "android-sdk/platform-tools/",      # legacy macOS layout
     "ffmpeg",                           # static ffmpeg (file at root)
     "ffmpeg.exe",                       # Windows variant
+    "scrcpy/",                          # screen mirror tool (~9 MB) —
+                                        # populated by tools/setup_scrcpy.py;
+                                        # without it customers fall back to
+                                        # the in-app auto-installer (still
+                                        # works, just needs internet on
+                                        # first Mirror click).
 )
 
 
@@ -139,17 +184,104 @@ def _under_pattern(rel: str, patterns: tuple[str, ...]) -> bool:
 # ── zip writer ───────────────────────────────────────────────────
 
 
+# ZIP file-mode constants (high 16 bits of ZipInfo.external_attr).
+# 0o120000 = symlink, 0o100000 = regular file. The standard zipfile
+# module doesn't expose these — we have to set them ourselves to get
+# Finder, unzip(1), and Linux unzip to recreate the symlink at extract
+# time instead of writing a tiny text file with the link target.
+_ZIP_SYMLINK_MODE = 0o120755 << 16
+_ZIP_FILE_MODE_EXEC = 0o100755 << 16
+_ZIP_FILE_MODE = 0o100644 << 16
+
+
+def _add_prebuilt_app(
+    zf: "zipfile.ZipFile",
+    prebuilt_dir: Path,
+    prefix: str,
+    os_name: str,
+) -> int:
+    """Pack the PyInstaller output into the customer zip.
+
+    Two big gotchas live here:
+
+    * macOS .app bundles contain *real* Unix symlinks (Python.framework
+      indirections, dylib version aliases). The default
+      ``ZipFile.write`` resolves them and writes the target file twice,
+      which (a) bloats the zip and (b) once unzipped, dlopen finds two
+      separate copies and crashes ("Failed to load Python shared
+      library"). We fix this by detecting symlinks and writing them
+      with the special 0o120000 mode bit.
+    * The ``Contents/MacOS/<binary>`` entry must keep its executable
+      bit; without it Finder will refuse to launch the app with a
+      misleading "damaged" dialog.
+    """
+    import os
+
+    n = 0
+    if os_name == "macos":
+        app_dir = prebuilt_dir / "NP-Create.app"
+        if not app_dir.is_dir():
+            return 0
+        for dirpath, dirnames, filenames in os.walk(app_dir, followlinks=False):
+            for fname in dirnames + filenames:
+                full = Path(dirpath) / fname
+                rel = full.relative_to(prebuilt_dir).as_posix()
+                arcname = f"{prefix}/app/{rel}"
+                if full.is_symlink():
+                    target = os.readlink(full)
+                    zinfo = zipfile.ZipInfo(arcname)
+                    zinfo.create_system = 3  # 3 = Unix
+                    zinfo.external_attr = _ZIP_SYMLINK_MODE
+                    zf.writestr(zinfo, target)
+                    n += 1
+                elif full.is_file():
+                    mode = full.stat().st_mode
+                    is_exec = bool(mode & 0o111)
+                    zinfo = zipfile.ZipInfo(arcname)
+                    zinfo.create_system = 3
+                    zinfo.external_attr = (
+                        _ZIP_FILE_MODE_EXEC if is_exec else _ZIP_FILE_MODE
+                    )
+                    zinfo.compress_type = zipfile.ZIP_DEFLATED
+                    with full.open("rb") as fh:
+                        zf.writestr(zinfo, fh.read())
+                    n += 1
+    elif os_name == "windows":
+        exe = prebuilt_dir / "NP-Create.exe"
+        if exe.is_file():
+            zf.write(exe, f"{prefix}/app/NP-Create.exe")
+            n += 1
+    return n
+
+
 def _walk_filtered(root: Path, skip_names: set[str]) -> list[Path]:
     """Iterate over files under ``root`` skipping any whose path
     contains one of ``skip_names`` (exact directory or file name).
+
+    Symlinks are followed (``followlinks=True``) because the macOS
+    setup script (``setup_macos_tools.py``) uses symlinks to point
+    ``.tools/macos/jdk-21`` at the legacy ``.tools/jdk-21``. Without
+    the follow flag the customer bundle would only contain the
+    bare symlink — which doesn't survive a zip extract on the
+    target machine and breaks the customer's first-run experience.
     """
+    import os
+
     out: list[Path] = []
-    for p in root.rglob("*"):
-        if p.is_dir():
-            continue
-        if any(part in skip_names for part in p.parts):
-            continue
-        out.append(p)
+    seen: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        # Prune directories early — both saves walk time and lets us
+        # honour skip_names on directory boundaries.
+        dirnames[:] = [d for d in dirnames if d not in skip_names]
+        for fname in filenames:
+            if fname in skip_names:
+                continue
+            p = Path(dirpath) / fname
+            real = str(p.resolve())
+            if real in seen:
+                continue  # cycle protection
+            seen.add(real)
+            out.append(p)
     return out
 
 
@@ -188,49 +320,159 @@ def add_file(zf: zipfile.ZipFile, src: Path, arc: str) -> None:
 
 
 def _launcher_body(os_name: str) -> str:
+    """Generate the OS-native double-clickable launcher.
+
+    Goals (in priority order):
+    1. Customer with **zero technical background** can double-click
+       and the program opens — no terminal interaction required.
+    2. If something is missing (Python, pip), show a Thai-language
+       error that tells them exactly what to do, in a window that
+       does not auto-close.
+    3. First-run pip install is silent on success and verbose on
+       failure (so we can copy-paste an error into Line support).
+    """
     if os_name == "windows":
+        # cmd.exe parses batch files using the **OEM codepage**, not
+        # whatever ``chcp`` is set to. If we put Thai bytes in here
+        # the parser tries to execute the garbled tokens as commands
+        # ("'\xe0\xb8\x82' is not recognized as an internal or
+        # external command…"). So the .bat itself stays **strictly
+        # ASCII**, and the moment Python is available we hand off all
+        # Thai user messaging to a tiny Python entrypoint
+        # (``src/_winlauncher.py``) — Python opens files as UTF-8
+        # explicitly, so Thai prints fine in the same cmd window once
+        # we ``chcp 65001`` it for the *output* side.
+        #
+        # Other cmd.exe quirks worth remembering:
+        #   - %~dp0 = this script's dir, with trailing backslash.
+        #   - ``call`` not ``start`` for pip so errorlevel propagates.
+        #   - install log goes to %TEMP% so a customer who hits a
+        #     pip failure can attach it to Line support.
         return textwrap.dedent("""\
             @echo off
-            REM NP Create — Windows launcher
-            cd /d "%~dp0\\vcam-pc"
-            where py >nul 2>&1
-            if %ERRORLEVEL%==0 (
-                py -3 -m pip install --quiet --user -r requirements.txt
-                py -3 -m src.main --studio
-            ) else (
-                where python >nul 2>&1
-                if %ERRORLEVEL%==0 (
-                    python -m pip install --quiet --user -r requirements.txt
-                    python -m src.main --studio
-                ) else (
-                    echo [!] Python 3 not found.
-                    echo     Install Python 3.13 from https://python.org/downloads
-                    pause
-                )
+            setlocal enableextensions
+            chcp 65001 > nul
+            title NP Create
+            REM NP Create -- Windows launcher (ASCII-only by design)
+            cd /d "%~dp0vcam-pc"
+
+            set "PYBIN="
+            where py >nul 2>&1 && set "PYBIN=py -3"
+            if "%PYBIN%"=="" (
+                where python >nul 2>&1 && set "PYBIN=python"
             )
-            pause
+
+            if "%PYBIN%"=="" (
+                echo.
+                echo  ==========================================================
+                echo    [!] Python 3 is not installed on this PC
+                echo  ==========================================================
+                echo.
+                echo    Steps to install Python:
+                echo    1. Open https://www.python.org/downloads
+                echo    2. Download Python 3.13 ^(Windows installer 64-bit^)
+                echo    3. IMPORTANT: tick "Add Python 3.13 to PATH"
+                echo    4. Finish the installer, then double-click run.bat again
+                echo.
+                echo    See INSTALL_TH.txt next to this file for Thai instructions.
+                echo    Contact admin via Line OA: @npcreate
+                echo.
+                pause
+                exit /b 1
+            )
+
+            REM Hand off to Python -- anything Thai/UTF-8 lives there,
+            REM not in this batch file.
+            %PYBIN% -X utf8 -m src._winlauncher
+            set "RC=%ERRORLEVEL%"
+            if not "%RC%"=="0" (
+                echo.
+                echo  [!] Launcher exited with code %RC%.
+                echo      Send the message above to admin via Line OA.
+                pause
+            )
+            exit /b %RC%
             """)
     if os_name == "macos":
+        # macOS .command launchers always open a Terminal window —
+        # we keep its output minimal and use osascript to show a
+        # *real* dialog box for any error, since most non-tech users
+        # will close the terminal panel without reading it.
         return textwrap.dedent("""\
             #!/usr/bin/env bash
-            # NP Create — macOS launcher
-            set -e
+            # NP Create — macOS launcher (v1.4)
+            set -u
+
             cd "$(dirname "$0")/vcam-pc"
+
+            err_dialog () {
+                osascript -e "display dialog \\"$1\\" buttons {\\"OK\\"} default button 1 with icon stop with title \\"NP Create\\""
+            }
+
             if ! command -v python3 >/dev/null 2>&1; then
-              osascript -e 'display dialog "ต้องติดตั้ง Python 3 ก่อนใช้งาน\\nไปที่ https://python.org/downloads แล้วลงเวอร์ชัน 3.13"'
-              exit 1
+                err_dialog "ต้องติดตั้ง Python 3 ก่อนใช้งานครับ\\n\\n1. เปิดเว็บ https://www.python.org/downloads\\n2. ดาวน์โหลด Python 3.13 สำหรับ macOS\\n3. ติดตั้งจนเสร็จ แล้วดับเบิ้ลคลิก run.command อีกครั้ง"
+                exit 1
             fi
-            python3 -m pip install --quiet --user -r requirements.txt
+
+            echo
+            echo "  NP Create — กำลังติดตั้งส่วนประกอบครั้งแรก (ใช้ Internet)"
+            echo "  อย่าปิดหน้าต่างนี้ ใช้เวลาประมาณ 30 วินาที..."
+            echo
+
+            LOG="$TMPDIR/NP-Create-install.log"
+            if ! python3 -m pip install --upgrade --quiet --user -r requirements.txt > "$LOG" 2>&1; then
+                err_dialog "ติดตั้งส่วนประกอบไม่สำเร็จ\\nlog อยู่ที่ $LOG\\n\\nส่งไฟล์นี้ให้แอดมินทาง Line ได้เลยครับ"
+                exit 1
+            fi
+
+            echo "  เปิดโปรแกรมแล้ว..."
             exec python3 -m src.main --studio
             """)
     # linux
     return textwrap.dedent("""\
         #!/usr/bin/env bash
+        # NP Create — Linux launcher (v1.4)
         set -e
         cd "$(dirname "$0")/vcam-pc"
-        python3 -m pip install --quiet --user -r requirements.txt
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo "[!] python3 not found — install with your package manager"
+            exit 1
+        fi
+        python3 -m pip install --upgrade --quiet --user -r requirements.txt
         exec python3 -m src.main --studio
         """)
+
+
+def _windows_install_thai() -> str:
+    """Thai-language install instructions shipped alongside run.bat.
+
+    The .bat must remain ASCII (cmd.exe parser uses the OEM
+    codepage), so all Thai messaging for the *pre-Python* error
+    path lives in this sibling text file. Customers double-click
+    it from Explorer and it opens in Notepad as UTF-8.
+    """
+    return (
+        "NP Create — คู่มือติดตั้ง (Windows)\n"
+        "===================================\n"
+        "\n"
+        "ถ้าดับเบิ้ลคลิก run.bat แล้วขึ้นข้อความว่าหา Python ไม่เจอ\n"
+        "(ขึ้น \"Python is not installed on this PC\")\n"
+        "ให้ทำตามนี้ครับ:\n"
+        "\n"
+        "1. เปิดเว็บ https://www.python.org/downloads\n"
+        "2. กด \"Download Python 3.13\" (Windows installer 64-bit)\n"
+        "3. เปิดไฟล์ที่โหลดมา (.exe)\n"
+        "4. **สำคัญ** — ติ๊กถูกที่ช่อง \"Add Python 3.13 to PATH\"\n"
+        "   (อยู่ด้านล่างหน้าต่างติดตั้ง ก่อนกด Install Now)\n"
+        "5. กด Install Now รอจนเสร็จ แล้วกด Close\n"
+        "6. กลับมาดับเบิ้ลคลิก run.bat อีกครั้ง\n"
+        "\n"
+        "ครั้งแรกที่เปิด ระบบจะดาวน์โหลดส่วนประกอบ ~30 วินาที\n"
+        "(ต้องต่อเน็ต) — อย่าปิดหน้าต่างจนกว่าโปรแกรมจะเปิดขึ้นมาเอง\n"
+        "\n"
+        "ถ้ายังเจอปัญหา ส่งข้อความใน Line OA: @npcreate ได้เลยครับ\n"
+        "ทำงานทุกวัน 9:00-22:00 น.\n"
+    )
 
 
 # ── README generation ────────────────────────────────────────────
@@ -266,22 +508,30 @@ def _readme(target: str, os_name: str) -> str:
         ```
         ผลลัพธ์อยู่ใน `dist/`
         """)
+    launcher_step = (
+        "ดับเบิ้ลคลิก `run.bat`"
+        if os_name == "windows"
+        else "ดับเบิ้ลคลิก `run.command`"
+    )
     sec_install = textwrap.dedent(f"""\
-        ## วิธีติดตั้ง
+        ## เริ่มต้นใช้งานเร็ว ๆ (Quick Start)
 
-        1. แตก zip ไฟล์นี้ลงเครื่อง (เก็บไว้ที่ Desktop ก็ได้)
-        2. {'เปิด `run.bat` (ดับเบิ้ลคลิก)' if os_name == 'windows' else 'ดับเบิ้ลคลิก `run.command`'}
-        3. ใส่ License Key ที่ได้รับจากผู้ขาย
-        4. เชื่อมโทรศัพท์ Android ผ่าน USB (เปิด USB Debugging)
-        5. ทำตามขั้นตอนใน "เพิ่มเครื่องใหม่"
+        1. ลง **Python 3.13** จาก https://www.python.org/downloads
+           {'(สำคัญ: ติ๊ก "Add Python to PATH" ตอนลง)' if os_name == 'windows' else ''}
+        2. แตก zip นี้ไว้ที่ Desktop
+        3. {launcher_step}
+        4. รอ ~30 วินาที (ติดตั้งส่วนประกอบครั้งแรก)
+        5. กรอก License Key → กด "เปิดใช้งาน"
+        6. เสียบ USB มือถือ → กด "เพิ่มเครื่องใหม่" → ทำตาม Wizard
 
-        ## ปัญหาที่อาจเจอ
+        > **อ่านคู่มือฉบับเต็ม** ใน `MANUAL_TH.md` (วิธีต่อ WiFi, แก้ปัญหา,
+        > FAQ และอื่น ๆ ครบทุกข้อ)
 
-        - **Python ยังไม่ได้ลง** — ระบบจะแจ้งเตือน ให้ไปที่ https://python.org/downloads
-          แล้วลงเวอร์ชัน 3.13 (Windows: ติ๊ก "Add Python to PATH")
-        - **adb ไม่เจอเครื่อง** — เปิด "USB Debugging" ในมือถือก่อน + ตอบ "Allow"
-          เมื่อมือถือถามขออนุญาต
-        - **ติดต่อแอดมิน** — Line: {BRAND.line_oa} ({BRAND.support_hours})
+        ## ติดต่อแอดมิน
+
+        - Line OA: **{BRAND.line_oa}**
+        - เวลาทำการ: {BRAND.support_hours}
+        - **ส่งภาพหน้าจอ + ข้อความ error** จะแก้ให้เร็วขึ้น
         """)
     sections = [
         f"# {title}\n\nเวอร์ชัน {BRAND.version}\n",
@@ -405,7 +655,17 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
             print("   license_history.json : EXCLUDED (customer-safe)")
 
         # ── apk ─────────────────────────────────────────────────
-        zf.write(apk, f"{prefix}/apk/vcam-app.apk")
+        # Ship as ``vcam-app-release.apk`` -- this name is the FIRST
+        # entry in ``platform_tools.find_vcam_apk()``'s search list,
+        # so the customer build picks it up immediately. We used to
+        # ship as ``vcam-app.apk``; that left ``find_vcam_apk()``
+        # returning None on the customer side because the search
+        # list never included that bare name. Net effect: the patch
+        # flow silently failed on Windows ("render ไม่ผ่าน adb")
+        # because it couldn't locate the Xposed module APK to feed
+        # into LSPatch. Renaming here keeps the build-time and
+        # runtime conventions aligned.
+        zf.write(apk, f"{prefix}/apk/vcam-app-release.apk")
 
         # ── tools (.tools/<os>/) ────────────────────────────────
         if tools_dir:
@@ -421,7 +681,15 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                     rel = rel[len("android-sdk/"):]
                 zf.write(f, f"{prefix}/.tools/{os_name}/{rel}")
                 n_t += 1
-            print(f"   .tools/ : {n_t} files (only adb + JDK + lspatch)")
+            print(f"   .tools/ : {n_t} files (adb + JDK + lspatch + ffmpeg + scrcpy)")
+            scrcpy_dir = tools_dir / "scrcpy"
+            if not scrcpy_dir.is_dir():
+                print(
+                    "   [!] .tools/scrcpy/ missing — customer Mirror will need\n"
+                    "       to auto-download on first click. To bundle, run:\n"
+                    f"          python tools/setup_scrcpy.py --os {os_name}",
+                    file=sys.stderr,
+                )
 
         # ── launcher + README ───────────────────────────────────
         launcher = LAUNCHER_NAMES[os_name]
@@ -435,6 +703,41 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
         info.compress_type = zipfile.ZIP_DEFLATED
         zf.writestr(info, body)
         zf.writestr(f"{prefix}/README_TH.md", _readme(target, os_name))
+
+        # ── prebuilt .app/.exe (optional) ───────────────────────
+        # If the admin ran `tools/build_pyinstaller.py` first, we
+        # bundle the resulting native binary alongside the Python
+        # script tree. The customer can then choose:
+        #   • Double-click NP-Create.app/.exe — works without Python
+        #   • Or run.bat / run.command — uses their installed Python
+        # We never *require* the prebuilt; missing is OK.
+        prebuilt_dir = PROJECT / "dist" / "pyinstaller"
+        if prebuilt_dir.is_dir():
+            n_pre = _add_prebuilt_app(zf, prebuilt_dir, prefix, os_name)
+            if n_pre:
+                print(f"   app/    : {n_pre} files (PyInstaller bundle)")
+
+        # ── Windows-only Thai install fallback (INSTALL_TH.txt) ─
+        # The .bat itself is ASCII-only (cmd.exe parses with the
+        # local OEM codepage, so Thai bytes blow up parsing). When
+        # Python is missing the .bat shows English instructions
+        # only — INSTALL_TH.txt sits next to run.bat as the Thai
+        # mirror so non-English customers still know what to do.
+        if os_name == "windows":
+            zf.writestr(f"{prefix}/INSTALL_TH.txt", _windows_install_thai())
+
+        # ── full Thai manual (always shipped, customer-friendly) ─
+        # The README is a quick-start. The MANUAL is the real deal:
+        # ~10 sections covering install / first device / streaming /
+        # WiFi / troubleshooting / FAQ. We ship it as a separate
+        # file so customers can keep it open in a browser tab while
+        # using the app.
+        manual_src = PROJECT / "docs" / "MANUAL_TH.md"
+        if manual_src.is_file():
+            zf.write(manual_src, f"{prefix}/MANUAL_TH.md")
+            print("   manual  : MANUAL_TH.md (full guide)")
+        else:
+            print("   manual  : (skipped — docs/MANUAL_TH.md missing)")
 
     size_mb = out_zip.stat().st_size / 1024 / 1024
     print(f"   ✓ wrote {size_mb:,.1f} MB")

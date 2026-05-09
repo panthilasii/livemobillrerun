@@ -300,6 +300,28 @@ def save_activation(license_key: str) -> None:
         encoding="utf-8",
     )
 
+    # Fire-and-forget phone-home to the central admin server so the
+    # admin panel can show "X PCs activated" without us having to
+    # ask customers in Line. Local activation is already persisted
+    # above — this network call is best-effort and runs on a
+    # background thread so a slow DNS / firewall / captive portal
+    # never blocks the activation modal closing.
+    try:
+        from . import license_server as _ls
+        if _ls.is_enabled():
+            import threading
+            threading.Thread(
+                target=_ls.activate,
+                args=(license_key,),
+                kwargs={"machine_label": _ls._hostname()},
+                daemon=True,
+                name="license-phone-home",
+            ).start()
+    except Exception:
+        # Never let a server-client bug propagate into the
+        # critical "save activation" path.
+        pass
+
 
 def load_activation() -> dict | None:
     if not ACTIVATION_PATH.is_file():

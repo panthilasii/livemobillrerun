@@ -9,12 +9,54 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _resolve_project_root() -> Path:
+    """Single source of truth for "where do my data files live?"
+
+    Three runtime modes are possible:
+
+    1. **Source tree** (developer, ``python -m src.cli``):
+       ``__file__`` resolves under ``vcam-pc/src/config.py`` so
+       ``parent.parent`` is ``vcam-pc/`` — the historical layout.
+
+    2. **Customer runs ZIP layout via run.bat / run.command** —
+       same as (1): ``__file__`` is still ``vcam-pc/src/config.py``
+       relative to the unzipped tree.
+
+    3. **PyInstaller frozen build** (.exe via Inno Setup, .app via
+       .dmg drag-to-Applications): ``sys.frozen`` is set. We anchor
+       on ``Path(sys.executable).parent`` — the directory the
+       installer dropped the binary into. Inno Setup installs
+       to ``%LOCALAPPDATA%\\NP Create\\`` and lays ``.tools\\`` /
+       ``apk\\`` next to ``NP-Create.exe``; ``build_dmg.sh``
+       produces a ``.app`` whose ``Contents/MacOS/`` / ``Contents/
+       Resources/`` siblings hold the same data. Either way the
+       *binary's parent dir* is where read/write state belongs,
+       which matters because:
+
+       - ``sys._MEIPASS`` (the alternative anchor) is a *temp*
+         directory wiped at exit on --onefile builds; writing
+         ``config.json`` there silently loses settings on every
+         relaunch.
+       - The binary's parent dir survives reboots and is the
+         only persistent location every PyInstaller mode shares.
+
+       Bundled read-only assets (``src/``, ``assets/``) are pulled
+       in via ``--add-data`` in ``tools/build_pyinstaller.py`` and
+       resolve from ``sys._MEIPASS`` automatically through the
+       Python import system — those don't need PROJECT_ROOT.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _resolve_project_root()
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 PROFILES_PATH = PROJECT_ROOT / "device_profiles.json"
 
@@ -29,6 +71,28 @@ class StreamConfig:
     tcp_port: int = 8888
     resolution: str = "720x1280"
     fps: int = 30
+    # Hook-mode MP4 output dimensions (landscape). The phone's
+    # rotation chain turns this back into a portrait clip on screen.
+    # 1920×1080 = "1080p" — the highest quality TikTok's ingest will
+    # accept reliably across mid-range Android phones. Drop to
+    # 1280×720 ("720p") on older / lower-RAM devices if the encode
+    # takes too long or playback stutters.
+    encode_width: int = 1920
+    encode_height: int = 1080
+
+    # Mirror the encoded frame horizontally before the rotation
+    # chain. Defaults to True because TikTok's Live ingest pulls our
+    # MP4 through the **front-camera** Camera2 path on most Android
+    # builds, and the Android system applies an implicit horizontal
+    # mirror to front-cam frames (selfie convention) — viewers of
+    # the live see text/logos as a mirror image otherwise. Pre-
+    # flipping here cancels that mirror, so the broadcast looks
+    # identical to the source MP4.
+    #
+    # If a particular phone uses the *rear* camera instead (no
+    # implicit mirror), the customer can toggle this off in
+    # Settings → คุณภาพวิดีโอ → "ภาพสะท้อน".
+    mirror_horizontal: bool = True
     video_bitrate: str = "2000k"
     video_maxrate: str = "2500k"
     video_bufsize: str = "4000k"
@@ -42,13 +106,59 @@ class StreamConfig:
     def load(cls, path: Path = CONFIG_PATH) -> "StreamConfig":
         if not path.is_file():
             log.warning("config.json not found at %s — using defaults", path)
-            return cls()
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Drop unknown keys so we don't blow up on schema drift.
-        valid = {f.name for f in cls.__dataclass_fields__.values()}
-        clean = {k: v for k, v in data.items() if k in valid}
-        return cls(**clean)
+            cfg = cls()
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Drop unknown keys so we don't blow up on schema drift.
+            valid = {f.name for f in cls.__dataclass_fields__.values()}
+            clean = {k: v for k, v in data.items() if k in valid}
+            cfg = cls(**clean)
+        return cfg._with_resolved_tools()
+
+    def _with_resolved_tools(self) -> "StreamConfig":
+        """Resolve ``adb_path`` / ``ffmpeg_path`` from the cross-platform
+        bundle if the bare names ("adb" / "ffmpeg") don't exist on PATH.
+
+        Why this lives in config-load (not at every callsite)
+        -----------------------------------------------------
+
+        Every module that touches ADB/FFmpeg used to call
+        ``shutil.which(self.cfg.adb_path)`` independently. That
+        worked on dev boxes (binaries on PATH) but failed on customer
+        macOS/Windows machines that only have the bundled tools under
+        ``.tools/<os>/``. Each callsite raised its own "adb not found"
+        error, leading to confusing dead-ends for non-technical users.
+
+        Resolving once at load time means *every* downstream subprocess
+        call ends up using the absolute path of the bundled binary
+        without each module having to repeat the fallback logic.
+
+        We never overwrite a fully-qualified path the user pinned
+        themselves — only the bare-name defaults.
+        """
+        import shutil
+        try:
+            from . import platform_tools
+        except Exception:
+            return self
+
+        # ADB
+        if self.adb_path in ("", "adb") or shutil.which(self.adb_path) is None:
+            bundled = platform_tools.find_adb()
+            if bundled is not None:
+                self.adb_path = str(bundled)
+
+        # ffmpeg
+        if (
+            self.ffmpeg_path in ("", "ffmpeg")
+            or shutil.which(self.ffmpeg_path) is None
+        ):
+            bundled = platform_tools.find_ffmpeg()
+            if bundled is not None:
+                self.ffmpeg_path = str(bundled)
+
+        return self
 
     def save(self, path: Path = CONFIG_PATH) -> None:
         with path.open("w", encoding="utf-8") as f:
