@@ -127,6 +127,31 @@ FFMPEG_BIN_IN_ARCHIVE = {
     "macos":   "ffmpeg",
 }
 
+# Google USB Driver — Windows-only ADB driver bundle. Apache-2
+# licensed, redistributable, signed by Google, ~8.6 MB. macOS has
+# native ADB-over-USB support (no driver needed) so we don't
+# bother on that platform.
+#
+# Why we bundle it (v1.7.11)
+# --------------------------
+# Customers report "phone shows up in adb on Mac but not in Windows
+# NP Create installer". Root cause: Windows ships no Android USB
+# driver out of the box. Without one, ``adb devices`` returns an
+# empty list, the wizard sits on "🔄 รอเครื่องเชื่อมต่อ…" forever,
+# and the customer has no idea what to do. Shipping the official
+# Google driver lets the in-app help dialog launch the installer
+# without a separate download.
+#
+# The Google driver is most reliable on Pixel + Nexus, but it also
+# WCID-registers as a generic Android ADB driver that satisfies
+# many OEMs (including modern Xiaomi/Redmi running HyperOS once
+# MIUI's "USB debugging (Security settings)" toggle is on). For
+# Xiaomi devices that need the OEM-signed driver, the dialog also
+# links to Mi PC Suite.
+GOOGLE_USB_DRIVER_URL = (
+    "https://dl.google.com/android/repository/usb_driver_r13-windows.zip"
+)
+
 
 # ── helpers ────────────────────────────────────────────────────────
 
@@ -337,6 +362,63 @@ def install_ffmpeg(os_name: str, force: bool) -> None:
           f"({size_mb:,.1f} MB)")
 
 
+def install_adb_driver(os_name: str, force: bool) -> None:
+    """Drop the Google USB Driver under
+    ``.tools/windows/adb-driver/usb_driver/`` so the in-app help
+    dialog can point Windows' Device Manager → "Update driver" at
+    a known-good local folder (or run the included
+    ``android_winusb.inf`` manually). macOS skips this — Apple's
+    Mac kernel handles Android ADB via libusb without an OEM
+    driver.
+
+    The downloaded zip already contains a single top-level
+    ``usb_driver/`` directory with all the .inf / .cat / .dll
+    bits Windows expects. We extract straight into the per-OS
+    .tools dir so the runtime resolver
+    (``platform_tools.find_adb_driver_dir``) can find it without
+    walking past archive metadata.
+    """
+    if os_name != "windows":
+        print()
+        print("[adb-driver] (skip — macOS handles ADB without an OEM driver)")
+        return
+    print()
+    print("[adb-driver]")
+    dest_dir = WORKSPACE / ".tools" / os_name / "adb-driver"
+    inf_marker = dest_dir / "usb_driver" / "android_winusb.inf"
+    if inf_marker.is_file() and not force:
+        size_mb = sum(
+            p.stat().st_size for p in dest_dir.rglob("*") if p.is_file()
+        ) / 1024 / 1024
+        print(f"  [OK] already at {dest_dir.relative_to(WORKSPACE)} "
+              f"({size_mb:,.1f} MB)")
+        return
+    cache_path = CACHE / "google-usb-driver.zip"
+    _download(GOOGLE_USB_DRIVER_URL, cache_path, force)
+    if dest_dir.is_dir():
+        shutil.rmtree(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  -> extracting to {dest_dir.relative_to(WORKSPACE)}")
+    # The zip contains a single top-level ``usb_driver/`` dir,
+    # which is exactly what we want at the destination — extract
+    # straight in.
+    _extract_zip(cache_path, dest_dir, strip_first=False)
+    if not inf_marker.is_file():
+        # Defensive: the archive layout occasionally drifts (Google
+        # nests under ``android_usb/`` in some old builds). Surface
+        # the failure here rather than at customer install time.
+        raise SystemExit(
+            f"adb-driver extraction completed but {inf_marker} is "
+            f"missing — archive layout may have changed; inspect "
+            f"{cache_path}."
+        )
+    size_mb = sum(
+        p.stat().st_size for p in dest_dir.rglob("*") if p.is_file()
+    ) / 1024 / 1024
+    print(f"  [OK] installed {dest_dir.relative_to(WORKSPACE)} "
+          f"({size_mb:,.1f} MB)")
+
+
 def install_lspatch(os_name: str, force: bool) -> None:
     print()
     print("[lspatch]")
@@ -374,6 +456,10 @@ def _verify(os_name: str) -> int:
     ]
     if os_name == "windows":
         checks.append(("jdk-21/bin/java   ", base / "jdk-21" / "bin" / "java.exe"))
+        checks.append((
+            "adb-driver/.../inf",
+            base / "adb-driver" / "usb_driver" / "android_winusb.inf",
+        ))
     else:
         # Adoptium macOS layout: jdk-21/Contents/Home/bin/java
         checks.append(("jdk-21/.../java   ",
@@ -404,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--skip", action="append", default=[],
-        choices=("platform-tools", "jdk", "lspatch", "ffmpeg"),
+        choices=("platform-tools", "jdk", "lspatch", "ffmpeg", "adb-driver"),
         help="skip a specific tool (repeatable)",
     )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
@@ -436,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         install_lspatch(os_name, args.force)
     if "ffmpeg" not in args.skip:
         install_ffmpeg(os_name, args.force)
+    if "adb-driver" not in args.skip:
+        install_adb_driver(os_name, args.force)
 
     rc = _verify(os_name)
     if rc == 0:

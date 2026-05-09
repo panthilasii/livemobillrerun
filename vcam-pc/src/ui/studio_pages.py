@@ -3591,6 +3591,15 @@ class WizardPage(ctk.CTkFrame):
         self._step = 0
         self._candidate_serial: str | None = None
         self._patched_ok = False
+        # Stamped the first time step 1 (the "wait for USB device"
+        # screen) renders. Used by the Windows driver-help nudge:
+        # if we've been waiting > 15 s with no candidate, surface
+        # the "ไม่เจอเครื่อง? ลง driver Windows" button. v1.7.11
+        # finding — Mac-side ADB works without OEM drivers, but
+        # Windows needs an INF; Xiaomi/Redmi customers were
+        # silently stuck because the wizard never explained why
+        # the popup wasn't firing.
+        self._step1_first_shown_at: float | None = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -3682,10 +3691,17 @@ class WizardPage(ctk.CTkFrame):
             self._finish()
             return
         self._step = min(self._step + 1, len(self.STEPS) - 1)
+        # Leaving step 1 — drop the "no device" timer so a later
+        # back-navigation gets a fresh 15 s grace period before
+        # the driver-help nudge re-appears.
+        if self._step != 1:
+            self._step1_first_shown_at = None
         self._render_step()
 
     def _prev(self) -> None:
         self._step = max(self._step - 1, 0)
+        if self._step != 1:
+            self._step1_first_shown_at = None
         self._render_step()
 
     # ── step 1 — instructions ────────────────────────────────────
@@ -3792,6 +3808,24 @@ class WizardPage(ctk.CTkFrame):
                 status_box,
                 "ระบบจะตรวจจับเครื่องอัตโนมัติเมื่อเสียบ USB",
             ).pack(padx=20, pady=(0, 14), anchor="w")
+
+            # Windows-only driver-help nudge. Pop the helper button
+            # ~15 s into the wait so we don't startle customers who
+            # are still finding their USB cable, but we don't leave
+            # the genuinely-stuck-on-driver case to figure it out
+            # alone. Mac users never see this — Apple ships ADB
+            # support in the kernel.
+            import sys as _sys
+            import time as _time
+            if self._step1_first_shown_at is None:
+                self._step1_first_shown_at = _time.monotonic()
+            elapsed = _time.monotonic() - self._step1_first_shown_at
+            if _sys.platform == "win32" and elapsed > 15.0:
+                _ghost_button(
+                    wrap,
+                    "❓  ไม่เจอเครื่อง? — ลง driver Windows",
+                    command=self._show_driver_help,
+                ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 16))
         else:
             d = candidates[0]
             self._candidate_serial = d.serial
@@ -3805,6 +3839,163 @@ class WizardPage(ctk.CTkFrame):
                 status_box,
                 f"serial: {d.serial}  ·  product: {d.product or '-'}",
             ).pack(padx=20, pady=(0, 14), anchor="w")
+
+    # ── Windows driver help ──────────────────────────────────────
+
+    def _show_driver_help(self) -> None:
+        """Pop a Thai-language explainer + one-click actions for the
+        Windows ADB driver issue.
+
+        Why this dialog exists (v1.7.11)
+        --------------------------------
+        macOS ships ADB-over-USB support in the kernel, so customers
+        who developed/tested NP Create on Mac never hit the driver
+        layer. On Windows, **every** USB-Android connection requires
+        an OEM-signed INF — Pixel, Xiaomi, Samsung, etc. all need
+        their own. Without one, the phone shows up under "Other
+        devices" with a yellow ⚠ in Device Manager and ``adb
+        devices`` returns an empty list. That's exactly the
+        "phone won't connect" symptom the customer reported.
+
+        We bundle Google's signed USB driver as a generic fallback
+        (covers Pixel + most modern WCID-friendly Androids), and
+        link out to OEM downloads for brands where the bundled
+        one is too old (notably Xiaomi/Redmi running HyperOS).
+        """
+        import os as _os
+        import subprocess as _sub
+        import sys as _sys
+        import webbrowser as _wb
+
+        from .. import platform_tools
+
+        driver_dir = platform_tools.find_adb_driver_dir()
+
+        win = ctk.CTkToplevel(self)
+        win.title("ลง driver USB สำหรับ Windows")
+        win.configure(fg_color=THEME.bg_main)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+        win.geometry("640x520")
+
+        wrap = ctk.CTkFrame(win, fg_color=THEME.bg_card, corner_radius=12)
+        wrap.pack(fill="both", expand=True, padx=16, pady=16)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "📱 ทำไม Windows ไม่เจอเครื่อง?").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 6)
+        )
+
+        _muted(
+            wrap,
+            "Windows ต้องลง driver USB ของยี่ห้อโทรศัพท์ก่อน adb ถึงจะเห็น\n"
+            "เครื่อง (Mac ไม่ต้อง — มี driver มาในตัว)",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
+
+        steps = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        steps.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        ctk.CTkLabel(
+            steps,
+            text=(
+                "ขั้นตอนแก้ (เครื่อง Xiaomi / Redmi / POCO):\n"
+                "1.  เปิด \"การตั้งค่านักพัฒนา\" บนมือถือ\n"
+                "2.  เปิด USB Debugging  +  USB Debugging (Security settings)\n"
+                "3.  เสียบ USB → เลือกโหมด \"File transfer / MTP\" (ห้าม Charging)\n"
+                "4.  ลง driver โดยกดปุ่มด้านล่าง → ถอด/เสียบ USB ใหม่\n"
+                "5.  มือถือจะมี popup \"อนุญาต USB Debugging\" — กด Allow"
+            ),
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=12)
+
+        # ── action buttons ───────────────────────────────────────
+        actions = ctk.CTkFrame(wrap, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", padx=20, pady=(4, 12))
+        actions.grid_columnconfigure(0, weight=1)
+
+        def _open_driver_folder() -> None:
+            """Open the bundled-driver folder in Windows Explorer so
+            the customer can right-click the .inf and "Install"."""
+            if driver_dir is None:
+                messagebox.showwarning(
+                    "ไม่พบ driver บันเดิล",
+                    "โปรแกรมหา driver ที่บันเดิลไม่พบ\n"
+                    "กรุณาส่งข้อความให้แอดมิน Line @npcreate",
+                )
+                return
+            try:
+                if _sys.platform == "win32":
+                    _os.startfile(str(driver_dir))  # type: ignore[attr-defined]
+                else:
+                    _sub.Popen(["xdg-open", str(driver_dir)])
+            except Exception:
+                # If startfile crashes (rare), at least show the
+                # path so the customer can paste it into Explorer.
+                messagebox.showinfo(
+                    "ตำแหน่ง driver",
+                    f"คัดลอก path นี้ไปวางในช่อง Address ของ\n"
+                    f"Windows Explorer:\n\n{driver_dir}",
+                )
+
+        def _open_device_manager() -> None:
+            """Spawn Device Manager so the customer can do
+            'Update driver' → 'Browse my computer' against the
+            bundled folder."""
+            if _sys.platform != "win32":
+                return
+            try:
+                _sub.Popen(["devmgmt.msc"], shell=True)
+            except Exception:
+                messagebox.showinfo(
+                    "Device Manager",
+                    "เปิดอัตโนมัติไม่ได้ — กด Win+X → "
+                    "เลือก Device Manager แทนครับ",
+                )
+
+        def _open_mi_driver_dl() -> None:
+            """OEM-signed Mi USB driver covers older MIUI 10–13
+            devices that the Google generic driver can't bind to.
+            Opens the official Xiaomi download page."""
+            _wb.open(
+                "https://www.mi.com/global/service/support/usb-driver.html"
+            )
+
+        _primary_button(
+            actions,
+            "📂  เปิดโฟลเดอร์ driver ที่บันเดิลมา",
+            command=_open_driver_folder,
+        ).grid(row=0, column=0, sticky="ew", pady=4)
+
+        _ghost_button(
+            actions,
+            "🔧  เปิด Device Manager",
+            command=_open_device_manager,
+        ).grid(row=1, column=0, sticky="ew", pady=4)
+
+        _ghost_button(
+            actions,
+            "🔗  ดาวน์โหลด Mi USB Driver (ถ้า driver ที่บันเดิลใช้ไม่ได้)",
+            command=_open_mi_driver_dl,
+        ).grid(row=2, column=0, sticky="ew", pady=4)
+
+        _ghost_button(
+            actions, "ปิดหน้าต่างนี้", command=win.destroy,
+        ).grid(row=3, column=0, sticky="ew", pady=(12, 4))
+
+        if driver_dir is None:
+            _muted(
+                wrap,
+                "(ไม่พบ driver บันเดิล — โปรแกรมตัวนี้ build ก่อน v1.7.11\n"
+                " ส่งข้อความให้แอดมิน Line @npcreate ได้เลยครับ)",
+            ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 12))
+        else:
+            _muted(
+                wrap,
+                f"driver path: {driver_dir}",
+            ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 12))
 
     # ── step 3 — patch ───────────────────────────────────────────
 

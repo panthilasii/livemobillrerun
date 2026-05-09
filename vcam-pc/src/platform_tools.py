@@ -299,6 +299,39 @@ def find_lspatch_jar() -> Path | None:
     return _first_existing(["lspatch/lspatch.jar"])
 
 
+def find_adb_driver_dir() -> Path | None:
+    """Return the directory containing Google's USB driver INF file
+    (Windows-only). macOS / Linux callers always get None — Apple
+    + libusb on Linux handle Android ADB without a kernel driver.
+
+    The dir layout we expect (matches what
+    ``tools/setup_ci_tools.install_adb_driver`` produces)::
+
+        .tools/windows/adb-driver/usb_driver/
+            android_winusb.inf      <- the file Windows wants
+            androidwinusb86.cat
+            androidwinusba64.cat
+            amd64/  i386/
+
+    Customers point Device Manager → "Update driver" → "Browse"
+    at the *parent* ``adb-driver/`` dir (or its ``usb_driver/``
+    subdir). The in-app help dialog
+    (``ui.studio_pages.WizardPage._show_driver_help``) opens this
+    folder via Explorer / shows the path so non-technical users
+    don't have to navigate the install tree manually.
+    """
+    if not is_windows():
+        return None
+    rels = [
+        "adb-driver/usb_driver/android_winusb.inf",
+        "adb-driver/android_winusb.inf",
+    ]
+    inf = _first_existing(rels)
+    if inf is None:
+        return None
+    return inf.parent.resolve()
+
+
 def find_scrcpy() -> Path | None:
     """Locate the ``scrcpy`` binary used for the on-PC mirror window.
 

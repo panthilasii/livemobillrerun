@@ -204,6 +204,63 @@ class TestFindVcamApkFrozen:
             assert found == apk.resolve()
 
 
+# ── find_adb_driver_dir (Windows only) ────────────────────────────
+
+
+class TestFindAdbDriverDir:
+    """v1.7.11 — bundled Google USB Driver. The in-app help dialog
+    points the customer's Device Manager at this folder.
+    """
+
+    def _bundle_driver(self, root: Path) -> Path:
+        inf = (
+            root
+            / ".tools"
+            / "windows"
+            / "adb-driver"
+            / "usb_driver"
+            / "android_winusb.inf"
+        )
+        inf.parent.mkdir(parents=True, exist_ok=True)
+        inf.write_text("[Version]\nSignature=$WINDOWS NT$\n")
+        return inf
+
+    def test_returns_dir_on_windows_when_bundled(self, tmp_path):
+        install = tmp_path / "install"
+        install.mkdir()
+        inf = self._bundle_driver(install)
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Windows"):
+            pt = _reload_platform_tools(install)
+            found = pt.find_adb_driver_dir()
+            assert found is not None
+            assert found == inf.parent.resolve()
+
+    def test_returns_none_when_not_bundled(self, tmp_path):
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Windows"):
+            pt = _reload_platform_tools(install)
+            assert pt.find_adb_driver_dir() is None
+
+    def test_returns_none_on_macos(self, tmp_path):
+        """macOS has native ADB-over-USB — no driver to install."""
+        install = tmp_path / "install"
+        install.mkdir()
+        # Even if a driver dir exists (shouldn't happen on Mac
+        # builds, but be defensive), the resolver must return None
+        # so the help dialog doesn't pop on Mac.
+        self._bundle_driver(install)
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Darwin"):
+            pt = _reload_platform_tools(install)
+            assert pt.find_adb_driver_dir() is None
+
+
 # ── env override ───────────────────────────────────────────────────
 
 

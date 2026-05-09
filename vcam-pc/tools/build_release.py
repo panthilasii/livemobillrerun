@@ -174,6 +174,19 @@ SHIP_TOOLS_PATTERNS = (
                                         # the in-app auto-installer (still
                                         # works, just needs internet on
                                         # first Mirror click).
+    "adb-driver/",                      # Google USB Driver (~9 MB,
+                                        # Windows only) — bundled INF
+                                        # so the in-app help dialog
+                                        # (WizardPage._show_driver_help)
+                                        # can point Device Manager at
+                                        # a known-good local folder
+                                        # without an internet round-
+                                        # trip. v1.7.11 fix for
+                                        # "Mac เทสได้แต่ Windows ไม่ได้"
+                                        # — Apple ships ADB-over-USB
+                                        # support in the kernel,
+                                        # Windows requires per-OEM
+                                        # driver installs first.
 )
 
 
@@ -682,7 +695,10 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                     rel = rel[len("android-sdk/"):]
                 zf.write(f, f"{prefix}/.tools/{os_name}/{rel}")
                 n_t += 1
-            print(f"   .tools/ : {n_t} files (adb + JDK + lspatch + ffmpeg + scrcpy)")
+            extras = "adb + JDK + lspatch + ffmpeg + scrcpy"
+            if os_name == "windows":
+                extras += " + adb-driver"
+            print(f"   .tools/ : {n_t} files ({extras})")
             scrcpy_dir = tools_dir / "scrcpy"
             if not scrcpy_dir.is_dir():
                 print(
@@ -691,6 +707,16 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                     f"          python tools/setup_scrcpy.py --os {os_name}",
                     file=sys.stderr,
                 )
+            if os_name == "windows":
+                drv_inf = tools_dir / "adb-driver" / "usb_driver" / "android_winusb.inf"
+                if not drv_inf.is_file():
+                    print(
+                        "   [!] .tools/windows/adb-driver/ missing — Xiaomi/Redmi\n"
+                        "       customers will be stuck on \"Allow USB Debugging\"\n"
+                        "       prompt without an OEM driver. To bundle, run:\n"
+                        "          python tools/setup_ci_tools.py --os windows --skip platform-tools --skip jdk --skip lspatch --skip ffmpeg",
+                        file=sys.stderr,
+                    )
 
         # ── launcher + README ───────────────────────────────────
         launcher = LAUNCHER_NAMES[os_name]

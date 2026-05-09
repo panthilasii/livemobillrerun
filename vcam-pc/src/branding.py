@@ -36,7 +36,7 @@ class Brand:
     company_th: str = "บริษัท เอ็นพี ครีเอ็ท จำกัด"
     company_en: str = "NP Create Co., Ltd."
 
-    version: str = "1.7.10"
+    version: str = "1.7.11"
 
     tagline_th: str = "ระบบไลฟ์มือโปร — เสถียร ใช้ง่าย"
     tagline_en: str = "Online Advertising & Digital Marketing"
