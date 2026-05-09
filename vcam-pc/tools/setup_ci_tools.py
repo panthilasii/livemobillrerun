@@ -57,9 +57,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -107,6 +109,22 @@ PT_URLS = {
 
 LSPATCH_RELEASE_API = (
     "https://api.github.com/repos/JingMatrix/LSPatch/releases/latest"
+)
+
+# Pinned fallback if the GitHub API is rate-limiting / down. We do
+# our own release dance (build + tag + publish on push) entirely in
+# this workflow, so the macOS job runs ~1 minute after the Windows
+# one and burns the same shared anonymous quota — it eats 403s
+# regularly without an Authorization header.
+#
+# Bumping this URL is a deliberate operation: the patched-TikTok
+# class-name fingerprint can shift between LSPatch majors and the
+# customer-side ``hook_status.probe()`` would need re-validating.
+# The release we tested with the v1.7.10 patched-TikTok signature
+# detection logic is v0.8 (2026-03), so that's what we pin.
+LSPATCH_PINNED_URL = (
+    "https://github.com/JingMatrix/LSPatch/releases/"
+    "download/v0.8/lspatch.jar"
 )
 
 # ffmpeg "static" / "essentials" builds. Same upstreams as
@@ -239,23 +257,67 @@ def _extract_tar(tpath: Path, into: Path, strip_first: bool = False) -> None:
 
 
 def _resolve_lspatch_url() -> str:
-    """Return the latest LSPatch jar download URL via GitHub API."""
+    """Return the latest LSPatch jar download URL.
+
+    Resolution strategy (each step short-circuits the rest):
+
+      1. ``$NPCREATE_LSPATCH_URL`` env var — operator override.
+      2. GitHub API ``/releases/latest`` with ``$GITHUB_TOKEN``
+         authorization if present. Auth bumps us from the 60/hr
+         anonymous limit to 5000/hr per-token.
+      3. ``LSPATCH_PINNED_URL`` (v0.8) — last resort when the
+         API is rate-limiting or unreachable. This is the
+         build that v1.7.10's patched-TikTok class-name probe
+         was validated against, so falling back is safe.
+
+    Why we ladder instead of always pinning
+    ---------------------------------------
+    LSPatch ships occasional security/compat fixes (Android 16/17
+    preview support landed in v0.8 itself). We want CI to grab
+    the newest stable when GitHub cooperates so customers don't
+    silently lag a working upstream — but never to *fail the
+    release* when the API hiccups, because a 403 here blocks
+    the entire macOS build from publishing the .dmg.
+    """
+    override = os.environ.get("NPCREATE_LSPATCH_URL", "").strip()
+    if override:
+        print(f"  -> using NPCREATE_LSPATCH_URL override: {override}")
+        return override
+
     print("  -> querying GitHub for latest LSPatch release")
-    req = urllib.request.Request(
-        LSPATCH_RELEASE_API,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "np-create-ci-setup/1.0",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    for asset in data.get("assets", []):
-        if asset.get("name") == "lspatch.jar":
-            url = asset.get("browser_download_url")
-            if url:
-                return url
-    raise SystemExit("could not resolve lspatch.jar download URL")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "np-create-ci-setup/1.0",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        # GitHub recommends "Bearer" for fine-grained PATs;
+        # classic GITHUB_TOKEN values accept it too.
+        headers["Authorization"] = f"Bearer {token}"
+        print("     (using GITHUB_TOKEN — 5000/hr quota)")
+    else:
+        print("     (no GITHUB_TOKEN — falling back to anon 60/hr quota)")
+
+    req = urllib.request.Request(LSPATCH_RELEASE_API, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        for asset in data.get("assets", []):
+            if asset.get("name") == "lspatch.jar":
+                url = asset.get("browser_download_url")
+                if url:
+                    return url
+        print(
+            "  [!] GitHub API returned no lspatch.jar asset; "
+            "falling back to pinned URL"
+        )
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+        # 403 (rate limit), 5xx (GH outage), DNS hiccup — all
+        # benign at the build level. Don't block the release.
+        print(f"  [!] GitHub API error: {e!r} -- falling back to pinned URL")
+
+    print(f"  -> pinned lspatch URL: {LSPATCH_PINNED_URL}")
+    return LSPATCH_PINNED_URL
 
 
 # ── per-tool installers ────────────────────────────────────────────

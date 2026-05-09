@@ -116,6 +116,15 @@ jobs:
         # zip, an Adoptium Temurin 21 JDK, and the latest LSPatch
         # release straight from upstream so installer.iss can pack
         # everything Inno Setup needs into ``{app}\.tools\windows\``.
+        #
+        # ``GITHUB_TOKEN`` lifts the GitHub API anon quota (60/hr,
+        # shared with every other macOS/Windows runner on the
+        # same egress IP) up to 5000/hr authenticated — without
+        # it the macOS leg of v1.7.11 hit 403 on the LSPatch
+        # ``releases/latest`` lookup right after the Windows leg
+        # had used the same quota.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: vcam-pc
         run: python tools/setup_ci_tools.py --os windows
         shell: pwsh
@@ -187,6 +196,8 @@ jobs:
         # ``platform_tools.discover()`` expects, so customers can
         # patch TikTok without installing Java or platform-tools
         # via Homebrew first.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: vcam-pc
         run: python tools/setup_ci_tools.py --os macos
 
