@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         # customer always lands in the GUI, never the CLI.
         str(HERE / "_pyinstaller_entry.py"),
     ]
-    print("→ running:", " ".join(cmd))
+    print("-> running:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=PROJECT)
 
     print()

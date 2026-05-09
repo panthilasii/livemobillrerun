@@ -79,6 +79,7 @@ ADMIN_TOOLS: set[str] = {
     "setup_macos_tools.py",
     "setup_ffmpeg.py",
     "setup_scrcpy.py",
+    "setup_ci_tools.py",
     "fake_phone.py",
     "publish_announcement.py",
     # Auto-update publisher: signs and packages new patch ZIPs for

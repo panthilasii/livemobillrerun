@@ -128,6 +128,11 @@ Source: "{#PROJ_ROOT}\dist\pyinstaller\{#MyAppExeName}"; DestDir: "{app}"; Flags
 ; preserves the directory tree under .tools\windows\.
 Source: "{#WORKSPACE_ROOT}\.tools\windows\*"; DestDir: "{app}\.tools\windows"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; vcam-app APK — the Xposed module that LSPatch fuses into TikTok
+; during Patch. ``find_vcam_apk()`` looks here at runtime; missing
+; means Patch fails with "vcam-app APK not found". ~7.5 MB.
+Source: "{#WORKSPACE_ROOT}\apk\vcam-app-release.apk"; DestDir: "{app}\apk"; Flags: ignoreversion
+
 ; Documentation customers will reference. SALES_KIT_TH.md is
 ; admin-only (pricing scripts, Line templates) and MUST NOT ship.
 Source: "{#PROJ_ROOT}\docs\MANUAL_TH.md"; DestDir: "{app}"; Flags: ignoreversion isreadme

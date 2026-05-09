@@ -96,15 +96,28 @@ jobs:
           }
         shell: pwsh
 
-      - name: Bundle scrcpy + adb (.tools/windows/)
-        # Pre-populates the workspace's `.tools/windows/scrcpy/`
-        # directory with the GitHub-released scrcpy zip plus its
-        # bundled `adb.exe`. The installer.iss + build_release.py
-        # both read from `.tools/windows/` so this step is a hard
-        # prerequisite for both downstream artifacts. SHA256 is
-        # verified inside setup_scrcpy.py.
+      - name: Bundle scrcpy (.tools/windows/scrcpy/)
+        # Downloads the GitHub-released scrcpy zip into
+        # ``.tools/windows/scrcpy/``. SHA256 is verified inside the
+        # script. The bundle also carries an ``adb.exe`` that
+        # ``find_adb()`` will pick up as a fallback if the canonical
+        # platform-tools download below fails for any reason.
         working-directory: vcam-pc
         run: python tools/setup_scrcpy.py --os windows
+        shell: pwsh
+
+      - name: Bundle platform-tools + JDK 21 + lspatch.jar (.tools/windows/)
+        # Pre-1.7.9, the .exe installer shipped only the scrcpy
+        # bundle — which left customers without a working
+        # platform-tools/adb.exe (the version inside scrcpy/ wasn't
+        # on ``find_adb()``'s search path) and without a JDK or
+        # lspatch.jar at all (Patch failed with "java not found").
+        # This step downloads the canonical Google platform-tools
+        # zip, an Adoptium Temurin 21 JDK, and the latest LSPatch
+        # release straight from upstream so installer.iss can pack
+        # everything Inno Setup needs into ``{app}\.tools\windows\``.
+        working-directory: vcam-pc
+        run: python tools/setup_ci_tools.py --os windows
         shell: pwsh
 
       - name: Build PyInstaller .exe
@@ -164,9 +177,18 @@ jobs:
       - name: Install create-dmg
         run: brew install create-dmg
 
-      - name: Bundle scrcpy + adb (.tools/macos/)
+      - name: Bundle scrcpy (.tools/macos/scrcpy/)
         working-directory: vcam-pc
         run: python tools/setup_scrcpy.py --os macos
+
+      - name: Bundle platform-tools + JDK 21 + lspatch.jar (.tools/macos/)
+        # Same rationale as the Windows job above: ensures the
+        # macOS .dmg / portable ZIP carries every binary
+        # ``platform_tools.discover()`` expects, so customers can
+        # patch TikTok without installing Java or platform-tools
+        # via Homebrew first.
+        working-directory: vcam-pc
+        run: python tools/setup_ci_tools.py --os macos
 
       - name: Build PyInstaller .app
         working-directory: vcam-pc

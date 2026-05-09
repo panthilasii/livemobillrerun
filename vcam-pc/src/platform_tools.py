@@ -85,8 +85,47 @@ def exe_suffix() -> str:
 # ── filesystem layout ────────────────────────────────────────────
 
 
-# .tools sits at the workspace root, one directory above vcam-pc/.
-LEGACY_TOOLS_ROOT = (PROJECT_ROOT.parent / ".tools").resolve()
+def _tools_root_base() -> Path:
+    """Locate the directory that *contains* the per-OS .tools/ tree.
+
+    The layout differs between launch modes — and getting it wrong
+    silently breaks adb/JDK/lspatch lookup, which presents to the
+    customer as "the wizard never finds my phone" because the
+    bundled adb.exe is unreachable. So this is the single canonical
+    source of truth.
+
+    Mode A — Dev / portable customer ZIP
+    ------------------------------------
+    Running ``python -m src.main`` (or via run.bat / run.command).
+    ``sys.frozen`` is False. ``PROJECT_ROOT`` resolves via
+    ``Path(__file__).parent.parent`` to ``vcam-pc/`` itself. The
+    workspace root that contains ``.tools/`` sits one directory
+    above, so we use ``PROJECT_ROOT.parent``.
+
+    Mode B — PyInstaller frozen build (Inno Setup .exe / .dmg .app)
+    ---------------------------------------------------------------
+    The Inno Setup installer (``installer.iss``) and the macOS
+    ``build_dmg.sh`` both lay ``.tools/<os>/`` **next to the
+    executable** (i.e. inside the install dir / .app bundle root,
+    NOT one level up). For Inno that's
+    ``%LOCALAPPDATA%\\NP Create\\.tools\\windows\\`` and for the
+    .app it's ``NP-Create.app/Contents/MacOS/.tools/macos/``.
+    ``PROJECT_ROOT`` already points at that directory because
+    ``config._resolve_project_root`` anchors on
+    ``Path(sys.executable).parent`` in frozen mode. So we use
+    ``PROJECT_ROOT`` itself, NOT its parent — the parent walks
+    one level too high and silently misses the bundled tools,
+    which is exactly the symptom that broke v1.7.8 customer
+    installs (https://… — "no popup on phone after USB plug").
+    """
+    if getattr(sys, "frozen", False):
+        return PROJECT_ROOT
+    return PROJECT_ROOT.parent
+
+
+# .tools/ root: workspace root in dev / portable, install dir when
+# frozen. See ``_tools_root_base`` for why the two paths diverge.
+LEGACY_TOOLS_ROOT = (_tools_root_base() / ".tools").resolve()
 
 
 def tools_root_for(os_name: str | None = None) -> Path:
@@ -94,15 +133,52 @@ def tools_root_for(os_name: str | None = None) -> Path:
     return LEGACY_TOOLS_ROOT / (os_name or current_os())
 
 
+def _extra_tools_roots() -> list[Path]:
+    """Additional ``.tools/`` candidates beyond the canonical layout.
+
+    Two cases worth covering:
+
+    * ``NPCREATE_TOOLS_ROOT`` env var — power-user override for
+      shared toolchains (e.g. one customer wired their installs to
+      a network-mounted `Z:\\np-create-tools\\` so all 6 phones'
+      LSPatch caches live in one place).
+    * macOS .app bundle ``Resources/`` — if a future build of
+      ``build_dmg.sh`` ever copies ``.tools/macos/`` into
+      ``NP-Create.app/Contents/Resources/.tools/`` (the canonical
+      Apple location for bundled assets), this candidate keeps
+      runtime resolution working without touching code.
+    """
+    out: list[Path] = []
+    env = os.environ.get("NPCREATE_TOOLS_ROOT", "").strip()
+    if env:
+        out.append(Path(env).expanduser().resolve())
+    if getattr(sys, "frozen", False) and is_macos():
+        # PROJECT_ROOT in frozen .app = .../Contents/MacOS/. The
+        # Apple-canonical asset dir is the sibling Resources/.
+        resources = PROJECT_ROOT.parent / "Resources"
+        if resources.is_dir():
+            out.append(resources.resolve())
+    return out
+
+
 def _candidates(rel: str) -> list[Path]:
     """Generate candidate paths for ``rel`` (a sub-path inside .tools/).
 
-    Order: per-OS first, then legacy flat.
+    Order: env-override first, then per-OS, then legacy flat, then
+    macOS .app/Contents/Resources/ if relevant. The first existing
+    path wins (see ``_first_existing``).
     """
-    return [
-        tools_root_for() / rel,
-        LEGACY_TOOLS_ROOT / rel,
-    ]
+    extras = _extra_tools_roots()
+    bases = [tools_root_for(), LEGACY_TOOLS_ROOT]
+    # Env override wins over installed defaults so the power-user
+    # path can short-circuit a stale bundled tool.
+    out: list[Path] = []
+    for extra in extras:
+        out.append(extra / current_os() / rel)
+        out.append(extra / rel)
+    for base in bases:
+        out.append(base / rel)
+    return out
 
 
 def _first_existing(rels: list[str]) -> Path | None:
@@ -117,11 +193,39 @@ def _first_existing(rels: list[str]) -> Path | None:
 
 
 def find_adb() -> Path | None:
-    """Return Path to a working ``adb`` binary, or None."""
+    """Return Path to a working ``adb`` binary, or None.
+
+    Lookup order (first hit wins):
+
+    1. ``.tools/<os>/platform-tools/adb`` — the canonical Google
+       Android platform-tools zip, downloaded by
+       ``tools/setup_windows_tools.py`` / ``setup_macos_tools.py``.
+       Preferred because this is the upstream, current adb that
+       Google ships, with full feature set (e.g. ``adb pair`` for
+       Android 11 wireless debugging).
+
+    2. ``.tools/<os>/android-sdk/platform-tools/adb`` — legacy
+       layout from older dev workstations that pre-date the
+       per-OS subdirectory split.
+
+    3. ``.tools/<os>/scrcpy/adb`` — scrcpy's GitHub-released zip
+       bundles a working adb.exe alongside the screen-mirror
+       binary. We extract scrcpy via ``tools/setup_scrcpy.py`` for
+       *every* CI build (it's the screen mirror dependency), so
+       this path is populated on every customer install — even
+       ones where ``setup_*_tools.py`` was skipped. This was the
+       Windows 1.7.8 regression: CI bundled scrcpy's adb but
+       ``find_adb`` only searched ``platform-tools/``, so the
+       installer left customers with no working adb on disk.
+
+    4. ``shutil.which("adb")`` — system-wide install. Power users
+       on Linux / dev machines that already have Android Studio.
+    """
     sfx = exe_suffix()
     rels = [
         f"platform-tools/adb{sfx}",
         f"android-sdk/platform-tools/adb{sfx}",
+        f"scrcpy/adb{sfx}",
     ]
     bundled = _first_existing(rels)
     if bundled:
@@ -245,21 +349,35 @@ def find_vcam_apk() -> Path | None:
     ``vcam-app.apk`` in the list as a backstop for the legacy 1.4.5
     bundles already in customer hands; from 1.4.6 onward the
     ``-release`` name is canonical.
+
+    Search base
+    -----------
+    Just like ``LEGACY_TOOLS_ROOT``, the canonical layout differs
+    between launch modes:
+
+    * Dev / portable ZIP — ``apk/`` sits at the workspace root,
+      one level above ``PROJECT_ROOT`` (which points at vcam-pc/).
+    * PyInstaller frozen — ``apk/`` ships next to NP-Create.exe
+      (Inno Setup) or inside the .app bundle (build_dmg.sh), which
+      is exactly what ``PROJECT_ROOT`` already resolves to.
+
+    Pre-1.7.9 we used ``PROJECT_ROOT.parent`` unconditionally,
+    which silently missed the bundled APK in frozen mode and made
+    Patch fail with "vcam-app APK not found" on .exe installs.
     """
+    base = _tools_root_base()
     candidates = [
         # 1.4.6+ canonical name (what build_release.py writes)
-        PROJECT_ROOT.parent / "apk" / "vcam-app-release.apk",
-        PROJECT_ROOT.parent / "apk" / "vcam-app-debug.apk",
+        base / "apk" / "vcam-app-release.apk",
+        base / "apk" / "vcam-app-debug.apk",
         # Legacy 1.4.5 customer bundles -- accepted so updating to
         # 1.4.6 doesn't break customers who copy in just the new
         # src/ folder over an existing extract.
-        PROJECT_ROOT.parent / "apk" / "vcam-app.apk",
+        base / "apk" / "vcam-app.apk",
         # Dev workspace (gradle output) -- used when running from
         # the source tree, not from a customer ZIP.
-        PROJECT_ROOT.parent
-        / "vcam-app/app/build/outputs/apk/release/app-release.apk",
-        PROJECT_ROOT.parent
-        / "vcam-app/app/build/outputs/apk/debug/app-debug.apk",
+        base / "vcam-app/app/build/outputs/apk/release/app-release.apk",
+        base / "vcam-app/app/build/outputs/apk/debug/app-debug.apk",
     ]
     for c in candidates:
         if c.is_file():
