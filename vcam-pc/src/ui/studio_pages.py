@@ -430,6 +430,25 @@ class DashboardPage(ctk.CTkFrame):
             command=self.app.go_settings,
         ).pack(fill="x", pady=2)
 
+        # ── Quick "restart adb" — v1.8.1 customer ask.
+        # Returning customers regularly hit the symptom "phone
+        # plugged in but every device card on the dashboard says
+        # offline" because some other process (scrcpy / Vysor /
+        # Android Studio left running in the background, or the
+        # OS USB stack after sleep/wake) is holding adb's port-5037
+        # daemon hostage. The wizard already has a 🔄 button buried
+        # in step 1, but customers in this state aren't *trying* to
+        # add a device — they're trying to use the dashboard with
+        # one they already onboarded. So put the same action one
+        # click away from the very page where the "everything
+        # offline" symptom presents.
+        self.btn_restart_adb = _ghost_button(
+            foot,
+            "🔄  รีสตาร์ท ADB",
+            command=self._on_restart_adb,
+        )
+        self.btn_restart_adb.pack(fill="x", pady=2)
+
         # ── Dashboard launcher
         # Spins up the FastAPI server (lazy import + lazy start so a
         # missing fastapi dependency doesn't crash startup) and opens
@@ -2770,6 +2789,72 @@ class DashboardPage(ctk.CTkFrame):
 
     def _on_add_device(self) -> None:
         self.app.go_wizard()
+
+    def _on_restart_adb(self) -> None:
+        """Run ``adb kill-server`` + ``adb start-server`` from the
+        Dashboard (v1.8.1).
+
+        Identical mechanics to the wizard's step-1 restart button,
+        wired to the same ``AdbController.restart_server`` helper —
+        we just expose it here too because the symptom most often
+        presents on the Dashboard ("every device offline") rather
+        than during onboarding.
+
+        Worker thread so the UI doesn't freeze; on completion we
+        force a synchronous device refresh so the sidebar stops
+        showing stale "offline" badges within a second.
+        """
+        self.btn_restart_adb.configure(
+            state="disabled",
+            text="⏳  กำลังรีสตาร์ท ADB…",
+        )
+
+        def _worker() -> None:
+            ok = False
+            try:
+                ok = self.app.adb.restart_server()
+            except Exception:
+                log.exception("Dashboard restart_adb crashed")
+
+            def _show_result() -> None:
+                try:
+                    self.btn_restart_adb.configure(
+                        state="normal",
+                        text="🔄  รีสตาร์ท ADB",
+                    )
+                except Exception:
+                    return  # widget gone (page changed)
+                if ok:
+                    # Force a same-tick device refresh so the
+                    # sidebar's "offline" badges go green within
+                    # ~1 s (otherwise customers wait the full
+                    # 2 s poller interval and assume nothing
+                    # happened).
+                    try:
+                        self.app.refresh_devices_now(timeout=3.0)
+                    except Exception:
+                        pass
+                    self._refresh_sidebar()
+                    messagebox.showinfo(
+                        "สำเร็จ",
+                        "รีสตาร์ท ADB เรียบร้อย\n"
+                        "ระบบจะตรวจจับเครื่องที่เสียบ USB อีกครั้งภายใน 1-2 วินาที",
+                    )
+                else:
+                    messagebox.showwarning(
+                        "ผิดพลาด",
+                        "รีสตาร์ท ADB ไม่สำเร็จ\n"
+                        "ลองปิดโปรแกรมที่ใช้ ADB อยู่ (scrcpy / Android Studio "
+                        "/ Vysor) แล้วลองกดปุ่มนี้อีกครั้ง",
+                    )
+
+            self.after(0, _show_result)
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="dashboard-restart-adb",
+        ).start()
 
     def _on_open_dashboard(self) -> None:
         """Launch the embedded sales dashboard.
