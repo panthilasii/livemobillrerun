@@ -4821,14 +4821,29 @@ class WizardPage(ctk.CTkFrame):
         # * WiFi rows for unknown phones — never auto-onboard
         #   over WiFi (the phone has to come in over USB so the
         #   subsequent ``adb tcpip`` step has a transport to talk to).
-        # * USB rows whose serial is already patched (the dashboard
-        #   handles re-patch separately).
+        #
+        # We do NOT silently skip already-patched USB devices any
+        # more (v1.8.1 fix). Older builds (v1.7.x and the v1.8.0
+        # initial release) hard-skipped any serial whose entry had
+        # ``patched_at`` set, on the theory that "already onboarded
+        # → use the dashboard". The unintended side-effect was the
+        # most-common customer complaint we've ever fielded:
+        #
+        #   "เสียบ USB กด Allow แล้ว — ระบบบอกว่ารอเครื่อง
+        #    เชื่อมต่อ ทั้งที่ adb เห็นเครื่องเลย"
+        #
+        # i.e. the wizard's "🔄 รอเครื่อง…" message looked
+        # identical to "no device", so customers spent minutes
+        # restarting cables / drivers / phones before realising
+        # they were just being silently filtered. v1.8.1 keeps
+        # the device visible and offers re-patch.
         from .. import wifi_adb
 
         patched_serials = {
             e.serial for e in self.app.devices_lib.list() if e.is_patched()
         }
         online_candidates: list = []
+        already_patched: list = []
         unauthorized_devs: list = []
         offline_devs: list = []
         for d in self.app.live_devices:
@@ -4836,8 +4851,9 @@ class WizardPage(ctk.CTkFrame):
                 continue
             if d.online:
                 if d.serial in patched_serials:
-                    continue
-                online_candidates.append(d)
+                    already_patched.append(d)
+                else:
+                    online_candidates.append(d)
             elif (d.state or "").lower() == "unauthorized":
                 unauthorized_devs.append(d)
             elif (d.state or "").lower() in ("offline", "bootloader", "recovery"):
@@ -4846,7 +4862,7 @@ class WizardPage(ctk.CTkFrame):
         status_box = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
         status_box.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
 
-        # ── 1. ONLINE & READY ──────────────────────────────────
+        # ── 1. ONLINE & READY (fresh device) ───────────────────
         if online_candidates:
             d = online_candidates[0]
             self._candidate_serial = d.serial
@@ -4859,6 +4875,34 @@ class WizardPage(ctk.CTkFrame):
             _muted(
                 status_box,
                 f"serial: {d.serial}  ·  product: {d.product or '-'}",
+            ).pack(padx=20, pady=(0, 14), anchor="w")
+            return
+
+        # ── 1b. ONLINE BUT ALREADY PATCHED ─────────────────────
+        # The customer plugged in a phone that's already been
+        # onboarded once. Surface it (don't silently filter) and
+        # let them re-patch from the wizard. Re-patching is the
+        # right action when:
+        #   * TikTok auto-updated and lost the LSPatch hook
+        #   * Customer factory-reset the phone
+        #   * Patch was applied on an older NP Create version
+        #     and we want to refresh to the latest LSPatch
+        # The patch pipeline is idempotent (uninstalls the old
+        # patched APK first), so re-patching is always safe.
+        if already_patched:
+            d = already_patched[0]
+            self._candidate_serial = d.serial
+            ctk.CTkLabel(
+                status_box,
+                text=f"🟢  พบเครื่อง: {d.model or d.serial}",
+                text_color=THEME.success,
+                font=ctk.CTkFont(size=14, weight="bold"),
+            ).pack(padx=20, pady=14, anchor="w")
+            _muted(
+                status_box,
+                f"serial: {d.serial}  ·  product: {d.product or '-'}\n"
+                "ℹ️  เครื่องนี้เคย patch แล้ว — กด 'ถัดไป →' เพื่อ patch ใหม่อีกครั้ง\n"
+                "(เช่น ถ้า TikTok update ตัวเอง หรือเปลี่ยนเครื่อง factory reset)",
             ).pack(padx=20, pady=(0, 14), anchor="w")
             return
 
