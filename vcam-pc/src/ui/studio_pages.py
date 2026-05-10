@@ -400,6 +400,18 @@ class DashboardPage(ctk.CTkFrame):
         )
         self.sidebar_meta.pack(anchor="w", pady=(2, 0))
 
+        # Version badge — pinned under the license line so support
+        # questions like "what version are you on?" can be answered
+        # by the customer in one glance. Pulls from BRAND.version
+        # (the single source of truth in src/branding.py) so a
+        # ``version: str = "1.8.X"`` bump propagates here for free.
+        ctk.CTkLabel(
+            head,
+            text=f"v{BRAND.version}",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=10),
+        ).pack(anchor="w", pady=(0, 0))
+
         ctk.CTkFrame(side, fg_color=THEME.divider, height=1).grid(
             row=1, column=0, sticky="ew", padx=8, pady=8
         )

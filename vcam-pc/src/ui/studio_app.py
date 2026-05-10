@@ -246,7 +246,11 @@ class StudioApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")  # base, we override per-widget
 
-        self.title(f"{BRAND.name} — {BRAND.tagline_th}")
+        # Window title carries the version — customers can confirm
+        # "what am I actually running" at a glance instead of having
+        # to dig into Settings or a hidden About dialog. This is the
+        # single most-asked support question after every release.
+        self.title(f"{BRAND.name} v{BRAND.version} — {BRAND.tagline_th}")
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(960, 640)
         self._install_window_icon()
