@@ -56,22 +56,40 @@ class _DevicePoller(threading.Thread):
     """Polls ``adb devices`` periodically and forwards results to a
     callback that runs on the Tk thread.
 
-    The poller also tries to *reconnect* saved WiFi devices that
-    aren't in the current ``adb devices`` list — usually because
-    the customer just opened the Studio and the previous
-    ``adb connect`` was forgotten by adbd. The reconnect attempt is
-    cheap and silent: ``adb connect`` returns instantly if it
-    succeeds, ~6 s if the LAN doesn't have anyone listening on
-    that IP. We rate-limit it to once every ``RECONNECT_EVERY_S``
-    so the UI stays smooth.
+    Two responsibilities, two threads (v1.8.2 fix)
+    ----------------------------------------------
+    Pre-v1.8.2, this class did *both* device polling AND WiFi
+    re-connection in a single ``run()`` loop. That worked fine
+    when customers had at most one or two saved WiFi devices —
+    ``adb connect <unreachable>:5555`` returns in ~4 s, so even
+    if every saved IP was offline the poller blocked for ~8 s
+    every 10 s, which the UI hid behind the existing 2 s
+    INTERVAL_S without anyone noticing.
 
-    All adb calls happen on this worker thread; the callback is
-    dispatched to the Tk loop via ``after(0, ...)`` so widget
-    updates never race with the main loop.
+    Real customer libraries grew faster than that. With 4–6
+    saved WiFi targets — all on a different LAN than the one the
+    customer is currently on, e.g. they pack up the rig at
+    home and carry it to a coworking space — the inline
+    reconnect attempt blocks the poller for 16–24 s straight.
+    During that window ``adb devices`` is not called, so
+    ``live_devices`` doesn't refresh, so every device card on
+    the dashboard shows "offline" even when the customer has
+    a phone freshly USB-plugged-in. Customer-facing symptom:
+    "ระบบไม่ซิงค์ที่จอเลย / ไม่อ่านค่าการเชื่อมต่อ".
+
+    The fix: device polling stays in this thread on a tight
+    ``INTERVAL_S`` cadence; WiFi reconnect runs in a sibling
+    thread (``_WifiReconnector``) that can block as long as it
+    likes without affecting the dashboard's freshness. The two
+    threads share nothing mutable — they both call
+    ``self._adb`` independently.
+
+    All adb calls happen on these worker threads; the device
+    callback is dispatched to the Tk loop via ``after(0, ...)``
+    so widget updates never race with the main loop.
     """
 
     INTERVAL_S = 2.0
-    RECONNECT_EVERY_S = 10.0
 
     def __init__(
         self,
@@ -84,62 +102,127 @@ class _DevicePoller(threading.Thread):
         self._adb = adb
         self._on_devices = on_devices
         self._tk_after = tk_after
-        # Callback returning the list of saved (ip, port) tuples to
-        # try `adb connect` on. We don't read the device library
-        # directly so the poller stays decoupled from the UI's data
-        # model.
-        self._get_wifi_targets = get_wifi_targets
-        self._stop = threading.Event()
-        self._last_reconnect_attempt = 0.0
+        # NOT ``self._stop`` — that name collides with
+        # ``threading.Thread._stop()`` which CPython's join()
+        # calls during cleanup; a stray ``Event`` there raises
+        # ``TypeError: 'Event' object is not callable`` and
+        # leaks the worker thread on app exit.
+        self._shutdown = threading.Event()
+
+        # Sibling thread handles wifi reconnect so it can't
+        # starve the device-poll loop. Started/stopped in
+        # lock-step with this thread.
+        self._wifi = _WifiReconnector(adb, get_wifi_targets, self._shutdown)
+
+    def start(self) -> None:  # type: ignore[override]
+        super().start()
+        self._wifi.start()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._shutdown.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
-            self._maybe_reconnect_wifi()
+        while not self._shutdown.is_set():
             try:
                 devs = self._adb.devices() if self._adb.is_available() else []
             except Exception:
                 log.exception("adb devices() crashed")
                 devs = []
             self._tk_after(0, lambda d=devs: self._safe(d))
-            self._stop.wait(self.INTERVAL_S)
-
-    def _maybe_reconnect_wifi(self) -> None:
-        now = time.monotonic()
-        if now - self._last_reconnect_attempt < self.RECONNECT_EVERY_S:
-            return
-        self._last_reconnect_attempt = now
-        try:
-            targets = self._get_wifi_targets() or []
-        except Exception:
-            log.exception("wifi-targets callback failed")
-            return
-        if not targets:
-            return
-        # Build the set of WiFi ids already online so we don't
-        # re-issue `adb connect` against them every tick.
-        try:
-            already_online = {
-                d.serial for d in self._adb.devices() if d.online
-            }
-        except Exception:
-            already_online = set()
-        for ip, port in targets:
-            wifi_id = f"{ip}:{port}"
-            if wifi_id in already_online:
-                continue
-            try:
-                wifi_adb.adb_connect(self._adb.adb_path, ip, port, timeout=4)
-            except Exception:
-                log.debug("adb connect %s failed", wifi_id, exc_info=True)
+            self._shutdown.wait(self.INTERVAL_S)
 
     def _safe(self, devs: list[AdbDevice]) -> None:
         try:
             self._on_devices(devs)
         except Exception:
             log.exception("on_devices callback failed")
+
+
+class _WifiReconnector(threading.Thread):
+    """Best-effort ``adb connect`` for saved WiFi devices.
+
+    Independent of ``_DevicePoller`` so a slow / unreachable LAN
+    can't block the dashboard's freshness. Per-target adaptive
+    backoff stops re-trying targets that have failed N times in
+    a row, which protects the customer from the "dead WiFi entry
+    in library + new LAN" → "every poll cycle wastes 4 s on
+    timeout" cascade.
+
+    Targets that *do* succeed reset their failure counter, so a
+    customer who fixed their WiFi (e.g. came back home) sees the
+    phone reconnect within a single ``INTERVAL_S`` window.
+    """
+
+    INTERVAL_S = 10.0
+    CONNECT_TIMEOUT_S = 3.0
+    # After this many consecutive failures, back off to one
+    # attempt per ``MAX_BACKOFF_S`` seconds. 3 attempts × 3 s
+    # timeout = ~9 s of wasted I/O per dead target before we
+    # stop hammering it.
+    FAIL_THRESHOLD = 3
+    MAX_BACKOFF_S = 120.0
+
+    def __init__(self, adb: AdbController, get_targets, stop_event) -> None:
+        super().__init__(daemon=True, name="npcreate-wifi-reconnect")
+        self._adb = adb
+        self._get_targets = get_targets
+        # See _DevicePoller for why this isn't named _stop —
+        # threading.Thread reserves that attribute name.
+        self._shutdown = stop_event
+        # wifi_id → (failure count, last attempt monotonic time)
+        self._fail_state: dict[str, tuple[int, float]] = {}
+
+    def run(self) -> None:
+        while not self._shutdown.is_set():
+            try:
+                self._tick()
+            except Exception:
+                log.exception("wifi reconnector tick crashed")
+            self._shutdown.wait(self.INTERVAL_S)
+
+    def _tick(self) -> None:
+        try:
+            targets = self._get_targets() or []
+        except Exception:
+            log.exception("wifi-targets callback failed")
+            return
+        if not targets:
+            return
+        try:
+            already_online = {
+                d.serial for d in self._adb.devices() if d.online
+            }
+        except Exception:
+            already_online = set()
+
+        now = time.monotonic()
+        for ip, port in targets:
+            if self._shutdown.is_set():
+                return
+            wifi_id = f"{ip}:{port}"
+            if wifi_id in already_online:
+                # Reset on success so a transient outage doesn't
+                # poison the backoff state forever.
+                self._fail_state.pop(wifi_id, None)
+                continue
+            fails, last_at = self._fail_state.get(wifi_id, (0, 0.0))
+            if fails >= self.FAIL_THRESHOLD:
+                # Adaptive backoff: linear in fail count, capped.
+                wait = min(self.MAX_BACKOFF_S, 10.0 * (fails - 1))
+                if now - last_at < wait:
+                    continue
+            ok = False
+            try:
+                ok = wifi_adb.adb_connect(
+                    self._adb.adb_path, ip, port,
+                    timeout=self.CONNECT_TIMEOUT_S,
+                )
+            except Exception:
+                log.debug("adb connect %s failed", wifi_id, exc_info=True)
+            if ok:
+                self._fail_state.pop(wifi_id, None)
+            else:
+                self._fail_state[wifi_id] = (fails + 1, time.monotonic())
 
 
 # ──────────────────────────────────────────────────────────────────
