@@ -48,7 +48,7 @@
 ; passing /D". Keep it in sync with branding.py before tagging a
 ; release; CI will warn if the two diverge by more than a tag.
 #ifndef MyAppVersion
-#define MyAppVersion "1.7.11"
+#define MyAppVersion "1.8.0"
 #endif
 #define MyAppPublisher "NP Create Co., Ltd."
 #define MyAppURL       "https://line.me/R/ti/p/@npcreate"

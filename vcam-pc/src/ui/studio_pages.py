@@ -33,6 +33,7 @@ import time
 import webbrowser
 from datetime import date
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -3570,6 +3571,1034 @@ class DashboardPage(ctk.CTkFrame):
 
 
 # ──────────────────────────────────────────────────────────────────
+#  ModePickerPage  — v1.8.0: pick how the phone talks to the PC
+# ──────────────────────────────────────────────────────────────────
+#
+# Background
+# ----------
+# Pre-1.8.0 the only "Add Device" path was USB → ADB → LSPatch
+# → install patched TikTok. That hard requirement on Windows
+# OEM USB drivers caused weeks of customer-support pain
+# (Xiaomi/Redmi/POCO especially — see v1.7.11's driver-help
+# dialog) and was a hard block for iPhone customers since
+# iPhones don't speak ADB at all.
+#
+# Mode B (RTMP + virtual-camera app on the phone) sidesteps
+# all of that: PC runs MediaMTX, phone runs CameraFi/Larix/DU
+# Recorder pulling rtmp://<PC-IP>:1935/live, TikTok sees a
+# regular "external camera". No USB cable, no driver, no
+# patched APK. Setup is 2-3 minutes via QR code.
+#
+# We keep Mode A (USB + Patch) as the "premium quality" option
+# because the patched TikTok stream has lower latency and no
+# transcoding loss. Mode C (Wireless ADB) is reserved for a
+# v1.8.1 follow-up — it still needs USB once for pairing on
+# Android < 11 so it doesn't fully solve the "Mac เทสได้
+# Windows ไม่ได้" complaint.
+
+
+class ModePickerPage(ctk.CTkFrame):
+    """One-screen picker between Mode A (USB+Patch) and Mode B
+    (RTMP+virtual-cam). Shown immediately when the customer
+    clicks "+ เพิ่มเครื่อง".
+    """
+
+    def __init__(self, app) -> None:
+        super().__init__(app, fg_color=THEME.bg_main)
+        self.app = app
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # ── header
+        head = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_columnconfigure(1, weight=1)
+
+        _ghost_button(
+            head, "← ยกเลิก",
+            command=self.app.go_dashboard,
+        ).grid(row=0, column=0, padx=14, pady=12)
+
+        ctk.CTkLabel(
+            head, text="เพิ่มเครื่องใหม่ — เลือกวิธีเชื่อม",
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=1, padx=14, sticky="w")
+
+        # ── body
+        body = ctk.CTkFrame(self, fg_color=THEME.bg_main)
+        body.grid(row=1, column=0, sticky="nsew", padx=24, pady=20)
+        body.grid_columnconfigure(0, weight=1)
+
+        _h2(body, "เลือกวิธีที่ลูกค้าจะใช้").grid(
+            row=0, column=0, sticky="w", pady=(8, 4)
+        )
+        _muted(
+            body,
+            "เลือก mode ตาม use-case ของลูกค้าได้เลย — แต่ละ mode มีข้อดี/ข้อเสียต่างกัน",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        # ── card: Mode B (recommended)
+        card_b = self._mode_card(
+            body,
+            badge="แนะนำ",
+            badge_color=THEME.success,
+            icon="📡",
+            title="ใช้ WiFi (ไม่ต้องเสียบ USB)",
+            description=(
+                "ลูกค้าลง app ฟรีบนมือถือ (CameraFi / Larix / DU Recorder)\n"
+                "→ สแกน QR → เริ่มไลฟ์ได้เลย"
+            ),
+            pros=[
+                "ไม่ต้องลง driver Windows",
+                "ใช้ TikTok ตัวจริง — ไม่มี ban risk จาก patched APK",
+                "ใช้ได้ทั้ง Android + iPhone",
+                "Setup เสร็จใน 2-3 นาที",
+            ],
+            cons=[
+                "Latency ~300-500ms (RTMP transcode)",
+                "ลูกค้าต้องเชื่อม WiFi เดียวกับ PC",
+                "ลูกค้าต้องเปิด virtual cam app ค้างไว้",
+            ],
+            command=self.app.go_rtmp_wizard,
+        )
+        card_b.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+
+        # ── card: Mode A (high quality)
+        card_a = self._mode_card(
+            body,
+            badge="คุณภาพสูง",
+            badge_color=THEME.primary,
+            icon="⚡",
+            title="ใช้ USB + Patch TikTok",
+            description=(
+                "เสียบ USB → patch TikTok ด้วย LSPatch → ไลฟ์\n"
+                "วิธีเดิม (Mode A) ของ NP Create"
+            ),
+            pros=[
+                "Latency ~50ms (เกือบ realtime)",
+                "คุณภาพวิดีโอระดับกล้องจริง",
+                "ไม่ต้องเชื่อม WiFi",
+            ],
+            cons=[
+                "ต้องลง driver Windows ตามยี่ห้อมือถือ",
+                "ต้องเสียบ USB cable",
+                "Patched TikTok มี ban risk สูงกว่า",
+            ],
+            command=self.app.go_usb_wizard,
+        )
+        card_a.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+
+        # ── card: Mode C (Wireless ADB — Android 11+)
+        card_c = self._mode_card(
+            body,
+            badge="ใหม่",
+            badge_color=THEME.warning,
+            icon="🔗",
+            title="Wireless ADB (Android 11+)",
+            description=(
+                "Pair ผ่าน WiFi (ไม่ต้องเสียบ USB) → Patch TikTok\n"
+                "ได้คุณภาพ Mode A โดยไม่ต้องลง driver Windows"
+            ),
+            pros=[
+                "ไม่ต้องลง driver Windows",
+                "คุณภาพระดับเดียวกับ Mode A (Patched TikTok)",
+                "ใช้ ADB ปกติหลัง pair เสร็จ",
+            ],
+            cons=[
+                "เฉพาะ Android 11+ เท่านั้น (iPhone ใช้ไม่ได้)",
+                "ต้องเปิด Wireless Debugging ใน Developer Options",
+                "Pair port หาย เมื่อปิดหน้าจอ Pair บนมือถือ",
+            ],
+            command=self.app.go_wireless_wizard,
+        )
+        card_c.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+
+    def _mode_card(
+        self, parent, *, badge: str, badge_color: str, icon: str,
+        title: str, description: str, pros: list[str], cons: list[str],
+        command,
+    ) -> ctk.CTkFrame:
+        """Render one mode-option card with hover-highlight on
+        the whole frame so the customer treats it as a single
+        clickable surface, not a button-in-text mix."""
+        card = ctk.CTkFrame(parent, fg_color=THEME.bg_card, corner_radius=10)
+        card.grid_columnconfigure(0, weight=1)
+
+        # Top row — badge + title
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 4))
+        top.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(
+            top, text=icon, font=ctk.CTkFont(size=24),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            top, text=title,
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ctk.CTkLabel(
+            top, text=f"  {badge}  ",
+            text_color="#000000", fg_color=badge_color,
+            corner_radius=4,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).grid(row=0, column=3, sticky="e")
+
+        ctk.CTkLabel(
+            card, text=description,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            justify="left", anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+
+        # Pros / cons row
+        if pros or cons:
+            pc = ctk.CTkFrame(card, fg_color="transparent")
+            pc.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+            pc.grid_columnconfigure(0, weight=1)
+            pc.grid_columnconfigure(1, weight=1)
+
+            if pros:
+                col = ctk.CTkFrame(pc, fg_color="transparent")
+                col.grid(row=0, column=0, sticky="nw", padx=(0, 12))
+                for p in pros:
+                    ctk.CTkLabel(
+                        col, text=f"✓ {p}",
+                        text_color=THEME.success,
+                        font=ctk.CTkFont(size=11),
+                        justify="left", anchor="w",
+                    ).pack(anchor="w", pady=1)
+            if cons:
+                col = ctk.CTkFrame(pc, fg_color="transparent")
+                col.grid(row=0, column=1, sticky="nw")
+                for c in cons:
+                    ctk.CTkLabel(
+                        col, text=f"⚠ {c}",
+                        text_color=THEME.warning,
+                        font=ctk.CTkFont(size=11),
+                        justify="left", anchor="w",
+                    ).pack(anchor="w", pady=1)
+
+        # Action row
+        if command is not None:
+            _primary_button(
+                card, "เลือก mode นี้", command=command,
+            ).grid(row=3, column=0, sticky="e", padx=20, pady=(0, 16))
+        else:
+            ctk.CTkLabel(
+                card, text="(ยังไม่เปิดให้ใช้)",
+                text_color=THEME.fg_muted,
+                font=ctk.CTkFont(size=11, slant="italic"),
+            ).grid(row=3, column=0, sticky="e", padx=20, pady=(0, 16))
+
+        return card
+
+
+# ──────────────────────────────────────────────────────────────────
+#  RTMPWizardPage — Mode B "no-USB" flow (v1.8.0)
+# ──────────────────────────────────────────────────────────────────
+
+
+class RTMPWizardPage(ctk.CTkFrame):
+    """Three-step setup for the Mode B WiFi flow.
+
+    Step 1: Pick + install a virtual-camera app on the phone
+            (CameraFi / Larix / DU Recorder). We render a Play
+            Store QR code so the customer just points the
+            phone's camera at the screen.
+    Step 2: Start MediaMTX on the PC and show the
+            ``rtmp://<PC-IP>:1935/live`` URL as a QR. The
+            customer pastes it into their virtual-cam app's
+            "RTMP Input" setting.
+    Step 3: Pick a nickname for this phone and finish.
+
+    This wizard never touches ADB or the phone's USB stack.
+    The phone entry it creates in ``customer_devices`` has
+    ``transport="rtmp"`` so the dashboard knows to show the
+    streaming controls (start/stop FFmpeg → MediaMTX) instead
+    of the Patch button.
+    """
+
+    STEPS = ("เลือกแอพ + ลง", "เริ่ม RTMP + สแกน QR", "ตั้งชื่อเล่น")
+
+    def __init__(self, app) -> None:
+        super().__init__(app, fg_color=THEME.bg_main)
+        self.app = app
+        self._step = 0
+        self._chosen_app_key: str = "camerafi"  # default = recommended()
+        self._nickname_var = tk.StringVar(value="")
+        self._rtmp_server = None  # lazy: created on step 2
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # header
+        head = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_columnconfigure(1, weight=1)
+
+        _ghost_button(
+            head, "← เลือก mode อื่น",
+            command=self.app.go_wizard,
+        ).grid(row=0, column=0, padx=14, pady=12)
+        ctk.CTkLabel(
+            head, text="เพิ่มเครื่องใหม่ (Mode B — WiFi)",
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=1, padx=14, sticky="w")
+        self.lbl_step = _muted(head, "")
+        self.lbl_step.grid(row=0, column=2, padx=14, sticky="e")
+
+        # body
+        self.body = ctk.CTkFrame(self, fg_color=THEME.bg_main)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.body.grid_columnconfigure(0, weight=1)
+        self.body.grid_rowconfigure(0, weight=1)
+
+        # footer
+        foot = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        foot.grid(row=2, column=0, sticky="ew")
+        foot.grid_columnconfigure(1, weight=1)
+        self.btn_prev = _ghost_button(foot, "← ก่อนหน้า", command=self._prev)
+        self.btn_prev.grid(row=0, column=0, padx=14, pady=12)
+        self.btn_next = _primary_button(foot, "ถัดไป →", command=self._next)
+        self.btn_next.grid(row=0, column=2, padx=14, pady=12)
+
+        self._render_step()
+
+    # ── flow control ─────────────────────────────────────────
+
+    def _render_step(self) -> None:
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.lbl_step.configure(
+            text=f"ขั้น {self._step + 1}/{len(self.STEPS)} · {self.STEPS[self._step]}"
+        )
+        getattr(self, f"_render_step_{self._step}")()
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.btn_prev.configure(
+            state="normal" if self._step > 0 else "disabled",
+        )
+        if self._step == len(self.STEPS) - 1:
+            self.btn_next.configure(text="✓  เสร็จสิ้น", state="normal")
+        else:
+            self.btn_next.configure(text="ถัดไป →", state="normal")
+
+    def _next(self) -> None:
+        if self._step == len(self.STEPS) - 1:
+            self._finish()
+            return
+        self._step = min(self._step + 1, len(self.STEPS) - 1)
+        self._render_step()
+
+    def _prev(self) -> None:
+        # Stop the RTMP server when navigating away from step 2 —
+        # leaving an orphan mediamtx running confuses customers
+        # who later try to start it again from a fresh wizard.
+        if self._step == 1 and self._rtmp_server is not None:
+            try:
+                self._rtmp_server.stop()
+            except Exception:
+                pass
+            self._rtmp_server = None
+        self._step = max(self._step - 1, 0)
+        self._render_step()
+
+    # ── step 0: pick + install virtual-cam app ───────────────
+
+    def _render_step_0(self) -> None:
+        from .. import virtual_cam_apps
+
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 1: ลง app บนมือถือ").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+        _muted(
+            wrap,
+            "เลือก app ตัวใดตัวหนึ่งด้านล่าง สแกน QR ด้วยกล้องมือถือเพื่อไป Play Store",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        # Selector row
+        chosen = virtual_cam_apps.by_key(self._chosen_app_key) or virtual_cam_apps.recommended()
+
+        seg_frame = ctk.CTkFrame(wrap, fg_color="transparent")
+        seg_frame.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+        for i, app in enumerate(virtual_cam_apps.CATALOG):
+            seg_frame.grid_columnconfigure(i, weight=1)
+
+            def _pick(k=app.key):
+                self._chosen_app_key = k
+                self._render_step()
+
+            is_active = app.key == chosen.key
+            stars = "⭐" * app.rating
+            ctk.CTkButton(
+                seg_frame,
+                text=f"{app.name}\n{stars}",
+                command=_pick,
+                fg_color=THEME.primary if is_active else THEME.bg_input,
+                hover_color=THEME.primary_hover if is_active else THEME.bg_hover,
+                text_color=THEME.fg_primary,
+                corner_radius=8,
+                height=60,
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=0, column=i, sticky="ew", padx=4)
+
+        # Detail panel: QR + steps for chosen app
+        detail = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        detail.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 24))
+        detail.grid_columnconfigure(1, weight=1)
+
+        # ── left: QR
+        qr_label = self._qr_label(detail, chosen.playstore_url, size=200)
+        if qr_label is not None:
+            qr_label.grid(row=0, column=0, padx=14, pady=14, rowspan=3)
+
+        # ── right: name + description + steps
+        ctk.CTkLabel(
+            detail, text=chosen.name,
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=(14, 0))
+
+        ctk.CTkLabel(
+            detail, text=chosen.description_th,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+            justify="left", anchor="w", wraplength=360,
+        ).grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(2, 6))
+
+        steps_text = "วิธีตั้งค่าใน app:\n" + "\n".join(
+            f"  {i+1}. {s}" for i, s in enumerate(chosen.setup_steps_th)
+        )
+        ctk.CTkLabel(
+            detail, text=steps_text,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+            justify="left", anchor="nw",
+        ).grid(row=2, column=1, sticky="nw", padx=(0, 14), pady=(0, 14))
+
+        if chosen.notes_th:
+            ctk.CTkLabel(
+                wrap, text=f"💡 {chosen.notes_th}",
+                text_color=THEME.warning,
+                font=ctk.CTkFont(size=11, slant="italic"),
+                justify="left", anchor="w", wraplength=600,
+            ).grid(row=4, column=0, sticky="w", padx=24, pady=(0, 16))
+
+    # ── step 1: start RTMP + show QR ─────────────────────────
+
+    def _render_step_1(self) -> None:
+        from .. import rtmp_server, virtual_cam_apps
+
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 2: เปิด RTMP server + สแกน QR").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+        _muted(
+            wrap,
+            "ระบบจะเปิด RTMP server บน PC ให้ลูกค้าใส่ URL ในแอพบนมือถือ",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        # Lazy start RTMP server
+        if self._rtmp_server is None:
+            self._rtmp_server = rtmp_server.RTMPServer()
+        if not self._rtmp_server.is_running:
+            ok = self._rtmp_server.start()
+            if not ok:
+                # Show the error and offer retry
+                err = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+                err.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+                ctk.CTkLabel(
+                    err, text="❌ เปิด RTMP server ไม่ได้",
+                    text_color=THEME.danger,
+                    font=ctk.CTkFont(size=14, weight="bold"),
+                ).pack(padx=14, pady=(14, 4), anchor="w")
+                tail = "\n".join(self._rtmp_server.last_errors()[-5:]) or \
+                    "(ไม่มี log — อาจพอร์ต 1935 ถูกใช้อยู่หรือ MediaMTX ไม่อยู่)"
+                ctk.CTkLabel(
+                    err, text=tail,
+                    text_color=THEME.fg_secondary,
+                    font=ctk.CTkFont(size=11, family="Menlo"),
+                    justify="left", anchor="w", wraplength=600,
+                ).pack(padx=14, pady=(0, 14), anchor="w")
+                _ghost_button(
+                    wrap, "🔄  ลองเปิดใหม่",
+                    command=self._render_step,
+                ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 16))
+                self.btn_next.configure(state="disabled", text="ยังเปิดไม่ได้")
+                return
+
+        url_phone = self._rtmp_server.rtmp_url_for_phone
+        is_routable = self._rtmp_server.is_lan_routable
+
+        # Status panel
+        status = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        status.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+        status.grid_columnconfigure(1, weight=1)
+
+        # Left: QR of rtmp:// URL
+        qr_label = self._qr_label(status, url_phone, size=220)
+        if qr_label is not None:
+            qr_label.grid(row=0, column=0, padx=14, pady=14, rowspan=3)
+
+        # Right: status text + URL
+        ctk.CTkLabel(
+            status, text="✅ RTMP server พร้อมใช้",
+            text_color=THEME.success,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=(14, 0))
+
+        ctk.CTkLabel(
+            status, text="URL ที่ลูกค้าใส่ในแอพมือถือ:",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(8, 0))
+
+        url_box = ctk.CTkEntry(
+            status,
+            font=ctk.CTkFont(size=14, family="Menlo", weight="bold"),
+            text_color=THEME.fg_primary,
+            fg_color=THEME.bg_card,
+            border_width=1,
+        )
+        url_box.insert(0, url_phone)
+        url_box.configure(state="readonly")
+        url_box.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=(2, 14))
+
+        if not is_routable:
+            ctk.CTkLabel(
+                wrap,
+                text=(
+                    "⚠️ PC ไม่ได้อยู่บน LAN — IP ที่แสดงคือ 127.0.0.1 "
+                    "ลูกค้าจะเชื่อมไม่ได้ กรุณาเชื่อม WiFi/LAN ก่อน"
+                ),
+                text_color=THEME.warning,
+                font=ctk.CTkFont(size=12),
+                justify="left", anchor="w", wraplength=600,
+            ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+
+        # Recap of chosen app's setup steps
+        chosen = virtual_cam_apps.by_key(self._chosen_app_key)
+        if chosen:
+            recap = ctk.CTkFrame(wrap, fg_color="transparent")
+            recap.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 16))
+            ctk.CTkLabel(
+                recap,
+                text=f"ใน {chosen.name} บนมือถือ:",
+                text_color=THEME.fg_primary,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                anchor="w",
+            ).pack(fill="x")
+            ctk.CTkLabel(
+                recap,
+                text="\n".join(
+                    f"  {i+1}. {s}"
+                    for i, s in enumerate(chosen.setup_steps_th)
+                ),
+                text_color=THEME.fg_secondary,
+                font=ctk.CTkFont(size=11),
+                justify="left", anchor="w",
+            ).pack(fill="x", pady=(2, 0))
+
+    # ── step 2: nickname + finish ────────────────────────────
+
+    def _render_step_2(self) -> None:
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 3: ตั้งชื่อเล่นเครื่อง").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+        _muted(
+            wrap,
+            "ตั้งชื่อให้จำง่าย เช่น 'มือถือลูกค้าเอ' หรือ 'iPhone หลัก'",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        ctk.CTkEntry(
+            wrap,
+            textvariable=self._nickname_var,
+            placeholder_text="ชื่อเล่นเครื่อง...",
+            font=ctk.CTkFont(size=14),
+            height=40,
+        ).grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+
+    def _finish(self) -> None:
+        from datetime import datetime
+        import uuid
+
+        from .. import customer_devices, virtual_cam_apps
+
+        chosen = virtual_cam_apps.by_key(self._chosen_app_key)
+        label = self._nickname_var.get().strip()
+        if not label:
+            label = f"WiFi · {chosen.name if chosen else 'RTMP'}"
+
+        # Synthetic serial: "rtmp:" prefix + uuid4 last 12. The
+        # rest of the app uses serial as primary key for device
+        # entries, so we need something unique that won't ever
+        # collide with a real ADB serial (real ones are hex 8/16/
+        # 40, never start with a colon and never contain one).
+        serial = f"rtmp:{uuid.uuid4().hex[:12]}"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        entry = customer_devices.DeviceEntry(
+            serial=serial,
+            label=label,
+            model=(chosen.name if chosen else "RTMP"),
+            added_at=now_iso,
+            created_at=now_iso,
+            transport="rtmp",
+            vcam_app_key=self._chosen_app_key,
+        )
+
+        try:
+            self.app.devices_lib.entries[serial] = entry
+            self.app.devices_lib.save()
+        except Exception as e:
+            messagebox.showerror(
+                "บันทึกเครื่องไม่ได้",
+                f"เพิ่มเครื่องล้มเหลว:\n{e}",
+            )
+            return
+
+        # Don't stop the RTMP server — the dashboard wants to
+        # keep streaming. The dashboard's "Mirror" / "Live"
+        # button adopts ownership of the running mediamtx and
+        # the FFmpeg loop on first interaction.
+        self.app.go_dashboard()
+
+    # ── helpers ──────────────────────────────────────────────
+
+    def _qr_label(self, parent, data: str, size: int = 200):
+        """Render a QR code of ``data`` and return a CTkLabel
+        holding the PhotoImage. Returns None if qrcode/Pillow
+        aren't importable (e.g. customer running an older
+        portable build without the v1.8.0 deps); the caller
+        is expected to handle that gracefully and just skip
+        the QR — the URL is also displayed as text."""
+        try:
+            import qrcode
+            from PIL import ImageTk
+        except Exception:
+            return None
+        try:
+            img = qrcode.make(data, box_size=8, border=2).convert("RGB")
+            # Scale to requested pixel size, preserving sharp pixels.
+            img = img.resize((size, size))
+            tk_img = ImageTk.PhotoImage(img)
+            lbl = ctk.CTkLabel(parent, text="", image=tk_img)
+            # Keep a ref so GC doesn't reap the PhotoImage out
+            # from under Tk before draw — Tk's image-ref dance.
+            lbl._qr_image = tk_img  # type: ignore[attr-defined]
+            return lbl
+        except Exception:
+            return None
+
+
+# ──────────────────────────────────────────────────────────────────
+#  WirelessADBWizardPage — Mode C "no USB" flow (Android 11+)
+# ──────────────────────────────────────────────────────────────────
+#
+# Why this page exists
+# --------------------
+# Mode A (USB+Patch) needs an OEM USB driver on Windows; lots of
+# Xiaomi/Redmi/HyperOS customers can't get past that.
+# Mode B (RTMP) avoids ADB entirely but trades latency for
+# convenience. Mode C splits the difference: pair the phone over
+# WiFi *once* via Android 11+'s Wireless Debugging UI, then run
+# the same ADB+LSPatch flow as Mode A. Result: same patched-
+# TikTok quality as Mode A, but no Windows driver required after
+# pairing.
+#
+# The pairing flow is the manual "Pair device with pairing code"
+# variant (not the QR variant — see ``_render_step_0`` for why).
+# Customer reads the IP:port + 6-digit code off the phone screen
+# and types it into the wizard. Once paired, we ``adb connect``
+# against the phone's *separate* live-ADB port (also displayed
+# on the same Android screen, just below the pair line) and
+# hand the resulting adb-id off to the regular WizardPage so the
+# customer continues with the familiar Patch step.
+
+
+class WirelessADBWizardPage(ctk.CTkFrame):
+    """Three steps before handoff to the regular Patch wizard:
+
+    Step 0: เปิด Wireless Debugging + อ่าน IP:port + code
+            (text instructions + 3 input fields)
+    Step 1: ใส่ live-ADB port + connect
+            (one input field + connect button)
+    Step 2: hand off to ``WizardPage(pre_paired_serial=<id>)``
+            so the customer continues with Patch + nickname
+            using the same code path as Mode A.
+    """
+
+    STEPS = ("Pair กับมือถือ", "เชื่อมต่อ ADB", "ไปต่อที่ Patch")
+
+    def __init__(self, app) -> None:
+        super().__init__(app, fg_color=THEME.bg_main)
+        self.app = app
+        self._step = 0
+        # form state
+        self._pair_ip = tk.StringVar(value="")
+        self._pair_port = tk.StringVar(value="")
+        self._pair_code = tk.StringVar(value="")
+        self._connect_port = tk.StringVar(value="")
+        self._connect_status = tk.StringVar(value="")
+        self._paired_ok = False
+        self._connected_serial: str | None = None
+        self._error: str = ""
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_columnconfigure(1, weight=1)
+
+        _ghost_button(
+            head, "← เลือก mode อื่น",
+            command=self.app.go_wizard,
+        ).grid(row=0, column=0, padx=14, pady=12)
+        ctk.CTkLabel(
+            head, text="เพิ่มเครื่องใหม่ (Mode C — Wireless ADB)",
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=1, padx=14, sticky="w")
+        self.lbl_step = _muted(head, "")
+        self.lbl_step.grid(row=0, column=2, padx=14, sticky="e")
+
+        self.body = ctk.CTkFrame(self, fg_color=THEME.bg_main)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.body.grid_columnconfigure(0, weight=1)
+        self.body.grid_rowconfigure(0, weight=1)
+
+        foot = ctk.CTkFrame(self, fg_color=THEME.bg_sidebar, corner_radius=0)
+        foot.grid(row=2, column=0, sticky="ew")
+        foot.grid_columnconfigure(1, weight=1)
+        self.btn_prev = _ghost_button(foot, "← ก่อนหน้า", command=self._prev)
+        self.btn_prev.grid(row=0, column=0, padx=14, pady=12)
+        self.btn_next = _primary_button(foot, "ถัดไป →", command=self._next)
+        self.btn_next.grid(row=0, column=2, padx=14, pady=12)
+
+        self._render_step()
+
+    def _render_step(self) -> None:
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.lbl_step.configure(
+            text=f"ขั้น {self._step + 1}/{len(self.STEPS)} · {self.STEPS[self._step]}"
+        )
+        getattr(self, f"_render_step_{self._step}")()
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.btn_prev.configure(
+            state="normal" if self._step > 0 else "disabled",
+        )
+        if self._step == 0:
+            self.btn_next.configure(
+                text="ถัดไป →" if self._paired_ok else "Pair ก่อน",
+                state="normal" if self._paired_ok else "disabled",
+            )
+        elif self._step == 1:
+            ok = self._connected_serial is not None
+            self.btn_next.configure(
+                text="ไปต่อ →" if ok else "เชื่อมต่อก่อน",
+                state="normal" if ok else "disabled",
+            )
+        else:
+            self.btn_next.configure(text="ไป Patch", state="normal")
+
+    def _next(self) -> None:
+        if self._step == len(self.STEPS) - 1:
+            self._handoff()
+            return
+        self._step = min(self._step + 1, len(self.STEPS) - 1)
+        self._render_step()
+
+    def _prev(self) -> None:
+        self._step = max(self._step - 1, 0)
+        self._render_step()
+
+    # ── step 0: pair ─────────────────────────────────────────
+
+    def _render_step_0(self) -> None:
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 1: Pair มือถือผ่าน WiFi").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+
+        # Instructions
+        instructions = (
+            "บนมือถือ Android 11+:\n"
+            "  1. Settings → About phone → กด 'Build number' 7 ครั้ง "
+            "(ปลด Developer mode)\n"
+            "  2. Settings → Developer options → เปิด 'Wireless debugging'\n"
+            "  3. กด 'Pair device with pairing code'\n"
+            "  4. มือถือจะแสดง:\n"
+            "       IP address & port:  192.168.1.42 : 38765\n"
+            "       Wi-Fi pairing code:  123456\n"
+            "  5. ใส่ค่าที่เห็นในช่องข้างล่าง (อย่าปิดหน้าจอ Pair)"
+        )
+        ctk.CTkLabel(
+            wrap, text=instructions,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            justify="left", anchor="nw",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        form = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        form.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 8))
+        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            form, text="IP มือถือ:",
+            text_color=THEME.fg_primary,
+        ).grid(row=0, column=0, sticky="e", padx=(14, 6), pady=12)
+        ctk.CTkEntry(
+            form, textvariable=self._pair_ip,
+            placeholder_text="192.168.1.42",
+            width=140,
+        ).grid(row=0, column=1, sticky="w", pady=12)
+
+        ctk.CTkLabel(
+            form, text="พอร์ต Pair:",
+            text_color=THEME.fg_primary,
+        ).grid(row=0, column=2, sticky="e", padx=(14, 6), pady=12)
+        ctk.CTkEntry(
+            form, textvariable=self._pair_port,
+            placeholder_text="38765",
+            width=100,
+        ).grid(row=0, column=3, sticky="w", pady=12)
+
+        ctk.CTkLabel(
+            form, text="Pairing code (6 หลัก):",
+            text_color=THEME.fg_primary,
+        ).grid(row=1, column=0, sticky="e", padx=(14, 6), pady=12)
+        ctk.CTkEntry(
+            form, textvariable=self._pair_code,
+            placeholder_text="123456",
+            width=140,
+        ).grid(row=1, column=1, sticky="w", pady=12)
+
+        _primary_button(
+            wrap, "🔐  Pair", command=self._do_pair,
+        ).grid(row=3, column=0, sticky="w", padx=24, pady=(8, 16))
+
+        if self._error:
+            ctk.CTkLabel(
+                wrap, text=f"⚠ {self._error}",
+                text_color=THEME.danger,
+                font=ctk.CTkFont(size=12),
+                justify="left", anchor="w", wraplength=600,
+            ).grid(row=4, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        if self._paired_ok:
+            ctk.CTkLabel(
+                wrap, text="✅ Pair สำเร็จ — ไปขั้นถัดไปได้เลย",
+                text_color=THEME.success,
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=5, column=0, sticky="w", padx=24, pady=(0, 16))
+
+    def _do_pair(self) -> None:
+        from .. import platform_tools, wifi_adb
+
+        ip = self._pair_ip.get().strip()
+        port_s = self._pair_port.get().strip()
+        code = self._pair_code.get().strip()
+        if not (ip and port_s and code):
+            self._error = "กรุณาใส่ครบทั้ง 3 ช่อง"
+            self._render_step()
+            return
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._error = f"พอร์ตต้องเป็นตัวเลข (ใส่: {port_s!r})"
+            self._render_step()
+            return
+
+        adb_path = platform_tools.find_adb()
+        if not adb_path:
+            self._error = "ไม่พบ adb — รัน tools/setup_ci_tools.py ก่อน"
+            self._render_step()
+            return
+
+        ok, msg = wifi_adb.adb_pair(str(adb_path), ip, port, code)
+        if ok:
+            self._paired_ok = True
+            self._error = ""
+            # Pre-fill the IP for the connect step (port differs).
+            self._pair_ip.set(ip)
+        else:
+            self._paired_ok = False
+            self._error = f"Pair ไม่สำเร็จ: {msg}"
+        self._render_step()
+
+    # ── step 1: connect ──────────────────────────────────────
+
+    def _render_step_1(self) -> None:
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 2: เชื่อมต่อ ADB").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+
+        instructions = (
+            "บนหน้า Wireless debugging ของมือถือ จะมี 2 พอร์ต:\n"
+            "   • IP address & port (ใต้หัวข้อ 'Wireless debugging')\n"
+            "       ↑ ใช้ตัวนี้ สำหรับเชื่อม ADB\n"
+            "   • Pairing IP & port (ที่ใช้ไปแล้วในขั้นที่ 1)\n"
+            "       ↑ ตัวนี้ใช้ครั้งเดียว ปิดไปได้แล้ว\n"
+            "\n"
+            "ใส่พอร์ต ADB ในช่องข้างล่าง (IP เดียวกับขั้นที่ 1)"
+        )
+        ctk.CTkLabel(
+            wrap, text=instructions,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=12),
+            justify="left", anchor="nw",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        form = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        form.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 8))
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            form, text=f"IP มือถือ: {self._pair_ip.get()}",
+            text_color=THEME.fg_secondary,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=12)
+
+        ctk.CTkLabel(
+            form, text="พอร์ต ADB:",
+            text_color=THEME.fg_primary,
+        ).grid(row=1, column=0, sticky="e", padx=(14, 6), pady=12)
+        ctk.CTkEntry(
+            form, textvariable=self._connect_port,
+            placeholder_text="42135",
+            width=120,
+        ).grid(row=1, column=1, sticky="w", pady=12)
+
+        _primary_button(
+            wrap, "🔗  Connect", command=self._do_connect,
+        ).grid(row=3, column=0, sticky="w", padx=24, pady=(8, 16))
+
+        status = self._connect_status.get()
+        if status:
+            color = (
+                THEME.success if self._connected_serial
+                else THEME.danger
+            )
+            ctk.CTkLabel(
+                wrap, text=status,
+                text_color=color,
+                font=ctk.CTkFont(size=12),
+                justify="left", anchor="w", wraplength=600,
+            ).grid(row=4, column=0, sticky="w", padx=24, pady=(0, 16))
+
+    def _do_connect(self) -> None:
+        from .. import platform_tools, wifi_adb
+
+        ip = self._pair_ip.get().strip()
+        port_s = self._connect_port.get().strip()
+        if not (ip and port_s):
+            self._connect_status.set("กรุณาใส่พอร์ต ADB")
+            self._connected_serial = None
+            self._render_step()
+            return
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._connect_status.set("พอร์ตต้องเป็นตัวเลข")
+            self._connected_serial = None
+            self._render_step()
+            return
+
+        adb_path = platform_tools.find_adb()
+        if not adb_path:
+            self._connect_status.set("ไม่พบ adb")
+            self._connected_serial = None
+            self._render_step()
+            return
+
+        ok = wifi_adb.adb_connect(str(adb_path), ip, port)
+        if ok:
+            self._connected_serial = wifi_adb.format_wifi_id(ip, port)
+            self._connect_status.set(
+                f"✅ Connect สำเร็จ — adb id: {self._connected_serial}"
+            )
+        else:
+            self._connected_serial = None
+            self._connect_status.set(
+                "❌ Connect ไม่สำเร็จ — ตรวจว่า phone อยู่ WiFi เดียวกับ PC"
+            )
+        self._render_step()
+
+    # ── step 2: handoff to Patch wizard ──────────────────────
+
+    def _render_step_2(self) -> None:
+        wrap = _card(self.body)
+        wrap.grid(row=0, column=0, padx=40, pady=30, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        _h2(wrap, "ขั้น 3: ไปต่อที่ Patch TikTok").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(20, 4)
+        )
+        _muted(
+            wrap,
+            "พร้อมแล้ว — กด 'ไป Patch' เพื่อเข้าหน้า Patch + ตั้งชื่อ",
+        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        info = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
+        info.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+        ctk.CTkLabel(
+            info,
+            text=f"ADB id ที่จะใช้: {self._connected_serial}",
+            text_color=THEME.fg_primary,
+            font=ctk.CTkFont(size=13, family="Menlo"),
+        ).pack(padx=14, pady=14, anchor="w")
+
+        ctk.CTkLabel(
+            wrap,
+            text=(
+                "💡 หลังจากนี้ขั้นตอน Patch + ตั้งชื่อจะเหมือน Mode A "
+                "ทุกอย่าง — ระบบจะใช้ adb id ด้านบนแทน USB"
+            ),
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11, slant="italic"),
+            justify="left", anchor="w", wraplength=600,
+        ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 16))
+
+    def _handoff(self) -> None:
+        if not self._connected_serial:
+            messagebox.showerror(
+                "ยังไม่ได้เชื่อมต่อ",
+                "กลับไปขั้น 2 และกด Connect ก่อน",
+            )
+            return
+        self.app.show_page(
+            WizardPage,
+            pre_paired_serial=self._connected_serial,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
 #  WizardPage  — guided "add a new phone" flow
 # ──────────────────────────────────────────────────────────────────
 
@@ -3585,11 +4614,26 @@ class WizardPage(ctk.CTkFrame):
 
     STEPS = ("USB Debugging", "เสียบ USB", "Patch TikTok", "ตั้งชื่อเล่น")
 
-    def __init__(self, app) -> None:
+    def __init__(
+        self,
+        app,
+        pre_paired_serial: str | None = None,
+    ) -> None:
+        """Construct the USB+Patch wizard.
+
+        ``pre_paired_serial`` — v1.8.0 Mode C entry point. When the
+        Wireless-ADB wizard finishes pairing+connecting a phone over
+        WiFi (Android 11+ Wireless Debugging), it hands the resulting
+        ``IP:port`` adb-id to this wizard so the customer doesn't
+        re-walk the "เสียบ USB" step. Skipping straight to the Patch
+        screen (step 2) when it's set.
+        """
         super().__init__(app, fg_color=THEME.bg_main)
         self.app = app
-        self._step = 0
-        self._candidate_serial: str | None = None
+        # Mode C handoff: jump straight to the Patch step if we
+        # already have a working adb id.
+        self._step = 2 if pre_paired_serial else 0
+        self._candidate_serial: str | None = pre_paired_serial
         self._patched_ok = False
         # Stamped the first time step 1 (the "wait for USB device"
         # screen) renders. Used by the Windows driver-help nudge:
@@ -3758,76 +4802,53 @@ class WizardPage(ctk.CTkFrame):
             "'อนุญาตการแก้ไขข้อบกพร่อง USB จากคอมพิวเตอร์เครื่องนี้'",
         ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 20))
 
-        # Live device list — pick the first online USB device that's
-        # not already in the customer's library. Critically, we skip:
+        # Live device list — bucket every visible row by ADB state so
+        # we can show a *specific* status to the customer instead of
+        # a generic "🔄 รอเครื่อง…". v1.8.0 fix for the persistent
+        # "เสียบสาย กด Allow แล้วระบบไม่เชื่อมโทรศัพท์" complaint:
+        # 90 % of those reports turned out to be a phone stuck in
+        # ``unauthorized`` because either (a) the bundled adb's RSA
+        # fingerprint differs from what the phone has in its
+        # "Always allow" cache (needs daemon restart) or (b) the
+        # customer hasn't actually tapped Allow yet (no popup
+        # because USB mode = "Charge only" on HyperOS). Knowing
+        # which bucket the device is in lets the wizard surface
+        # the right next-action.
         #
-        # * WiFi rows (``IP:port``) that map back onto a known
-        #   canonical serial — those are already set up and would
-        #   confuse the user if the wizard claimed to have "found a
-        #   new device". The whole point of "+ เพิ่มเครื่อง" is to
-        #   onboard a *fresh* phone over USB.
-        # * WiFi rows for unknown phones — we never auto-add over
-        #   WiFi (no trust, no transport for `adb tcpip`).
-        # * USB rows whose serial is already in the library.
+        # We skip:
+        # * WiFi rows that map back onto a known canonical serial —
+        #   those are already set up.
+        # * WiFi rows for unknown phones — never auto-onboard
+        #   over WiFi (the phone has to come in over USB so the
+        #   subsequent ``adb tcpip`` step has a transport to talk to).
+        # * USB rows whose serial is already patched (the dashboard
+        #   handles re-patch separately).
         from .. import wifi_adb
 
-        # An entry is "fully onboarded" once it's been patched. The
-        # device poller auto-creates a barebones entry for every
-        # USB device it sees so the dashboard sidebar shows it right
-        # away — that helper shouldn't make the wizard think the
-        # device is "already in the library".
         patched_serials = {
             e.serial for e in self.app.devices_lib.list() if e.is_patched()
         }
-        candidates = []
+        online_candidates: list = []
+        unauthorized_devs: list = []
+        offline_devs: list = []
         for d in self.app.live_devices:
-            if not d.online:
-                continue
             if wifi_adb.is_wifi_id(d.serial):
-                # WiFi-only — never a wizard candidate. The phone
-                # has to come in over USB so we can run `adb tcpip`
-                # on it.
                 continue
-            if d.serial in patched_serials:
-                # Already onboarded; the dashboard handles re-patch.
-                continue
-            candidates.append(d)
+            if d.online:
+                if d.serial in patched_serials:
+                    continue
+                online_candidates.append(d)
+            elif (d.state or "").lower() == "unauthorized":
+                unauthorized_devs.append(d)
+            elif (d.state or "").lower() in ("offline", "bootloader", "recovery"):
+                offline_devs.append(d)
 
         status_box = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
-        status_box.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 24))
+        status_box.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
 
-        if not candidates:
-            self._candidate_serial = None
-            ctk.CTkLabel(
-                status_box,
-                text="🔄  รอเครื่องเชื่อมต่อ…",
-                text_color=THEME.warning,
-                font=ctk.CTkFont(size=14, weight="bold"),
-            ).pack(padx=20, pady=14, anchor="w")
-            _muted(
-                status_box,
-                "ระบบจะตรวจจับเครื่องอัตโนมัติเมื่อเสียบ USB",
-            ).pack(padx=20, pady=(0, 14), anchor="w")
-
-            # Windows-only driver-help nudge. Pop the helper button
-            # ~15 s into the wait so we don't startle customers who
-            # are still finding their USB cable, but we don't leave
-            # the genuinely-stuck-on-driver case to figure it out
-            # alone. Mac users never see this — Apple ships ADB
-            # support in the kernel.
-            import sys as _sys
-            import time as _time
-            if self._step1_first_shown_at is None:
-                self._step1_first_shown_at = _time.monotonic()
-            elapsed = _time.monotonic() - self._step1_first_shown_at
-            if _sys.platform == "win32" and elapsed > 15.0:
-                _ghost_button(
-                    wrap,
-                    "❓  ไม่เจอเครื่อง? — ลง driver Windows",
-                    command=self._show_driver_help,
-                ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 16))
-        else:
-            d = candidates[0]
+        # ── 1. ONLINE & READY ──────────────────────────────────
+        if online_candidates:
+            d = online_candidates[0]
             self._candidate_serial = d.serial
             ctk.CTkLabel(
                 status_box,
@@ -3839,6 +4860,199 @@ class WizardPage(ctk.CTkFrame):
                 status_box,
                 f"serial: {d.serial}  ·  product: {d.product or '-'}",
             ).pack(padx=20, pady=(0, 14), anchor="w")
+            return
+
+        self._candidate_serial = None
+
+        # ── 2. UNAUTHORIZED — phone visible, Allow not yet tapped
+        #      (or tapped but adb daemon hasn't refreshed yet). ───
+        if unauthorized_devs:
+            d = unauthorized_devs[0]
+            ctk.CTkLabel(
+                status_box,
+                text="📱  เห็นเครื่องแล้ว — กรุณากด 'Allow' บนหน้าจอมือถือ",
+                text_color=THEME.warning,
+                font=ctk.CTkFont(size=14, weight="bold"),
+            ).pack(padx=20, pady=14, anchor="w")
+            _muted(
+                status_box,
+                f"serial: {d.serial}  ·  state: unauthorized\n"
+                "ถ้ามี popup 'อนุญาตการแก้ไขข้อบกพร่อง USB?' → กด 'อนุญาต' (ติ๊ก 'จดจำเสมอ' ด้วย)\n"
+                "ถ้าไม่เห็น popup → ลองสายใหม่ / เปลี่ยนพอร์ต USB / กดปุ่มด้านล่าง",
+            ).pack(padx=20, pady=(0, 14), anchor="w")
+
+            # Action row: restart adb daemon (fixes the "Allow
+            # tapped but state stuck" case where the bundled adb
+            # has a different RSA key than the phone's "Always
+            # allow" cache expects).
+            actions = ctk.CTkFrame(wrap, fg_color="transparent")
+            actions.grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+            _ghost_button(
+                actions,
+                "🔄  รีสตาร์ท ADB",
+                command=self._restart_adb,
+            ).pack(side="left", padx=(0, 8))
+            self._render_hyperos_hint(wrap, row=4)
+            return
+
+        # ── 3. OFFLINE — phone visible but transport dead. ──────
+        if offline_devs:
+            d = offline_devs[0]
+            ctk.CTkLabel(
+                status_box,
+                text=f"🔌  เครื่อง offline (state: {d.state})",
+                text_color=THEME.warning,
+                font=ctk.CTkFont(size=14, weight="bold"),
+            ).pack(padx=20, pady=14, anchor="w")
+            _muted(
+                status_box,
+                f"serial: {d.serial}\n"
+                "ลองถอดสายแล้วเสียบใหม่ — ถ้ายังไม่ได้กดปุ่ม 'รีสตาร์ท ADB'",
+            ).pack(padx=20, pady=(0, 14), anchor="w")
+            _ghost_button(
+                wrap,
+                "🔄  รีสตาร์ท ADB",
+                command=self._restart_adb,
+            ).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+            return
+
+        # ── 4. NO DEVICE AT ALL ─────────────────────────────────
+        ctk.CTkLabel(
+            status_box,
+            text="🔄  รอเครื่องเชื่อมต่อ…",
+            text_color=THEME.warning,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(padx=20, pady=14, anchor="w")
+        _muted(
+            status_box,
+            "ระบบจะตรวจจับเครื่องอัตโนมัติเมื่อเสียบ USB",
+        ).pack(padx=20, pady=(0, 14), anchor="w")
+
+        # Action row stacked under the status: restart-adb is
+        # cheap and helps customers whose adb daemon predates the
+        # phone plug-in (common when scrcpy left a stale v40
+        # daemon on port 5037 before NP Create launched).
+        actions = ctk.CTkFrame(wrap, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+        _ghost_button(
+            actions,
+            "🔄  รีสตาร์ท ADB",
+            command=self._restart_adb,
+        ).pack(side="left", padx=(0, 8))
+
+        # Windows-only driver-help nudge. Pop the helper button
+        # ~15 s into the wait so we don't startle customers who
+        # are still finding their USB cable, but we don't leave
+        # the genuinely-stuck-on-driver case to figure it out
+        # alone. Mac users never see this — Apple ships ADB
+        # support in the kernel.
+        import sys as _sys
+        import time as _time
+        if self._step1_first_shown_at is None:
+            self._step1_first_shown_at = _time.monotonic()
+        elapsed = _time.monotonic() - self._step1_first_shown_at
+        if _sys.platform == "win32" and elapsed > 15.0:
+            _ghost_button(
+                actions,
+                "❓  ไม่เจอเครื่อง? — ลง driver Windows",
+                command=self._show_driver_help,
+            ).pack(side="left")
+
+    # ── ADB daemon restart ───────────────────────────────────────
+
+    def _restart_adb(self) -> None:
+        """Run ``adb kill-server`` + ``adb start-server`` on a worker
+        thread so the UI doesn't freeze, then re-render the wizard
+        after a short delay so the next ``adb devices`` poll has time
+        to populate.
+
+        Why this is wired to a button (v1.8.0): the most-common
+        Windows complaint isn't "no driver" — it's "Allow tapped but
+        the wizard still says 'รอเครื่อง'". That symptom is almost
+        always a stale adb daemon whose RSA key disagrees with what
+        the phone has cached under "Always allow from this computer".
+        Restarting the daemon under our bundled adb's identity fixes
+        it 95 % of the time without making the customer touch
+        Settings / Developer Options.
+        """
+
+        def _worker() -> None:
+            ok = False
+            try:
+                ok = self.app.adb.restart_server()
+            except Exception:
+                # Never let a daemon-restart hiccup crash the wizard;
+                # the customer can always retry.
+                pass
+
+            def _show_result() -> None:
+                if ok:
+                    messagebox.showinfo(
+                        "รีสตาร์ท ADB สำเร็จ",
+                        "ลอง:\n"
+                        "  1. ถอดสาย USB\n"
+                        "  2. เสียบใหม่\n"
+                        "  3. รอ 2-3 วินาที\n"
+                        "ถ้ามี popup 'อนุญาต' บนมือถือ ให้กด อนุญาต และติ๊ก 'จดจำเสมอ'",
+                    )
+                else:
+                    messagebox.showerror(
+                        "รีสตาร์ท ADB ไม่สำเร็จ",
+                        "ลองปิดเปิดโปรแกรมใหม่ — ถ้ายังไม่ได้แจ้ง support",
+                    )
+                # Reset the 15-s timer for the driver-help nudge so
+                # the customer can decide if they need to escalate.
+                self._step1_first_shown_at = None
+                try:
+                    self._render_step()
+                except Exception:
+                    pass
+
+            try:
+                self.after(100, _show_result)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="wizard-adb-restart").start()
+
+    # ── HyperOS / Xiaomi hint ────────────────────────────────────
+
+    def _render_hyperos_hint(self, parent, *, row: int) -> None:
+        """Inline reminder for Xiaomi/Redmi/POCO customers who tap
+        Allow but never advance.
+
+        On HyperOS / MIUI, the ``Allow USB Debugging`` toggle is
+        guarded by *two* additional Developer Options the customer
+        usually doesn't know to flip:
+
+        * **Install via USB** — without this, ``adb install`` returns
+          ``INSTALL_FAILED_USER_RESTRICTED`` and (more annoyingly for
+          this wizard) the device often stays in ``unauthorized``
+          state right after Allow because adbd validates installs
+          before authorising the host.
+        * **USB debugging (Security settings)** — separate toggle
+          (often greyed out unless the customer has signed in to a
+          Mi account on the device). Without it, ``adb shell input``
+          / ``adb shell am`` are silently no-ops, which the patch
+          step then trips on far down the pipeline.
+
+        We keep this hint inline (not a modal) because customers who
+        need it have already seen the wizard pause for several
+        seconds — a popup at that point feels accusatory.
+        """
+        ctk.CTkLabel(
+            parent,
+            text=(
+                "💡 ถ้าเป็น Xiaomi / Redmi / POCO (MIUI / HyperOS):\n"
+                "    • Settings → Developer options → เปิด 'Install via USB'\n"
+                "    • Settings → Developer options → เปิด 'USB debugging (Security settings)'\n"
+                "    • ดึง notification shade ลง → กดไอคอน USB → เลือก 'File transfer (MTP)'"
+            ),
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+            justify="left", anchor="w", wraplength=620,
+        ).grid(row=row, column=0, sticky="w", padx=24, pady=(0, 16))
 
     # ── Windows driver help ──────────────────────────────────────
 

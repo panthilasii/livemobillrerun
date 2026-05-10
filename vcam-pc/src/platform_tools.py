@@ -299,6 +299,24 @@ def find_lspatch_jar() -> Path | None:
     return _first_existing(["lspatch/lspatch.jar"])
 
 
+def find_mediamtx() -> Path | None:
+    """Return the bundled MediaMTX binary, or None.
+
+    v1.8.0's "Mode B" (RTMP path — no USB / no ADB) needs an
+    on-PC RTMP server so the customer's phone (running CameraFi
+    / Larix / DU Recorder from the Play Store) can pull the
+    looped video over WiFi. We ship the upstream single-binary
+    build at ``.tools/<os>/mediamtx/mediamtx[.exe]`` via
+    ``tools/setup_ci_tools.install_mediamtx``.
+
+    Returns None on Linux dev machines (we don't bundle a
+    linux mediamtx; ``rtmp_server.start()`` surfaces a clear
+    "install MediaMTX or use Mode A" message in that case).
+    """
+    sfx = ".exe" if is_windows() else ""
+    return _first_existing([f"mediamtx/mediamtx{sfx}"])
+
+
 def find_adb_driver_dir() -> Path | None:
     """Return the directory containing Google's USB driver INF file
     (Windows-only). macOS / Linux callers always get None — Apple

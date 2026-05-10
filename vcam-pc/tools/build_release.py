@@ -183,6 +183,17 @@ SHIP_TOOLS_PATTERNS = (
                                         # without an internet round-
                                         # trip. v1.7.11 fix for
                                         # "Mac เทสได้แต่ Windows ไม่ได้"
+    "mediamtx/",                        # MediaMTX RTMP server (~26 MB)
+                                        # — powers v1.8.0's "Mode B"
+                                        # no-USB live path (PC →
+                                        # MediaMTX ← phone's
+                                        # CameraFi/Larix/DU Recorder
+                                        # over WiFi; TikTok sees the
+                                        # virtual camera). Ships on
+                                        # both Windows and macOS so
+                                        # customers who can't get
+                                        # ADB drivers working still
+                                        # have a path to live.
                                         # — Apple ships ADB-over-USB
                                         # support in the kernel,
                                         # Windows requires per-OEM
@@ -695,10 +706,23 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                     rel = rel[len("android-sdk/"):]
                 zf.write(f, f"{prefix}/.tools/{os_name}/{rel}")
                 n_t += 1
-            extras = "adb + JDK + lspatch + ffmpeg + scrcpy"
+            extras = "adb + JDK + lspatch + ffmpeg + scrcpy + mediamtx"
             if os_name == "windows":
                 extras += " + adb-driver"
             print(f"   .tools/ : {n_t} files ({extras})")
+            mtx_bin = tools_dir / "mediamtx" / (
+                "mediamtx.exe" if os_name == "windows" else "mediamtx"
+            )
+            if not mtx_bin.is_file():
+                print(
+                    "   [!] .tools/{}/mediamtx/ missing — Mode B (RTMP)\n"
+                    "       wizard will surface 'mediamtx not found' to\n"
+                    "       customers and they won't be able to use the\n"
+                    "       no-USB live path. To bundle, run:\n"
+                    "          python tools/setup_ci_tools.py --os {} --skip platform-tools --skip jdk --skip lspatch --skip ffmpeg --skip adb-driver"
+                    .format(os_name, os_name),
+                    file=sys.stderr,
+                )
             scrcpy_dir = tools_dir / "scrcpy"
             if not scrcpy_dir.is_dir():
                 print(

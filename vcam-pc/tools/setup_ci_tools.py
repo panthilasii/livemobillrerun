@@ -170,6 +170,30 @@ GOOGLE_USB_DRIVER_URL = (
     "https://dl.google.com/android/repository/usb_driver_r13-windows.zip"
 )
 
+# MediaMTX — single-binary RTMP/RTSP/HLS server (Go). Powers
+# v1.8.0's "Mode B" no-USB live path: the customer installs a
+# Play-Store virtual-cam app (CameraFi/Larix/DU Recorder) on
+# the phone, sets its RTMP input to ``rtmp://<PC-IP>:1935/live``
+# and picks it as the camera in TikTok. PC pushes the looped
+# video file via FFmpeg → MediaMTX → phone over WiFi. No ADB,
+# no USB cable, no Windows OEM driver.
+#
+# Pinned at v1.18.1 (April 2026). MediaMTX maintains backwards-
+# compat for the RTMP listener config, but the exec layout and
+# CLI args have moved across major versions, so we lock the
+# build we tested against.
+MEDIAMTX_VERSION = "v1.18.1"
+MEDIAMTX_URLS = {
+    "windows": (
+        "https://github.com/bluenviron/mediamtx/releases/download/"
+        f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_windows_amd64.zip"
+    ),
+    "macos": (
+        "https://github.com/bluenviron/mediamtx/releases/download/"
+        f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_darwin_arm64.tar.gz"
+    ),
+}
+
 
 # ── helpers ────────────────────────────────────────────────────────
 
@@ -481,6 +505,63 @@ def install_adb_driver(os_name: str, force: bool) -> None:
           f"({size_mb:,.1f} MB)")
 
 
+def install_mediamtx(os_name: str, force: bool) -> None:
+    """Drop the MediaMTX binary + a stub config under
+    ``.tools/<os>/mediamtx/`` for v1.8.0's RTMP-based live path.
+
+    Layout produced::
+
+        .tools/<os>/mediamtx/
+            mediamtx[.exe]      <- the single-binary RTMP server
+            mediamtx.yml        <- generated at runtime by
+                                   src/rtmp_server.py (bind addr,
+                                   port, paths). The upstream zip
+                                   ships its own example yml here
+                                   too; we keep it for diff'ing.
+
+    The Windows archive is a flat zip with three files at the
+    root (mediamtx.exe, mediamtx.yml, LICENSE). The macOS
+    tarball has the same structure but is gzipped.
+    """
+    print()
+    print("[mediamtx]")
+    dest_dir = WORKSPACE / ".tools" / os_name / "mediamtx"
+    bin_name = "mediamtx.exe" if os_name == "windows" else "mediamtx"
+    dest_bin = dest_dir / bin_name
+    if dest_bin.is_file() and not force:
+        size_mb = dest_bin.stat().st_size / 1024 / 1024
+        print(f"  [OK] already at {dest_bin.relative_to(WORKSPACE)} "
+              f"({size_mb:,.1f} MB)")
+        return
+    url = MEDIAMTX_URLS[os_name]
+    if os_name == "windows":
+        cache_path = CACHE / f"mediamtx-{MEDIAMTX_VERSION}-windows.zip"
+        _download(url, cache_path, force)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  -> extracting to {dest_dir.relative_to(WORKSPACE)}")
+        _extract_zip(cache_path, dest_dir, strip_first=False)
+    else:
+        cache_path = CACHE / f"mediamtx-{MEDIAMTX_VERSION}-macos.tar.gz"
+        _download(url, cache_path, force)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  -> extracting to {dest_dir.relative_to(WORKSPACE)}")
+        # macOS tarball is flat — use strip_first=False.
+        _extract_tar(cache_path, dest_dir, strip_first=False)
+        # Mark the binary executable; tarballs preserve the bit
+        # but defensive chmod doesn't hurt.
+        if dest_bin.is_file():
+            dest_bin.chmod(dest_bin.stat().st_mode | 0o755)
+    if not dest_bin.is_file():
+        raise SystemExit(
+            f"mediamtx extraction completed but {dest_bin} is "
+            f"missing — archive layout may have changed; inspect "
+            f"{cache_path}."
+        )
+    size_mb = dest_bin.stat().st_size / 1024 / 1024
+    print(f"  [OK] installed {dest_bin.relative_to(WORKSPACE)} "
+          f"({size_mb:,.1f} MB)")
+
+
 def install_lspatch(os_name: str, force: bool) -> None:
     print()
     print("[lspatch]")
@@ -515,6 +596,7 @@ def _verify(os_name: str) -> int:
         ("platform-tools/adb", base / "platform-tools" / f"adb{sfx}"),
         ("lspatch.jar       ", base / "lspatch" / "lspatch.jar"),
         ("ffmpeg            ", base / f"ffmpeg{sfx}"),
+        ("mediamtx          ", base / "mediamtx" / f"mediamtx{sfx}"),
     ]
     if os_name == "windows":
         checks.append(("jdk-21/bin/java   ", base / "jdk-21" / "bin" / "java.exe"))
@@ -552,7 +634,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--skip", action="append", default=[],
-        choices=("platform-tools", "jdk", "lspatch", "ffmpeg", "adb-driver"),
+        choices=("platform-tools", "jdk", "lspatch", "ffmpeg",
+                 "adb-driver", "mediamtx"),
         help="skip a specific tool (repeatable)",
     )
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
@@ -586,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
         install_ffmpeg(os_name, args.force)
     if "adb-driver" not in args.skip:
         install_adb_driver(os_name, args.force)
+    if "mediamtx" not in args.skip:
+        install_mediamtx(os_name, args.force)
 
     rc = _verify(os_name)
     if rc == 0:

@@ -558,9 +558,37 @@ class StudioApp(ctk.CTk):
         self.show_page(SettingsPage)
 
     def go_wizard(self) -> None:
+        """Entry point for "+ เพิ่มเครื่อง" — v1.8.0 routes
+        through the mode picker so the customer can opt out of
+        USB/ADB entirely. Old code paths that called
+        ``go_wizard()`` keep working: the picker just becomes
+        an extra screen in front of the existing wizard.
+        """
+        from .studio_pages import ModePickerPage
+
+        self.show_page(ModePickerPage)
+
+    def go_usb_wizard(self) -> None:
+        """Direct entry to the classic USB+LSPatch flow (Mode A).
+        Picker calls this when the customer chooses
+        "ใช้ USB + Patch (คุณภาพสูงสุด)"."""
         from .studio_pages import WizardPage
 
         self.show_page(WizardPage)
+
+    def go_rtmp_wizard(self) -> None:
+        """Mode B — RTMP + virtual-cam app on the phone.
+        No USB, no driver, no patch. Set up over WiFi only."""
+        from .studio_pages import RTMPWizardPage
+
+        self.show_page(RTMPWizardPage)
+
+    def go_wireless_wizard(self) -> None:
+        """Mode C — Android 11+ Wireless Debugging pair → connect.
+        Same Patch flow as Mode A but no Windows driver needed."""
+        from .studio_pages import WirelessADBWizardPage
+
+        self.show_page(WirelessADBWizardPage)
 
     def go_activation(self, error: str | None = None) -> None:
         from .studio_pages import ActivationPage

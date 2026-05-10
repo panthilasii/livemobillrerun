@@ -118,6 +118,29 @@ class DeviceEntry:
     # customer compare phones without a separate analytics DB.
     # Updated at stop_live() time.
     total_live_seconds: int = 0
+    # ── Transport (v1.8.0) ──────────────────────────────────────
+    # How NP Create talks to this phone. "usb" = the classic Mode A
+    # ADB+LSPatched-TikTok flow (default for legacy entries that
+    # pre-date this field). "rtmp" = Mode B; the phone runs a
+    # virtual-cam app (see vcam_app_key) and pulls our PC's RTMP
+    # stream over WiFi — no ADB at all.
+    #
+    # Code that branches on transport should default to "usb" for
+    # the empty string so old config files keep working without a
+    # migration step.
+    transport: str = "usb"
+    # When transport == "rtmp" — which Play Store app the customer
+    # picked in the v1.8.0 RTMP wizard ("camerafi" / "larix" /
+    # "du_recorder"). Empty for "usb" entries. The dashboard reads
+    # this so the per-device card can show app-specific
+    # troubleshooting tips ("กด Start Virtual Camera ใน CameraFi
+    # ก่อนเปิด TikTok") instead of generic ADB advice.
+    vcam_app_key: str = ""
+    # ISO timestamp the customer first added this entry. Distinct
+    # from ``added_at`` only when migrating very old configs that
+    # only had ``patched_at`` filled — kept here so dashboards
+    # that sort by "newest" don't get confused by NULL values.
+    created_at: str = ""
 
     def display_name(self) -> str:
         return self.label or self.model or self.serial
@@ -214,6 +237,9 @@ class DeviceLibrary:
                     ),
                     live_started_at=str(raw.get("live_started_at", "")),
                     total_live_seconds=int(raw.get("total_live_seconds", 0) or 0),
+                    transport=str(raw.get("transport", "usb") or "usb"),
+                    vcam_app_key=str(raw.get("vcam_app_key", "")),
+                    created_at=str(raw.get("created_at", "")),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)

@@ -114,6 +114,60 @@ class AdbController:
             return False
         return r.returncode == 0
 
+    def restart_server(self) -> bool:
+        """``adb kill-server`` then ``adb start-server``.
+
+        Why we need this
+        ----------------
+        On Windows the most common ADB sticking-point isn't a missing
+        driver — it's a stale daemon. Customers who:
+
+        * Used scrcpy, Vysor, or Android Studio earlier — those ship
+          their own adb (often a different version), and whichever
+          one wins the port-5037 race is what subsequent ``adb
+          devices`` calls talk to. If the surviving daemon is from
+          v40+ but our bundled adb is v34, you can get silent
+          protocol mismatches where the device list never refreshes
+          even after the customer taps "Allow USB Debugging".
+        * Have rebooted Windows mid-session — adb's USB descriptors
+          go stale and the customer ends up with a permanently
+          ``unauthorized`` row that won't transition to ``device``
+          no matter how many times they tap Allow.
+
+        ``adb kill-server`` tears down whatever's running on 5037,
+        ``adb start-server`` spawns a fresh daemon under our bundled
+        adb's identity (so the RSA key matches what's saved on the
+        phone too). The combination clears 95 % of "ADB sees my
+        phone but it's stuck on Allow / unauthorized" reports.
+
+        Returns ``True`` if both commands completed without an error
+        return code; ``False`` (and logs the stderr) otherwise. The
+        caller is expected to re-poll ``adb devices`` ~1 s after a
+        successful restart so the UI updates with fresh state.
+        """
+        try:
+            kr = self._run("kill-server", timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("adb kill-server timed out")
+            return False
+        # kill-server exits non-zero ("error: cannot connect to
+        # daemon") if the daemon was already dead — that's fine,
+        # the goal is "no daemon running" and we got there.
+        if kr.returncode != 0:
+            log.debug("adb kill-server rc=%s err=%r",
+                      kr.returncode, (kr.stderr or "").strip())
+        try:
+            sr = self._run("start-server", timeout=10)
+        except subprocess.TimeoutExpired:
+            log.warning("adb start-server timed out")
+            return False
+        if sr.returncode != 0:
+            log.error("adb start-server failed: rc=%s err=%r",
+                      sr.returncode, (sr.stderr or "").strip())
+            return False
+        log.info("adb daemon restarted")
+        return True
+
     # ── device enumeration ─────────────────────────────────────
 
     def devices(self) -> list[AdbDevice]:

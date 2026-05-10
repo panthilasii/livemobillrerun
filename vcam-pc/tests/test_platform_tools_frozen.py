@@ -261,6 +261,55 @@ class TestFindAdbDriverDir:
             assert pt.find_adb_driver_dir() is None
 
 
+# ── find_mediamtx (v1.8.0) ────────────────────────────────────────
+
+
+class TestFindMediaMTX:
+    """The Mode B RTMP path needs the bundled MediaMTX binary.
+    Resolver returns the platform-appropriate filename
+    (``mediamtx.exe`` on Windows, ``mediamtx`` on macOS) under
+    ``.tools/<os>/mediamtx/``."""
+
+    def _bundle(self, root: Path, os_name: str) -> Path:
+        suffix = ".exe" if os_name == "windows" else ""
+        bin_path = (
+            root
+            / ".tools"
+            / os_name
+            / "mediamtx"
+            / f"mediamtx{suffix}"
+        )
+        bin_path.parent.mkdir(parents=True, exist_ok=True)
+        bin_path.write_bytes(b"\x7fELF" if os_name != "windows" else b"MZ\x90")
+        return bin_path
+
+    def test_resolves_on_windows(self, tmp_path):
+        install = tmp_path / "install"
+        install.mkdir()
+        bin_path = self._bundle(install, "windows")
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Windows"):
+            pt = _reload_platform_tools(install)
+            assert pt.find_mediamtx() == bin_path.resolve()
+
+    def test_resolves_on_macos(self, tmp_path):
+        install = tmp_path / "install"
+        install.mkdir()
+        bin_path = self._bundle(install, "macos")
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Darwin"):
+            pt = _reload_platform_tools(install)
+            assert pt.find_mediamtx() == bin_path.resolve()
+
+    def test_returns_none_when_not_bundled(self, tmp_path):
+        install = tmp_path / "install"
+        install.mkdir()
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Windows"):
+            pt = _reload_platform_tools(install)
+            assert pt.find_mediamtx() is None
+
+
 # ── env override ───────────────────────────────────────────────────
 
 

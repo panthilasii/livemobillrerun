@@ -177,6 +177,79 @@ def adb_connect(
     return False
 
 
+def adb_pair(
+    adb_path: str,
+    ip: str,
+    port: int,
+    pairing_code: str,
+    timeout: float = 30.0,
+) -> tuple[bool, str]:
+    """Pair an Android 11+ device using its Wireless Debugging
+    "Pair device with pairing code" screen.
+
+    The customer follows this sequence on the phone:
+
+      Settings → Developer Options → Wireless Debugging
+        → Pair device with pairing code
+
+    The phone displays a one-shot ``IP : <pair-port>`` pair plus
+    a 6-digit code. They feed both into the wizard, and we run::
+
+        adb pair <ip>:<pair-port>
+        <pair-port-prompts-for-the-code-on-stdin>
+
+    On success, the phone's wireless-debugging UI flips to
+    "Paired devices: 1" and we can immediately ``adb connect``
+    against ``<ip>:<wireless-debugging-port>`` (which is a
+    *different* port — Android assigns one port for pairing
+    and another for the live ADB transport, both shown on
+    the same screen).
+
+    The pair-port lives only as long as the customer leaves
+    that pairing screen open; after that it's gone forever.
+    The connect-port survives until the phone reboots.
+
+    Returns
+    -------
+    (success, message) — ``message`` is the lowercase tail of
+    adb's stdout on success or the stderr/stdout tail on
+    failure, both for surfacing to the wizard's UI.
+    """
+    if shutil.which(adb_path) is None:
+        return False, f"ไม่พบ adb: {adb_path}"
+    target = f"{ip}:{port}"
+    code = (pairing_code or "").strip()
+    if not code:
+        return False, "ไม่ได้ใส่ pairing code"
+    try:
+        # ``adb pair`` reads the code from stdin when
+        # invoked with just the target. We send the code
+        # plus a newline so adb's prompt completes.
+        r = subprocess.run(
+            [adb_path, "pair", target],
+            input=code + "\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("adb pair %s timed out", target)
+        return False, "หมดเวลา — phone อาจไม่อยู่บน LAN เดียวกัน"
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    out_lower = out.lower()
+    # adb's success message: "Successfully paired to <ip>:<port>
+    # [guid=adb-...]". On bad code: "Failed: Wrong pairing code".
+    # On bad target: "Failed: Pairing connection refused" /
+    # "Failed: Aborting pairing because timer expired".
+    if "successfully paired" in out_lower:
+        log.info("adb pair %s ok", target)
+        return True, out
+    log.warning("adb pair %s failed: %r", target, out)
+    # Surface a short, friendly tail; full output is in the log.
+    return False, out[-300:] if out else "adb pair ไม่สำเร็จ"
+
+
 def adb_disconnect(
     adb_path: str,
     ip: str | None = None,

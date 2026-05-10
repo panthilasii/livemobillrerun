@@ -140,6 +140,18 @@ def _hidden_imports() -> list[str]:
         "--hidden-import", "PIL._tkinter_finder",
         "--hidden-import", "src._ed25519",
         "--hidden-import", "src._pubkey",
+        # v1.8.0: Mode B's RTMP wizard renders QR codes via the
+        # qrcode package's PIL backend. PyInstaller usually auto-
+        # picks this up, but the import is wrapped in a try/except
+        # in studio_pages.py (so the wizard degrades gracefully on
+        # an older portable build), and that try/except hides the
+        # import from PyInstaller's static dependency walker. We
+        # have to name it explicitly or the bundled exe will fall
+        # through to the "QR not available, here's the URL as
+        # text" branch even though qrcode is in the venv.
+        "--hidden-import", "qrcode",
+        "--hidden-import", "qrcode.image.pil",
+        "--hidden-import", "PIL.ImageTk",
         "--collect-data", "customtkinter",
     ]
 
