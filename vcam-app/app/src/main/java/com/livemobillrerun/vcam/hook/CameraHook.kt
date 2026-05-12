@@ -1,13 +1,18 @@
 package com.livemobillrerun.vcam.hook
 
 import android.app.Application
+import android.content.Context
 import android.graphics.SurfaceTexture
 import android.hardware.Camera
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCrypto
 import android.media.MediaFormat
+import android.os.Handler
 import android.view.Surface
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -17,6 +22,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 
 /**
  * Xposed entry point for the vcam camera-replacement module.
@@ -84,6 +90,103 @@ class CameraHook : IXposedHookLoadPackage {
          */
         @JvmField var activeVideoPath: String? = null
 
+        // ────────────────────────────────────────────────────────
+        //  Camera-facing tracking (v1.8.8 — back-only bypass)
+        // ────────────────────────────────────────────────────────
+        //
+        // Pre-v1.8.8 the hook injected the MP4 onto *every* camera
+        // session. That tripped TikTok Live's pre-broadcast face /
+        // liveness probe — the probe runs against the front-camera
+        // preview (default) and the looped MP4 is too "perfect" to
+        // pass. Customers had to physically uninstall the patch to
+        // get past the gate.
+        //
+        // The fix: track which camera (front vs back) TikTok last
+        // asked the framework to open, and bypass *only when the
+        // back camera is active*. The front camera always shows
+        // the real lens — that's what TikTok's detector sees, so
+        // the broadcast gate opens. The customer then flips to
+        // back-cam inside the live UI, which is when our injection
+        // kicks in.
+        //
+        // Facing values follow the **Camera2** convention because
+        // that's what TikTok uses on every API 33+ device we ship
+        // to. Camera1 uses the inverted convention (0=BACK there)
+        // so we normalise via [normaliseCamera1Facing].
+        //
+        //   FACING_FRONT   = 0   (CameraCharacteristics.LENS_FACING_FRONT)
+        //   FACING_BACK    = 1   (CameraCharacteristics.LENS_FACING_BACK)
+        //   FACING_EXTERNAL= 2   (USB / OTG camera — treated like back)
+        //   FACING_UNKNOWN =-1   (no openCamera fired yet → safe = don't bypass)
+        // ``val`` not ``const val`` — Kotlin only inlines Java
+        // ``public static final`` constants from the SDK in some
+        // build configurations, and the slight performance gain
+        // from inlining vs. a static field load is negligible
+        // against everything else this hook does per camera open.
+        @JvmField val FACING_FRONT: Int = CameraCharacteristics.LENS_FACING_FRONT
+        @JvmField val FACING_BACK: Int = CameraCharacteristics.LENS_FACING_BACK
+        @JvmField val FACING_EXTERNAL: Int = CameraCharacteristics.LENS_FACING_EXTERNAL
+        const val FACING_UNKNOWN = -1
+
+        /**
+         * Rear-lens upright correction is applied in **texture space**
+         * ([FlipRenderer.rearLensCorrectTex180]) — not via stacking degrees
+         * on [rotationDegrees], because MVP rotation alone failed to counter
+         * [SurfaceTexture.getTransformMatrix] on some TikTok pipelines.
+         */
+        const val REAR_CAMERA_EXTRA_ROTATION_DEGREES: Int = 0
+
+        /** Last camera TikTok asked to open. TikTok keeps one
+         *  camera session at a time so a single global suffices
+         *  for v1; multi-physical-camera devices (Pixel logical
+         *  groups, S2x dual-cam Live) would benefit from a per-
+         *  CameraDevice map but the v1 single-int approach already
+         *  covers the customer's primary phones (Redmi Note 13,
+         *  POCO X5, MediaTek Helio G81/G85). */
+        @JvmField @Volatile var lastOpenedFacing: Int = FACING_UNKNOWN
+
+        /** Per-Camera1-instance facing. Camera1 doesn't have an
+         *  equivalent of CameraManager.getCameraCharacteristics
+         *  reachable from the preview hook, so we resolve facing
+         *  at `Camera.open(int)` time and cache it. */
+        @JvmField val camera1Facing: ConcurrentHashMap<Camera, Int> =
+            ConcurrentHashMap()
+
+        /**
+         * @return true when [facing] should receive the MP4
+         *         replacement. v1.8.8 hardcodes "back only" — so
+         *         the back lens (and external USB cams, treated
+         *         the same) gets the loop; the front lens keeps
+         *         producing real frames for TikTok's detector.
+         *
+         * Returns **false on FACING_UNKNOWN**. That's deliberate:
+         * if openCamera hasn't fired yet, the safe assumption is
+         * "we don't know — let the real camera through" rather
+         * than "inject MP4 and hope". Wrong choice triggers the
+         * detection step we're trying to evade.
+         */
+        @JvmStatic
+        fun shouldBypass(facing: Int): Boolean {
+            return facing == FACING_BACK || facing == FACING_EXTERNAL
+        }
+
+        /**
+         * Camera1's `CameraInfo.facing` is the inverse of Camera2's
+         * `LENS_FACING_*` constants:
+         *
+         *   Camera1: 0=BACK, 1=FRONT
+         *   Camera2: 0=FRONT, 1=BACK
+         *
+         * Normalise to Camera2 so the rest of the hook can use a
+         * single facing-int regardless of API path.
+         */
+        @JvmStatic
+        fun normaliseCamera1Facing(c1Facing: Int): Int = when (c1Facing) {
+            Camera.CameraInfo.CAMERA_FACING_BACK -> FACING_BACK
+            Camera.CameraInfo.CAMERA_FACING_FRONT -> FACING_FRONT
+            else -> FACING_UNKNOWN
+        }
+
         /**
          * Encoders TikTok creates during a Live session. Tracked so
          * `queueInputBuffer` audio replacement can target only the
@@ -94,6 +197,19 @@ class CameraHook : IXposedHookLoadPackage {
 
         /** Surfaces we've already attached a player to — avoids double-feeding. */
         @JvmField val encoderSurfaces: MutableSet<Surface> = ConcurrentHashMap.newKeySet()
+
+        /**
+         * Maps each encoder input [Surface] from [hookMediaCodecCreateInputSurface]
+         * to its owning [MediaCodec]. Needed when injection is deferred to
+         * [hookCaptureRequestAddTarget] so FlipRenderer / [StreamReceiver] can
+         * recover the codec's width/height hints.
+         */
+        @JvmField val encoderSurfaceToCodec:
+            ConcurrentHashMap<Surface, MediaCodec> = ConcurrentHashMap()
+
+        /** TikTok process [Application]; set in [hookAppOnCreate]. Used to
+         *  resolve [CameraManager] when stamping facing from [CameraDevice]. */
+        @JvmField @Volatile var hostApplication: Application? = null
 
         /** Per-encoder MediaFormat captured from `configure()`. Used by
          *  [hookMediaCodecCreateInputSurface] to size the FlipRenderer. */
@@ -127,6 +243,18 @@ class CameraHook : IXposedHookLoadPackage {
         if (!isTikTok) return
 
         log("✅ loaded into $pkg — installing hooks")
+        // Facing trackers must install BEFORE the gate hooks so
+        // that by the time `addTarget` / `createInputSurface` /
+        // `setPreviewTexture` fires, `lastOpenedFacing` already
+        // reflects which camera TikTok asked for. Failure here
+        // (e.g. a vendor-modified CameraManager that ART can't
+        // resolve) is logged but non-fatal — the gate hooks then
+        // see FACING_UNKNOWN and refuse to inject, which is the
+        // safe default (real camera passes through, no MP4 leak).
+        try { hookCameraManagerOpenCamera() } catch (t: Throwable) { log("hookCameraManagerOpenCamera failed: $t") }
+        try { hookCamera1Open() } catch (t: Throwable) { log("hookCamera1Open failed: $t") }
+        try { hookCameraDeviceCreateCaptureRequest() } catch (t: Throwable) { log("hookCameraDeviceCreateCaptureRequest failed: $t") }
+
         try { hookMediaCodecConfigure() } catch (t: Throwable) { log("hookMediaCodecConfigure failed: $t") }
         try { hookMediaCodecCreateInputSurface() } catch (t: Throwable) { log("hookMediaCodecCreateInputSurface failed: $t") }
         try { hookMediaCodecAudioInput() } catch (t: Throwable) { log("hookMediaCodecAudioInput failed: $t") }
@@ -136,6 +264,201 @@ class CameraHook : IXposedHookLoadPackage {
         try { hookAudioRecordSource() } catch (t: Throwable) { log("hookAudioRecordSource failed: $t") }
         try { hookDisableAEC() } catch (t: Throwable) { log("hookDisableAEC failed: $t") }
         try { hookAppOnCreate() } catch (t: Throwable) { log("hookAppOnCreate failed: $t") }
+    }
+
+    /* ───────────────────────────────────────────────────────── *
+     *  Facing trackers — stamp [lastOpenedFacing] on every camera
+     *  open so the gate hooks know who's writing to the
+     *  surface(s) they're about to be asked to wrap.
+     * ───────────────────────────────────────────────────────── */
+
+    /**
+     * Hook every overload of `CameraManager.openCamera` to stamp
+     * `lastOpenedFacing` from `CameraCharacteristics.LENS_FACING`
+     * *before* the framework returns the [CameraDevice]. The map
+     * lookup goes through the same CameraManager instance so we
+     * pick up vendor-extended cameras (Samsung's "logical" rear
+     * cam group) using whatever ID the OEM assigned.
+     *
+     * Reading characteristics inside `beforeHookedMethod` adds a
+     * one-time disk/IPC trip per camera open — negligible against
+     * the 100-500 ms TikTok already spends initialising the
+     * preview pipeline. If the read itself throws (e.g. permission
+     * race when the app hasn't been granted CAMERA yet), we leave
+     * `lastOpenedFacing` untouched so the gate falls back to its
+     * previous value rather than flipping to UNKNOWN and exposing
+     * the front camera to MP4 injection mid-session.
+     */
+    private fun hookCameraManagerOpenCamera() {
+        // Overload A — pre-API-28 signature with a Handler.
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                CameraManager::class.java, "openCamera",
+                String::class.java,
+                CameraDevice.StateCallback::class.java,
+                Handler::class.java,
+                facingStamperHook,
+            )
+            log("hook CameraManager.openCamera(String,Cb,Handler) installed")
+        }.onFailure { log("openCamera handler-overload hook failed: $it") }
+
+        // Overload B — API 28+ Executor signature.
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                CameraManager::class.java, "openCamera",
+                String::class.java,
+                Executor::class.java,
+                CameraDevice.StateCallback::class.java,
+                facingStamperHook,
+            )
+            log("hook CameraManager.openCamera(String,Executor,Cb) installed")
+        }.onFailure { log("openCamera executor-overload hook failed: $it") }
+    }
+
+    /** Shared body for both `openCamera` overloads. Reads facing
+     *  from [CameraCharacteristics] for the camera ID being opened
+     *  and stamps it onto [lastOpenedFacing] so subsequent
+     *  surface-wrap decisions know who's driving the session. */
+    private val facingStamperHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(p: MethodHookParam) {
+            val mgr = p.thisObject as? CameraManager ?: return
+            val cameraId = p.args.getOrNull(0) as? String ?: return
+            runCatching {
+                val chars = mgr.getCameraCharacteristics(cameraId)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing != null) {
+                    lastOpenedFacing = facing
+                    log(
+                        "openCamera($cameraId) → facing=$facing " +
+                            "(${facingName(facing)}); " +
+                            "bypass=${shouldBypass(facing)}"
+                    )
+                }
+            }.onFailure {
+                log("openCamera facing probe failed for $cameraId: $it")
+            }
+        }
+    }
+
+    /**
+     * Camera1 path: `Camera.open(int)` returns a `Camera` and
+     * `Camera.CameraInfo.facing` tells us which lens. We cache
+     * the result so the later `setPreviewTexture` hook can look
+     * up "who's writing here" by the Camera instance alone.
+     *
+     * Camera1 is rare on API 33+ but a handful of TikTok login /
+     * profile-photo flows still touch it, and ignoring those
+     * would let the front-cam profile-photo capture leak through
+     * the MP4 injection (the customer would silently upload an
+     * MP4 frame as their avatar — embarrassing failure mode).
+     */
+    private fun hookCamera1Open() {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                Camera::class.java, "open",
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        val cam = p.result as? Camera ?: return
+                        val id = p.args.getOrNull(0) as? Int ?: return
+                        val info = Camera.CameraInfo()
+                        runCatching {
+                            Camera.getCameraInfo(id, info)
+                            val facing = normaliseCamera1Facing(info.facing)
+                            camera1Facing[cam] = facing
+                            lastOpenedFacing = facing
+                            log(
+                                "Camera.open($id) → facing=$facing " +
+                                    "(${facingName(facing)}); " +
+                                    "bypass=${shouldBypass(facing)}"
+                            )
+                        }.onFailure {
+                            log("Camera.getCameraInfo($id) failed: $it")
+                        }
+                    }
+                }
+            )
+            log("hook Camera.open(int) installed")
+        }.onFailure { log("hookCamera1Open failed: $it") }
+
+        // Camera1 also has a no-arg `open()` that opens the first
+        // back camera. Stamp facing accordingly so the cache is
+        // populated even for the legacy entry point.
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                Camera::class.java, "open",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        val cam = p.result as? Camera ?: return
+                        // ``Camera.open()`` (no args) → first back cam.
+                        camera1Facing[cam] = FACING_BACK
+                        lastOpenedFacing = FACING_BACK
+                        log("Camera.open() → assumed FACING_BACK")
+                    }
+                }
+            )
+            log("hook Camera.open() installed")
+        }.onFailure { /* most TikTok builds skip this — keep silent */ }
+    }
+
+    /**
+     * Stamp [lastOpenedFacing] from the [CameraDevice] that is about to
+     * build a [CaptureRequest]. This fixes ordering bugs where
+     * [hookMediaCodecCreateInputSurface] runs while [lastOpenedFacing] still
+     * reflects a *different* camera (e.g. rear still cached when the user is
+     * on the front preview), and it beats relying on [hookCameraManagerOpenCamera]
+     * alone on OEMs that open logical / auxiliary cameras in unexpected order.
+     */
+    private fun hookCameraDeviceCreateCaptureRequest() {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                CameraDevice::class.java,
+                "createCaptureRequest",
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        val dev = p.thisObject as? CameraDevice ?: return
+                        stampFacingFromCameraId(dev.id)
+                    }
+                },
+            )
+            log("hook CameraDevice.createCaptureRequest(int) installed")
+        }.onFailure { log("CameraDevice.createCaptureRequest hook failed: $it") }
+    }
+
+    /**
+     * Resolve [CameraCharacteristics.LENS_FACING] for [cameraId] via the
+     * host app's [CameraManager] and assign [lastOpenedFacing].
+     */
+    private fun stampFacingFromCameraId(cameraId: String) {
+        val app = hostApplication
+        if (app == null) {
+            log("stampFacingFromCameraId: hostApplication=null (cameraId=$cameraId)")
+            return
+        }
+        runCatching {
+            val mgr = app.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val chars = mgr.getCameraCharacteristics(cameraId)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            if (facing != null) {
+                lastOpenedFacing = facing
+                log(
+                    "CameraDevice id=$cameraId → facing=$facing " +
+                        "(${facingName(facing)}); bypass=${shouldBypass(facing)}",
+                )
+            }
+        }.onFailure {
+            log("stampFacingFromCameraId($cameraId) failed: $it")
+        }
+    }
+
+    /** Pretty-print facing for log readability — saves the support
+     *  engineer a Camera2-vs-Camera1 lookup when grepping logs. */
+    private fun facingName(facing: Int): String = when (facing) {
+        FACING_FRONT -> "FRONT"
+        FACING_BACK -> "BACK"
+        FACING_EXTERNAL -> "EXTERNAL"
+        else -> "UNKNOWN($facing)"
     }
 
     /* ───────────────────────────────────────────────────────── *
@@ -224,40 +547,28 @@ class CameraHook : IXposedHookLoadPackage {
                     val encoderSurface = p.result as? Surface ?: return
                     val mode = resolvedMode()
                     val codec = p.thisObject as? MediaCodec
-                    log("createInputSurface fired — mode=$mode surface=$encoderSurface")
+                    val facing = lastOpenedFacing
+                    log(
+                        "createInputSurface fired — mode=$mode " +
+                            "facing=${facingName(facing)} surface=$encoderSurface"
+                    )
                     if (mode == 0) return
                     if (mode == 2) {
-                        // Wrap encoder Surface with FlipRenderer so the
-                        // user's rotation/mirror picker (in vcam-app)
-                        // takes effect live. Fixed race: start() is now
-                        // blocking, so inputSurface is guaranteed
-                        // non-null when wrapWithFlipRenderer returns.
-                        val playSurface: Surface =
-                            wrapWithFlipRenderer(codec, encoderSurface)
-                                ?: encoderSurface
+                        // v1.8.9: NEVER inject from createInputSurface — TikTok
+                        // often creates the video encoder *before* the camera
+                        // pipeline stamps [lastOpenedFacing], so feeding here
+                        // poisoned the front preview with stale BACK state from
+                        // an earlier session or auxiliary open. Registration +
+                        // deferred inject in [hookCaptureRequestAddTarget] only.
                         encoderSurfaces.add(encoderSurface)
-
-                        // Live-stream takes precedence over the static
-                        // MP4 loop — the user can flip between them by
-                        // touching/removing /data/local/tmp/vcam_stream_url
-                        if (StreamReceiver.enabled()) {
-                            log("📡 live stream mode: attaching StreamReceiver")
-                            val format = codec?.let { videoFormats[it] }
-                            val w = format?.getInteger(MediaFormat.KEY_WIDTH) ?: 720
-                            val h = format?.getInteger(MediaFormat.KEY_HEIGHT) ?: 1280
-                            val rx = StreamReceiver(playSurface, w, h)
-                            StreamReceiver.instances[encoderSurface] = rx
-                            rx.start()
-                            return
+                        if (codec != null) {
+                            encoderSurfaceToCodec[encoderSurface] = codec
                         }
-
-                        val path = activeVideoPath ?: VideoFeeder.activeVideoPath()
-                        if (path != null) {
-                            log("🎬 mp4 loop mode: ${path.substringAfterLast('/')}")
-                            VideoFeeder.feedToSurface(playSurface, path)
-                            return
-                        }
-                        log("⚠ createInputSurface: mode=2 but no source available")
+                        log(
+                            "createInputSurface: mode=2 registered " +
+                                "$encoderSurface (inject deferred to addTarget); " +
+                                "facingHint=${facingName(facing)}",
+                        )
                         return
                     }
                     encoderSurfaces.add(encoderSurface)
@@ -286,6 +597,9 @@ class CameraHook : IXposedHookLoadPackage {
         outputSurface: Surface,
         widthHint: Int? = null,
         heightHint: Int? = null,
+        rearLensExtraRotation: Int = 0,
+        /** Horizontal flip baseline like TikTok front preview (selfie mirror). */
+        mirrorLikeFrontCamera: Boolean = false,
     ): Surface? {
         // Re-use an existing renderer if we already wrapped this surface.
         FlipRenderer.instances[outputSurface]?.let { return it.inputSurface }
@@ -309,8 +623,11 @@ class CameraHook : IXposedHookLoadPackage {
                 ?: format?.getInteger(MediaFormat.KEY_HEIGHT)
                 ?: 1280
             val fr = FlipRenderer(w, h, outputSurface).also { r ->
-                r.rotationDegrees = liveRotationDegrees
-                r.mirrorH = liveMirrorH
+                r.rearLensExtraRotation = rearLensExtraRotation
+                r.rotationDegrees = liveRotationDegrees + rearLensExtraRotation
+                r.rearLensMirrorLikeFront = mirrorLikeFrontCamera
+                r.rearLensCorrectTex180 = mirrorLikeFrontCamera
+                r.mirrorH = liveMirrorH != mirrorLikeFrontCamera
                 r.mirrorV = liveMirrorV
                 r.zoom = liveZoom
                 r.start()  // synchronous — blocks until inputSurface is non-null
@@ -361,22 +678,67 @@ class CameraHook : IXposedHookLoadPackage {
                     val mode = resolvedMode()
                     if (mode == 0) return
                     if (mode == 2) {
-                        val path = activeVideoPath ?: VideoFeeder.activeVideoPath()
-                        if (path != null) {
-                            // TikTok Live takes this path: the camera
-                            // target Surface is sized to the camera's
-                            // sensor (typically landscape), and any
-                            // rotation TikTok applies for the portrait
-                            // viewport happens DOWNSTREAM of us. Wrap
-                            // it with FlipRenderer so the user can
-                            // dial in the right rotation from app UI
-                            // and the broadcast hits FlipRenderer
-                            // immediately.
-                            val targetSurface =
-                                wrapWithFlipRenderer(null, surface)
+                        // v1.8.9: [stampFacingFromCameraId] runs from
+                        // CameraDevice.createCaptureRequest right before
+                        // builders add outputs — [lastOpenedFacing] matches
+                        // the camera driving *this* session (not a stale open).
+                        val facing = lastOpenedFacing
+                        if (!shouldBypass(facing)) {
+                            stopAnyInjectionFor(surface)
+                            log(
+                                "addTarget: facing=${facingName(facing)} " +
+                                    "→ pass-through (real camera)",
+                            )
+                            return
+                        }
+
+                        if (
+                            StreamReceiver.enabled() &&
+                            encoderSurfaces.contains(surface)
+                        ) {
+                            val codecHint = encoderSurfaceToCodec[surface]
+                            val playSurface =
+                                wrapWithFlipRenderer(
+                                    codecHint,
+                                    surface,
+                                    rearLensExtraRotation =
+                                        REAR_CAMERA_EXTRA_ROTATION_DEGREES,
+                                    mirrorLikeFrontCamera = false,
+                                )
                                     ?: surface
-                            VideoFeeder.feedToSurface(targetSurface, path)
-                            log("🎬 video injected via CaptureRequest.addTarget")
+                            val format = codecHint?.let { videoFormats[it] }
+                            val w =
+                                format?.getInteger(MediaFormat.KEY_WIDTH) ?: 720
+                            val h =
+                                format?.getInteger(MediaFormat.KEY_HEIGHT)
+                                    ?: 1280
+                            val rx = StreamReceiver(playSurface, w, h)
+                            StreamReceiver.instances[surface] = rx
+                            rx.start()
+                            log(
+                                "📡 live stream via addTarget " +
+                                    "(${w}×$h facing=${facingName(facing)})",
+                            )
+                        } else {
+                            val path =
+                                activeVideoPath ?: VideoFeeder.activeVideoPath()
+                            if (path != null) {
+                                val codecHint = encoderSurfaceToCodec[surface]
+                                val targetSurface =
+                                    wrapWithFlipRenderer(
+                                        codecHint,
+                                        surface,
+                                        rearLensExtraRotation =
+                                            REAR_CAMERA_EXTRA_ROTATION_DEGREES,
+                                        mirrorLikeFrontCamera = false,
+                                    )
+                                        ?: surface
+                                VideoFeeder.feedToSurface(targetSurface, path)
+                                log(
+                                    "🎬 video injected via addTarget " +
+                                        "(facing=${facingName(facing)})",
+                                )
+                            }
                         }
                     }
                     p.result = null
@@ -385,6 +747,36 @@ class CameraHook : IXposedHookLoadPackage {
             }
         )
         log("hook CaptureRequest.Builder.addTarget installed")
+    }
+
+    /**
+     * Tear down any FlipRenderer + VideoFeeder previously attached
+     * to [surface]. Called when we decide to **stop** injecting for
+     * that surface — e.g. the customer flipped from back camera
+     * (bypass) to front camera (real). Without this, the previous
+     * session's MediaPlayer keeps drawing onto the same encoder
+     * Surface in parallel with the now-attached real camera, and
+     * the encoder sees a torn mixture of MP4 frames and live frames.
+     *
+     * Safe to call on a Surface that was never wrapped — both
+     * lookups return null and the method becomes a no-op.
+     */
+    private fun stopAnyInjectionFor(surface: Surface) {
+        val fr = FlipRenderer.instances[surface]
+        if (fr != null) {
+            // Stop the MediaPlayer first so its callbacks can't
+            // race with the renderer teardown — VideoFeeder.stopFor
+            // is UI-thread-safe (it posts) so we can call it inline.
+            val input = fr.inputSurface
+            if (input != null) VideoFeeder.stopFor(input)
+            runCatching { fr.stop() }
+                .onFailure { log("FlipRenderer.stop() failed on $surface: $it") }
+            log("⏹ stopped injection for $surface (facing change)")
+        } else {
+            // No FlipRenderer wrap — but the camera/preview path
+            // may have fed the surface directly. Stop just in case.
+            VideoFeeder.stopFor(surface)
+        }
     }
 
     private fun hookCamera1Preview() {
@@ -396,13 +788,47 @@ class CameraHook : IXposedHookLoadPackage {
                     val orig = p.args[0] as? SurfaceTexture ?: return
                     val mode = resolvedMode()
                     if (mode == 0) return
+                    // mode == 1 (block): always replace with dummy
+                    // so the encoder gets no frames; facing is
+                    // irrelevant — the customer asked for a black
+                    // broadcast and that's what they get. Fall
+                    // through past the mode==2 branch into the
+                    // shared dummy-swap below.
                     if (mode == 2) {
+                        // v1.8.8: per-Camera-instance facing lookup.
+                        // Camera1 doesn't have CameraCharacteristics
+                        // — the source of truth is the map populated
+                        // by [hookCamera1Open]. Fall back to
+                        // [lastOpenedFacing] when the instance isn't
+                        // in the map (legacy Camera.open() variants
+                        // that bypassed our hook); FACING_UNKNOWN
+                        // then triggers the safe "no inject" path.
+                        val cam = p.thisObject as? Camera
+                        val facing = cam?.let { camera1Facing[it] }
+                            ?: lastOpenedFacing
+                        if (!shouldBypass(facing)) {
+                            log(
+                                "Camera1 setPreviewTexture: " +
+                                    "facing=${facingName(facing)} → " +
+                                    "pass-through (real camera)"
+                            )
+                            // Leave p.args[0] alone so the real
+                            // camera writes to TikTok's real
+                            // SurfaceTexture; preview shows the
+                            // front lens for the detection step.
+                            return
+                        }
                         val path = activeVideoPath ?: VideoFeeder.activeVideoPath()
                         if (path != null) {
                             VideoFeeder.feedToSurface(Surface(orig), path)
                         }
                     }
-                    // Hand the camera a dummy texture so its frames go nowhere.
+                    // Shared between mode=1 (block) and mode=2-BACK
+                    // (bypass): hand the camera a dummy SurfaceTexture
+                    // so its frames go nowhere on the customer's
+                    // pre-existing path. For mode=2 we already
+                    // started VideoFeeder above, which writes the
+                    // MP4 onto the real `orig` surface in parallel.
                     p.args[0] = SurfaceTexture(0)
                     log("🎬 Camera1 setPreviewTexture intercepted (mode=$mode)")
                 }
@@ -531,6 +957,7 @@ class CameraHook : IXposedHookLoadPackage {
                     // the receiver's own process — different VM).
                     runCatching {
                         val app = p.thisObject as android.app.Application
+                        hostApplication = app
                         val recv = InProcessModeReceiver()
                         val filter = android.content.IntentFilter(
                             "com.livemobillrerun.vcam.SET_MODE"
@@ -575,9 +1002,18 @@ class CameraHook : IXposedHookLoadPackage {
             }
 
             // Live transform parameters — applied via FlipRenderer.
-            // Use sentinel ints so unspecified extras don't reset.
-            val rot = intent.getIntExtra("rotation", -1)
-            if (rot != -1) liveRotationDegrees = rot
+            // Rotation may arrive as int (--ei) or float (--ef) depending on sender.
+            if (intent.hasExtra("rotation")) {
+                val raw = intent.extras?.get("rotation")
+                val deg = when (raw) {
+                    is Int -> raw
+                    is Long -> raw.toInt()
+                    is Float -> raw.toInt()
+                    is Double -> raw.toInt()
+                    else -> intent.getIntExtra("rotation", 0)
+                }
+                liveRotationDegrees = ((deg % 360) + 360) % 360
+            }
             if (intent.hasExtra("flipX")) liveMirrorH = intent.getBooleanExtra("flipX", false)
             if (intent.hasExtra("flipY")) liveMirrorV = intent.getBooleanExtra("flipY", false)
             val z = intent.getFloatExtra("zoom", -1f)
@@ -585,8 +1021,9 @@ class CameraHook : IXposedHookLoadPackage {
 
             // Push the new transforms to all live FlipRenderers.
             for (fr in FlipRenderer.instances.values) {
-                fr.rotationDegrees = liveRotationDegrees
-                fr.mirrorH = liveMirrorH
+                fr.rotationDegrees =
+                    liveRotationDegrees + fr.rearLensExtraRotation
+                fr.mirrorH = liveMirrorH != fr.rearLensMirrorLikeFront
                 fr.mirrorV = liveMirrorV
                 fr.zoom = liveZoom
             }

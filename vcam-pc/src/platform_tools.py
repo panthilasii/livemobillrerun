@@ -119,18 +119,33 @@ def _tools_root_base() -> Path:
       ``PROJECT_ROOT`` = ``<bundle>/app/``. ``.tools/`` sits at
       ``<bundle>/.tools/`` — *parent* of PROJECT_ROOT.
 
+    * **macOS portable ZIP, .app double-clicked from Finder** —
+      the customer ZIP ships a PyInstaller .app at
+      ``<bundle>/app/NP-Create.app/`` *plus* the ``run.command``
+      launcher at the root. Some customers (and admins giving
+      remote support) follow the macOS muscle-memory of
+      "find the .app, double-click it" instead of the documented
+      ``run.command`` path. In that mode ``PROJECT_ROOT`` =
+      ``<bundle>/app/NP-Create.app/Contents/MacOS/`` — i.e. four
+      directory levels below ``.tools/``. The 1.8.3 release
+      regressed silently here because the previous 3-level walk
+      stopped at ``NP-Create.app/`` and returned None for adb /
+      ffmpeg / lspatch / vcam_apk, leaving the dashboard stuck
+      with every device showing offline forever.
+
     Defensive walk
     --------------
     Rather than hard-code one rule per mode and pray we covered
     every distribution combo, we *walk up* from the natural
     starting point looking for the first directory that has a
-    ``.tools/`` child. This handles all four layouts with a single
-    code path and silently absorbs any future installer layout we
-    haven't thought of yet.
+    ``.tools/`` child. This handles every layout above with a
+    single code path and silently absorbs any future installer
+    layout we haven't thought of yet.
 
-    The walk is bounded (3 levels) so a missing ``.tools/`` falls
-    through to a sensible default rather than wandering into the
-    user's home directory and picking up a stale toolchain there.
+    The walk is bounded (5 levels) — deep enough to escape the
+    nested ``app/NP-Create.app/Contents/MacOS/`` case but shallow
+    enough that a missing ``.tools/`` doesn't wander into the
+    user's home directory and pick up a stale toolchain there.
     """
     if getattr(sys, "frozen", False):
         # Frozen: start at the .exe / .app dir and walk up.
@@ -143,10 +158,20 @@ def _tools_root_base() -> Path:
         # vcam-pc/, ``.tools/`` is one level up.
         start = PROJECT_ROOT.parent
 
-    candidates = [start, start.parent, start.parent.parent]
-    for cand in candidates:
+    # Walk up to 5 levels — the deepest case in production is
+    # ``Contents/MacOS/`` → ``Contents/`` → ``NP-Create.app/`` →
+    # ``app/`` → ``<bundle>/`` (.tools/ here) which is exactly 4
+    # hops, with one more in reserve for any future nesting we
+    # don't anticipate yet. Any deeper than that and we risk
+    # picking up a stale ``.tools/`` from the user's home
+    # directory or repo workspace.
+    cand = start
+    for _ in range(5):
         if (cand / ".tools").is_dir():
             return cand
+        if cand.parent == cand:  # filesystem root
+            break
+        cand = cand.parent
 
     # Nothing on disk yet — return the most-likely answer for this
     # mode so the resolver can still report a useful "not found"

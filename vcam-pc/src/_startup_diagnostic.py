@@ -70,9 +70,9 @@ def write_diagnostic(log_dir: Path | None = None) -> Path | None:
 def _write_unsafe(log_dir: Path | None) -> Path | None:
     from . import platform_tools
     from .branding import BRAND
-    from .config import PROJECT_ROOT
+    from .config import DATA_ROOT, PROJECT_ROOT
 
-    target_dir = log_dir or (PROJECT_ROOT / "logs")
+    target_dir = log_dir or (DATA_ROOT / "logs")
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / DIAGNOSTIC_FILENAME
 
@@ -105,6 +105,8 @@ def _write_unsafe(log_dir: Path | None) -> Path | None:
     # ── project paths ────────────────────────────────────────────
     w("Project paths")
     w("-" * 40)
+    kv("DATA_ROOT", DATA_ROOT)
+    kv("  exists", DATA_ROOT.is_dir())
     kv("PROJECT_ROOT", PROJECT_ROOT)
     kv("  exists", PROJECT_ROOT.is_dir())
     try:

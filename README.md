@@ -138,6 +138,10 @@ bash tools/phone_smoke.sh            # phone-side — needs USB-debug + cable
 Drop `.mp4` files into `vcam-pc/videos/` to use real footage instead of
 the auto-generated SMPTE bars sample.
 
+## Full source on another machine
+
+To clone or archive the whole workspace, build **`vcam-app`**, sign **`apk/vcam-app-release.apk`**, and run **`vcam-pc`**, see **[docs/BUILD_FROM_SOURCE.md](docs/BUILD_FROM_SOURCE.md)**.
+
 ## License
 
 Private project. Not for redistribution.

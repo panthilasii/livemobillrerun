@@ -31,7 +31,6 @@ import subprocess
 import threading
 import time
 import webbrowser
-from datetime import date
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -41,6 +40,16 @@ from PIL import Image
 
 from ..branding import BRAND, THEME
 from ..customer_devices import DeviceEntry
+from ..encode_push_runner import run_encode_push
+from ..encode_push_tasks import (
+    STATE_CANCELLED,
+    STATE_DONE,
+    STATE_ENCODING,
+    STATE_ERROR,
+    STATE_PUSHING,
+    STATE_QUEUED,
+    EncodePushTask,
+)
 from ..hook_mode import human_bytes
 from ..license_key import (
     LicenseError,
@@ -48,7 +57,6 @@ from ..license_key import (
     save_activation,
     verify_key,
 )
-from ..playlist import write_playlist
 
 log = logging.getLogger(__name__)
 
@@ -489,6 +497,13 @@ class DashboardPage(ctk.CTkFrame):
         ).pack(fill="x", pady=2)
 
         self._device_buttons: dict[str, ctk.CTkButton] = {}
+        # Per-serial reference to the row's sub-line label widget.
+        # Lets ``_refresh_sidebar_badge_for(serial)`` poke a single
+        # row's text without nuking + rebuilding every device card,
+        # which used to be the v1.8.6 hot path during encode (5+
+        # progress callbacks per second × N devices = sidebar
+        # destroy/rebuild storm + flicker + lost hover state).
+        self._device_sub_labels: dict[str, ctk.CTkLabel] = {}
         self._refresh_sidebar()
 
     def _refresh_sidebar(self) -> None:
@@ -497,6 +512,7 @@ class DashboardPage(ctk.CTkFrame):
         for w in self.devices_scroll.winfo_children():
             w.destroy()
         self._device_buttons.clear()
+        self._device_sub_labels.clear()
 
         entries = self.app.devices_lib.list()
         if not entries:
@@ -602,41 +618,7 @@ class DashboardPage(ctk.CTkFrame):
         )
         title_lbl.grid(row=0, column=1, sticky="w")
 
-        # When the user hasn't set a label yet, two phones with the
-        # same model would render identical title+sub. Append the
-        # last 4 chars of the serial so they're at least
-        # distinguishable until "บัญชี A" / "บัญชี B" is filled in.
-        if entry.label:
-            sub = entry.model or entry.serial[:12]
-        else:
-            tail = entry.serial[-4:] if entry.serial else ""
-            sub = f"{entry.model or 'Phone'} · …{tail}"
-        if online:
-            transport = self.app.transport_of(entry.serial)
-            if transport == "wifi":
-                sub = f"{sub} · 📶 WiFi"
-            elif transport == "usb":
-                sub = f"{sub} · 🔌 USB"
-        else:
-            sub = f"{sub} · offline"
-        # Live indicator: append "🔴 LIVE MM:SS" to the sub-line so
-        # the customer can see at a glance which phones are
-        # broadcasting without clicking through. The duration is
-        # cheap to compute (timestamp diff) so we re-render it
-        # every refresh -- the dashboard's 1 s tick covers
-        # propagation. We deliberately don't dim offline live
-        # entries: a phone that went off-network mid-broadcast
-        # is exactly the case the customer should see flagged.
-        if entry.is_live():
-            from .. import live_control as _lc
-            elapsed = _lc.format_elapsed(entry.live_elapsed_seconds())
-            sub = f"{sub} · 🔴 LIVE {elapsed}"
-        # Drift badge: TikTok auto-updated and we already warned the
-        # customer this session. Surface a small ⚠️ until they
-        # Re-Patch so the alarming state stays visible without
-        # spawning another modal.
-        if entry.tiktok_drift_warned_at:
-            sub = f"{sub} · ⚠️ TikTok updated"
+        sub = self._compute_sidebar_sub(entry, online=online)
         sub_lbl = ctk.CTkLabel(
             inner,
             text=sub,
@@ -645,6 +627,10 @@ class DashboardPage(ctk.CTkFrame):
             anchor="w",
         )
         sub_lbl.grid(row=1, column=1, sticky="w")
+        # Keep a per-serial reference so ``_refresh_sidebar_badge_for``
+        # can update *just this row's text* during encode progress
+        # without nuking the whole sidebar.
+        self._device_sub_labels[entry.serial] = sub_lbl
 
         # Bind click + hover propagation on every visible child too.
         # Hover events are tricky because moving the cursor between
@@ -666,6 +652,98 @@ class DashboardPage(ctk.CTkFrame):
                 w.configure(cursor="hand2")
         except Exception:
             pass
+
+    def _compute_sidebar_sub(
+        self, entry: DeviceEntry, *, online: bool | None = None,
+    ) -> str:
+        """Compose the sidebar row's sub-line text for ``entry``.
+
+        Refactored out of ``_build_device_row`` (v1.8.6 hotfix)
+        so ``_refresh_sidebar_badge_for(serial)`` can recompute
+        the same string without rebuilding the whole row tree —
+        otherwise every encode-progress callback would destroy
+        and re-create every device card on the sidebar at 5+ Hz,
+        which produced flicker and lost hover state on Tk.
+
+        ``online`` is optional so callers can pass a cached value
+        and avoid recomputing the lookup for every row during a
+        full rebuild; it defaults to a fresh probe.
+        """
+        if online is None:
+            online = self.app.is_online(entry.serial)
+
+        # When the user hasn't set a label yet, two phones with
+        # the same model would render identical title+sub. Append
+        # the last 4 chars of the serial so they're at least
+        # distinguishable until "บัญชี A" / "บัญชี B" is filled in.
+        if entry.label:
+            sub = entry.model or entry.serial[:12]
+        else:
+            tail = entry.serial[-4:] if entry.serial else ""
+            sub = f"{entry.model or 'Phone'} · …{tail}"
+        if online:
+            transport = self.app.transport_of(entry.serial)
+            if transport == "wifi":
+                sub = f"{sub} · 📶 WiFi"
+            elif transport == "usb":
+                sub = f"{sub} · 🔌 USB"
+        else:
+            sub = f"{sub} · offline"
+        # Live indicator: append "🔴 LIVE MM:SS" so the customer
+        # can see at a glance which phones are broadcasting
+        # without clicking through. The duration is cheap to
+        # compute (timestamp diff) so we re-render it every
+        # refresh -- the dashboard's 1 s tick covers propagation.
+        # We deliberately don't dim offline live entries: a phone
+        # that went off-network mid-broadcast is exactly the case
+        # the customer should see flagged.
+        if entry.is_live():
+            from .. import live_control as _lc
+            elapsed = _lc.format_elapsed(entry.live_elapsed_seconds())
+            sub = f"{sub} · 🔴 LIVE {elapsed}"
+        # Drift badge: TikTok auto-updated and we already warned
+        # the customer this session. Surface a small ⚠️ until
+        # they Re-Patch so the alarming state stays visible
+        # without spawning another modal.
+        if entry.tiktok_drift_warned_at:
+            sub = f"{sub} · ⚠️ TikTok updated"
+        # Encode + push task badge (v1.8.6). Compact
+        # ``status_label_thai`` is designed to fit alongside the
+        # existing chips so a 5-device sidebar still scans cleanly.
+        task = self.app.encode_tasks.get(entry.serial)
+        if task is not None:
+            sub = f"{sub} · {task.status_label_thai()}"
+        return sub
+
+    def _refresh_sidebar_badge_for(self, serial: str) -> None:
+        """Cheap badge refresh — just recompute one row's sub-text.
+
+        Hot path during encode + push: the runner fires
+        ``on_update`` callbacks at ~5 Hz per device, and pre-fix
+        each one routed through the full ``_refresh_sidebar``
+        which destroyed every row and rebuilt the tree. Replacing
+        that with a single ``configure(text=...)`` here drops the
+        cost from O(N_devices × widget_create) per tick to
+        O(1 × text-set), and Tk's hover-state book-keeping no
+        longer flickers.
+
+        Falls back to a full rebuild if the row isn't in our
+        widget map (e.g. the customer just added a device that
+        the registry knows about but the sidebar hasn't seen
+        yet) so we never *miss* a paint, just opt out of the
+        expensive one when it's not needed.
+        """
+        sub_lbl = self._device_sub_labels.get(serial)
+        entry = self.app.devices_lib.get(serial)
+        if sub_lbl is None or entry is None:
+            self._refresh_sidebar()
+            return
+        try:
+            sub_lbl.configure(text=self._compute_sidebar_sub(entry))
+        except Exception:
+            log.debug("badge refresh failed, falling back to full rebuild",
+                      exc_info=True)
+            self._refresh_sidebar()
 
     # ── main panel ───────────────────────────────────────────────
 
@@ -729,6 +807,29 @@ class DashboardPage(ctk.CTkFrame):
             command=self._on_rename_device,
         )
         self.btn_rename_device.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        # Trash button — let the customer prune stale entries from
+        # the library. Unlike rename, this is destructive, so we
+        # tint the border with the danger colour and gate the
+        # action behind a Yes/No confirm dialog. We deliberately
+        # do *not* drop the per-device files (videos, profiles)
+        # from disk: deletion only removes the ``devices.json``
+        # entry, so re-plugging the same phone restores its files.
+        self.btn_delete_device = ctk.CTkButton(
+            title_row,
+            text="🗑️ ลบเครื่อง",
+            width=110,
+            height=28,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=THEME.bg_hover,
+            text_color=THEME.danger,
+            font=ctk.CTkFont(size=11),
+            border_width=1,
+            border_color=THEME.danger,
+            command=self._on_delete_device,
+        )
+        self.btn_delete_device.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
         self.lbl_device_status = _muted(self.header_card, "—")
         self.lbl_device_status.grid(row=1, column=0, sticky="w", padx=20, pady=(2, 4))
@@ -1447,6 +1548,7 @@ class DashboardPage(ctk.CTkFrame):
             self.lbl_device_title.configure(text="ยังไม่มีเครื่องที่เลือก")
             try:
                 self.btn_rename_device.grid_remove()
+                self.btn_delete_device.grid_remove()
             except Exception:
                 pass
             self.lbl_device_status.configure(
@@ -1469,6 +1571,7 @@ class DashboardPage(ctk.CTkFrame):
         self.lbl_device_title.configure(text=e.display_name())
         try:
             self.btn_rename_device.grid()
+            self.btn_delete_device.grid()
         except Exception:
             pass
         online = self.app.is_online(e.serial)
@@ -1572,6 +1675,19 @@ class DashboardPage(ctk.CTkFrame):
             self.btn_patch.configure(text=f"Patch สำเร็จเมื่อ {e.patched_at[:10]}")
         else:
             self.btn_patch.configure(text="Patch & ติดตั้ง TikTok")
+
+        # Encode + Push card — driven entirely off the per-device
+        # task registry now. If a task exists for this serial we
+        # render whichever phase it's in (queued / encoding /
+        # pushing / done / error); if none exists, it's pristine.
+        # Switching between devices simply re-paints from
+        # whichever task object that device has — the worker
+        # threads keep running independently.
+        task = self.app.encode_tasks.get(e.serial)
+        if task is not None:
+            self._render_encode_card_for(task)
+        else:
+            self._render_encode_card_idle()
 
     def _set_card_enabled(self, card: ctk.CTkFrame, enabled: bool) -> None:
         # CustomTkinter has no built-in disabled state on frames, so
@@ -1916,8 +2032,16 @@ class DashboardPage(ctk.CTkFrame):
             patched_signature = (inst.fingerprint or "").lower()
         except Exception as ex:
             log.exception("re-patch crashed")
-            self.after(0, lambda: messagebox.showerror(
-                "Re-Patch ล้มเหลว", f"crash: {ex}",
+            # Capture ``ex`` into a snapshot now -- Python 3 deletes
+            # the ``except as ex`` binding the moment the block exits
+            # (CPython does this to break refcycles), and our lambda
+            # fires on the *next* Tk tick via ``self.after(0, ...)``,
+            # by which point ``ex`` is gone. Without the snapshot the
+            # customer sees ``NameError: name 'ex' is not defined``
+            # instead of the actual error message.
+            err_msg = f"crash: {ex}"
+            self.after(0, lambda m=err_msg: messagebox.showerror(
+                "Re-Patch ล้มเหลว", m,
             ))
             return
 
@@ -2117,7 +2241,25 @@ class DashboardPage(ctk.CTkFrame):
         cancelled in ``destroy`` (Tk's ``after`` is automatically
         torn down with the widget tree, but being explicit means
         no spurious 'invalid command name' errors during page
-        switches)."""
+        switches).
+
+        Page-destroyed guard
+        --------------------
+        Tk's ``after`` callbacks are scheduled on the root, not on
+        the widget, so they keep firing for one extra tick after
+        the DashboardPage is destroyed (e.g. user navigated to
+        Settings while the tick was already in flight). Without
+        this guard the inner ``.configure()`` calls on
+        ``lbl_mirror_status`` etc. raise
+        ``_tkinter.TclError: invalid command name``.
+        """
+        try:
+            if not self.winfo_exists():
+                self._live_tick_handle = None
+                return
+        except Exception:  # pragma: no cover -- defensive
+            self._live_tick_handle = None
+            return
         try:
             self._render_live_control_state()
         except Exception:
@@ -2178,7 +2320,22 @@ class DashboardPage(ctk.CTkFrame):
         Called from the 1 s live-tick AND from the scrcpy
         change-callback so closing the mirror window externally
         flips the button back without waiting for the tick.
+
+        Page-destroyed guard
+        --------------------
+        The scrcpy ``on_change`` callback can fire from a worker
+        thread *after* this page has been destroyed (customer
+        navigated away and the scrcpy process died a moment
+        later). ``hasattr(self, ...)`` still returns True in that
+        case because Python attribute survives Tk widget
+        destruction, so we need the explicit
+        ``winfo_exists()`` check before touching any child.
         """
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # pragma: no cover -- defensive
+            return
         if not hasattr(self, "btn_live_mirror"):
             return
 
@@ -2722,6 +2879,143 @@ class DashboardPage(ctk.CTkFrame):
         self._refresh_sidebar()
         self._refresh_main()
 
+    def _on_delete_device(self) -> None:
+        """Drop the selected entry from ``devices.json``.
+
+        Two corner cases drive the dialog copy:
+
+        * **Live broadcasting / mirroring** — we'd be ripping the
+          rug out from under the customer mid-stream. Stop the
+          live counter and any open scrcpy window first so we
+          don't leak background processes after the entry goes.
+        * **Currently online via USB** — the next ``adb devices``
+          tick will re-add the row (with a blank label) because
+          ``_on_devices_polled`` auto-tracks any USB serial it
+          sees. We tell the customer up front to unplug first if
+          they want the deletion to stick.
+
+        Files on disk (videos, profiles, license cache) are left
+        alone on purpose: re-adding the same phone later restores
+        its old display state without forcing the customer to
+        re-pick the clip / re-enter their nickname.
+        """
+        e = self.app.selected_entry()
+        if e is None:
+            return
+
+        nice = e.display_name()
+        is_online = self.app.is_online(e.serial)
+        is_live = bool(getattr(e, "is_live", lambda: False)())
+        # Mirror sessions are keyed by the *active adb id* (USB
+        # serial OR ``ip:port``), not the canonical serial — so
+        # ask the app for the right key before checking.
+        try:
+            from .. import scrcpy_mirror
+            adb_id = self.app.adb_id_for(e)
+            is_mirroring = scrcpy_mirror.is_mirroring(adb_id)
+        except Exception:
+            is_mirroring = False
+            adb_id = e.serial
+
+        warning_lines: list[str] = []
+        if is_live:
+            warning_lines.append("• เครื่องนี้กำลัง LIVE อยู่ — จะถูกหยุดทันที")
+        if is_mirroring:
+            warning_lines.append(
+                "• หน้าต่าง Mirror ของเครื่องนี้กำลังเปิดอยู่ — จะถูกปิด"
+            )
+        # Warn if an encode/push job is mid-flight (v1.8.6+).
+        # The runner thread will keep going and write to the
+        # per-serial cache MP4 even after the entry is gone, but
+        # the customer should know they're walking out on a
+        # half-finished job.
+        encode_task = self.app.encode_tasks.get(e.serial)
+        if encode_task is not None and encode_task.is_running():
+            warning_lines.append(
+                f"• กำลัง {encode_task.status_label_thai()} — "
+                "งานจะรันต่อจนเสร็จแต่ผลจะไม่แสดงในรายการอีก"
+            )
+        if is_online and self.app.transport_of(e.serial) == "usb":
+            warning_lines.append(
+                "• เครื่องนี้ยัง 'เสียบสายอยู่' — ระบบจะเพิ่มเข้ามาใหม่"
+                "อัตโนมัติ\n  ถ้าอยากให้ลบถาวร ให้ถอดสาย USB ก่อนกดยืนยัน"
+            )
+        warning = "\n".join(warning_lines)
+
+        msg = f"ลบ '{nice}' ออกจากรายชื่อ?"
+        if warning:
+            msg = f"{msg}\n\n{warning}"
+        msg = (
+            f"{msg}\n\n"
+            "ℹ️ จะลบเฉพาะรายการในโปรแกรม (Patch บนโทรศัพท์ยังอยู่)\n"
+            "ไฟล์วิดีโอ / โปรไฟล์เดิม จะถูกเก็บไว้ในเครื่องคอม"
+        )
+
+        if not messagebox.askyesno("ยืนยันการลบเครื่อง", msg, icon="warning"):
+            return
+
+        # Cleanup live state + mirror window before yanking the
+        # entry, so background subprocesses don't outlive their
+        # owner record.
+        if is_live:
+            try:
+                self.app.devices_lib.stop_live(e.serial)
+            except Exception:
+                log.exception("stop_live during delete failed")
+        if is_mirroring:
+            try:
+                from .. import scrcpy_mirror
+                scrcpy_mirror.stop_mirror(adb_id)
+            except Exception:
+                log.exception("stop_mirror during delete failed")
+
+        # Drop a stale wifi reverse map / online-set cache hit
+        # from this run so the next refresh paints clean.
+        self.app.online_serials.discard(e.serial)
+        self.app.transport_for.pop(e.serial, None)
+        self.app.adb_id_for_serial.pop(e.serial, None)
+        # Drop any encode-push task tracked for this serial — both
+        # finished AND running. Earlier (1.8.6 first pass) we only
+        # cleared finished tasks on the assumption that "the worker
+        # will keep going so leave it alone". Two problems:
+        #
+        # 1. **Ghost ✓ on re-pair.** Customer deletes phone S
+        #    while encode is mid-flight; worker finishes a few
+        #    seconds later and stamps STATE_DONE. Customer plugs
+        #    same phone back in → poller auto-upserts the entry
+        #    → sidebar reads ``encode_tasks.get(S)`` and shows
+        #    "✓ ส่งคลิปสำเร็จ" on a row the customer hasn't
+        #    interacted with. Confusing and impossible to clear
+        #    without a second delete + re-add cycle.
+        #
+        # 2. **Stale badge during the running window.** Even
+        #    before completion, the row is gone — the running
+        #    task's progress updates land in nowhere visible.
+        #
+        # Removing the registry entry doesn't kill the worker
+        # thread (we don't have cancel-event plumbing yet — that's
+        # a separate fix); it just means ``_on_encode_task_update``
+        # silently no-ops because ``selected_serial`` won't match
+        # the deleted serial and the sidebar walks the device
+        # library, not the registry. The ffmpeg/adb children get
+        # to finish on their own; their output MP4 sits in
+        # ``cache/vcam_<serial>.mp4`` and gets overwritten if the
+        # phone is re-paired and re-encoded.
+        self.app.encode_tasks.remove(e.serial)
+
+        removed = self.app.devices_lib.remove(e.serial)
+        self.app.save_devices()
+
+        if self.app.selected_serial == e.serial:
+            self.app.selected_serial = None
+
+        self._refresh_sidebar()
+        self._auto_select()
+        self._refresh_main()
+
+        if removed:
+            log.info("device entry removed: %s", e.serial)
+
     def _on_setup_wifi(self) -> None:
         """Enable wireless ADB on a USB-connected device.
 
@@ -3053,7 +3347,51 @@ class DashboardPage(ctk.CTkFrame):
         )
         self.app.save_devices()
 
+        def _poke_tiktok_transform() -> None:
+            try:
+                from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
+
+                pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
+                self.app.hook.broadcast_flip_transform_to_tiktok(
+                    tiktok_pkg=pkg,
+                    rotation_deg=int(self.rotation_var.get()),
+                    flip_x=bool(self.mirror_h_var.get()),
+                    flip_y=bool(self.mirror_v_var.get()),
+                    serial=self.app.adb_id_for(e),
+                )
+            except Exception:
+                log.exception("broadcast_flip_transform_to_tiktok failed")
+
+        threading.Thread(target=_poke_tiktok_transform, daemon=True).start()
+
     def _on_encode_push(self) -> None:
+        """Kick off encode + push for the *currently-selected* device.
+
+        Per-device parallelism (v1.8.6)
+        -------------------------------
+
+        Pre-1.8.6 this handler ran encode + push *synchronously
+        through the UI* — single shared button, single progress
+        bar, single ``app.local_mp4`` cache path. With 5+ phones
+        the customer had to babysit each one in turn (~90 s × N
+        devices, strictly serial), which prompted the v1.8.6 ask:
+        "1 เครื่อง 1 encode + push, ไม่อยากให้ user รอ".
+
+        Now: each click registers an ``EncodePushTask`` on
+        ``app.encode_tasks`` and fires a daemon thread that runs
+        the encode + push end-to-end. Multiple devices can be
+        running tasks simultaneously — every dependency the
+        runner touches (ffmpeg subprocess, adb subprocess,
+        playlist tempfile, output MP4 path) is per-call or per-
+        serial, so concurrent tasks don't race. The customer
+        can switch between devices while tasks are running and
+        the encode card / sidebar badge will reflect the right
+        per-device state.
+
+        Re-clicking the button on a device that's already running
+        is a no-op — the registry's ``has_running`` rejects the
+        duplicate before we waste an ffmpeg child on it.
+        """
         e = self.app.selected_entry()
         if e is None:
             return
@@ -3063,6 +3401,20 @@ class DashboardPage(ctk.CTkFrame):
                 "กด 'เปลี่ยนคลิป...' เพื่อเลือกไฟล์ก่อนครับ",
             )
             return
+
+        # Reject duplicate clicks for the same device — we already
+        # have a running task for it. The button render in
+        # ``_render_encode_card_for_selected`` should keep the
+        # button visually disabled, but we double-check here so a
+        # rapid double-click can't slip through the gap between
+        # ``_refresh_main`` paints.
+        if self.app.encode_tasks.has_running(e.serial):
+            log.info(
+                "encode-push double-click ignored: %s already running",
+                e.serial,
+            )
+            return
+
         # Real-time refresh — see _on_patch_tiktok for the rationale.
         self.app.refresh_devices_now()
         if not self.app.is_online(e.serial):
@@ -3098,189 +3450,243 @@ class DashboardPage(ctk.CTkFrame):
             if not cont:
                 return
 
-        self.btn_encode_push.configure(state="disabled", text="กำลังทำงาน…")
-        self.progress.set(0.05)
-        self.lbl_encode_status.configure(
-            text="กำลัง encode คลิป…", text_color=THEME.fg_secondary,
-        )
-        threading.Thread(
-            target=self._run_encode_push,
-            args=(self.app.adb_id_for(e), Path(e.last_video)),
-            daemon=True,
-        ).start()
+        # Resolve which TikTok variant lives on this phone so the
+        # on-phone target path picks the right /sdcard/Android/data/
+        # subtree. Falls back to the international package for
+        # legacy entries that pre-date the per-device probe.
+        from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
+        pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
 
-    def _run_encode_push(self, serial: str, source: Path) -> None:
-        # 1. Build a single-file playlist.
-        try:
-            pl = write_playlist([source], loop=self.app.cfg.loop_playlist)
-        except Exception as ex:
-            log.exception("playlist write failed")
-            self._encode_done(False, f"playlist write failed: {ex}")
-            return
-
-        # 2. Use the device's ProfileLibrary entry that matches the
-        #    cfg default — for now that's enough; per-device rotation
-        #    is layered on by FlipRenderer at runtime, not at encode
-        #    time, so we hardcode "no extra rotation in ffmpeg".
+        # Pick a device profile up front so the runner thread
+        # doesn't have to touch ``app.profiles`` (= less shared
+        # state under concurrency). Per-device rotation is applied
+        # at *render* time on the phone, not at encode time, so
+        # the same profile is fine for every parallel task.
         prof = self.app.profiles.get(self.app.cfg.default_profile) or (
             self.app.profiles.profiles[0] if self.app.profiles.profiles else None
         )
         if prof is None:
-            self._encode_done(False, "ไม่พบ device profile")
+            messagebox.showerror(
+                "ไม่พบ device profile",
+                "กรุณาตั้งค่า profile ในเมนู Settings ก่อน",
+            )
             return
 
-        # ── progress bar split: encode = 0..0.5, push = 0.5..1.0 ──
-        #
-        # The hook pipeline reports (pct, msg) on a worker thread;
-        # we forward to the Tk thread via ``after(0, ...)``. We
-        # *can't* call widget methods directly here -- Tk is single-
-        # threaded and silently corrupts state if called from the
-        # wrong thread. Wrapping every callback in ``after(0, ...)``
-        # also coalesces rapid updates: if 50 ffmpeg ticks fire in
-        # 100 ms, Tk will only paint once.
-        def _on_encode_progress(pct: float, msg: str) -> None:
-            self.after(
-                0,
-                lambda p=pct, m=msg: self._set_progress_status(p * 0.5, m),
-            )
+        task = EncodePushTask(
+            serial=e.serial,
+            adb_id=self.app.adb_id_for(e),
+            source=Path(e.last_video),
+            output=self.app.device_local_mp4(e.serial),
+            tiktok_pkg=pkg,
+        )
+        self.app.encode_tasks.upsert(task)
+
+        # Repaint immediately so the customer sees "queued" before
+        # the worker thread has even spawned. Without this the
+        # button can sit briefly with the old "▶ Encode + Push"
+        # label between click and first progress callback, which
+        # looked like the click had been lost on slow machines.
+        self._refresh_main()
+        self._refresh_sidebar()
+
+        threading.Thread(
+            target=self._run_encode_push,
+            args=(task, prof),
+            daemon=True,
+            name=f"encode-push-{e.serial}",
+        ).start()
+
+    def _run_encode_push(self, task: EncodePushTask, profile) -> None:
+        """Worker-thread body. The runner does all the heavy
+        lifting; we just bridge its updates back to the Tk loop."""
+
+        def _on_update(t: EncodePushTask) -> None:
+            # ``run_encode_push`` calls this from its worker
+            # thread. Tk is single-threaded so we must hop back
+            # to the main loop before touching widgets — bare
+            # ``self.after(0, fn)`` is the canonical way to
+            # serialise that hand-off.
+            self.after(0, lambda task=t: self._on_encode_task_update(task))
 
         try:
-            self.after(0, lambda: self._set_progress_status(
-                0.0, "เตรียม encode…",
-            ))
-            r = self.app.hook.encode_playlist(
-                playlist_file=pl,
-                profile=prof,
-                output_path=self.app.local_mp4,
-                progress_cb=_on_encode_progress,
+            run_encode_push(
+                pipeline=self.app.hook,
+                cfg=self.app.cfg,
+                profile=profile,
+                task=task,
+                on_update=_on_update,
             )
-        except Exception as ex:
-            log.exception("encode crashed")
-            self._encode_done(False, f"encode crashed: {ex}")
-            return
-        finally:
-            try:
-                pl.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        if not r.ok:
-            self._encode_done(False, f"Encode ล้มเหลว: {r.error}")
-            return
-
-        self.after(0, lambda sz=r.bytes: self._set_progress_status(
-            0.5, f"Encode สำเร็จ ({human_bytes(sz)}). กำลัง push…"
-        ))
-
-        def _on_push_progress(pct: float, msg: str) -> None:
-            self.after(
-                0,
-                lambda p=pct, m=msg: self._set_progress_status(
-                    0.5 + p * 0.5, m,
-                ),
+        except Exception:
+            # The runner is supposed to swallow every exception
+            # internally and surface STATE_ERROR. If something
+            # leaks anyway we log it loud — the task object is
+            # still in the registry, and a future "retry" handler
+            # could re-spawn it.
+            log.exception(
+                "encode-push runner leaked exception for %s", task.serial,
             )
 
-        # Per-device TikTok variant: customers running TikTok Lite
-        # or Douyin live under different package names, and the
-        # /sdcard/Android/data/<pkg>/files/ path varies accordingly.
-        # We saved the detected variant on each successful hook-
-        # status probe, so by the time the customer clicks Encode
-        # + Push it's almost always populated. Falls back to the
-        # global default for legacy devices that pre-date the
-        # detection (mostly: customers who patched on v1.4.x and
-        # haven't opened the dashboard yet on v1.5+).
-        #
-        # The ``serial`` param here is actually the adb_id (USB
-        # serial OR ip:port for WiFi). For WiFi rows we need to
-        # resolve the canonical USB serial to look up the entry,
-        # otherwise devices_lib.get() returns None and we'd
-        # silently route the broadcast at the wrong package.
-        from ..hook_mode import TARGET_PATH_TEMPLATE, TIKTOK_PACKAGE_DEFAULT
-        entry_for_target = self.app.devices_lib.get(serial)
-        if entry_for_target is None:
-            # Likely a WiFi row whose serial here is "ip:port".
-            # Reverse-look-up the canonical USB serial via the
-            # transport map the poller maintains.
-            for canonical, adb_id in self.app.adb_id_for_serial.items():
-                if adb_id == serial:
-                    entry_for_target = self.app.devices_lib.get(canonical)
-                    break
-        pkg_for_target = (
-            entry_for_target.tiktok_package
-            if entry_for_target and entry_for_target.tiktok_package
-            else TIKTOK_PACKAGE_DEFAULT
-        )
-        target = TARGET_PATH_TEMPLATE.format(pkg=pkg_for_target)
-        try:
-            push = self.app.hook.push_to_phone(
-                self.app.local_mp4,
-                serial=serial,
-                target=target,
-                progress_cb=_on_push_progress,
-                tiktok_pkg=pkg_for_target,
-            )
-        except Exception as ex:
-            log.exception("push crashed")
-            self._encode_done(False, f"push crashed: {ex}")
-            return
+    def _on_encode_task_update(self, task: EncodePushTask) -> None:
+        """Tk-thread entry point for runner updates.
 
-        if not push.ok:
-            self._encode_done(False, f"Push ล้มเหลว: {push.error}")
-            return
+        Repaints the sidebar (so any device row's badge stays
+        fresh) and, if the task belongs to the *currently
+        displayed* device, the encode card on the main panel.
+        Terminal states (done / error) for the displayed device
+        also pop a modal — but only for the displayed device,
+        otherwise five parallel tasks would stack five modals
+        and steal focus from each other on completion.
 
-        self._encode_done(
-            True,
-            f"สำเร็จ ({human_bytes(push.bytes)} ใน {push.elapsed_s:.1f} วิ)",
-        )
-
-    def _set_progress_status(self, value: float, text: str) -> None:
-        self.progress.set(value)
-        self.lbl_encode_status.configure(text=text)
-
-    def _encode_done(self, ok: bool, msg: str) -> None:
-        """Surface the encode+push outcome to the customer.
-
-        Up through v1.7.3 the result lived in a small green/red
-        label under the button. Multiple customers (most recently
-        the v1.7.4 Patch test) reported "ไฟล์ไม่เข้าเครื่อง" even
-        when the push had succeeded — they never registered the
-        small-text update because the action takes minutes and
-        their attention had drifted.
-
-        We now also pop a modal dialog with the success/failure
-        message so it's *impossible* to miss. The dialog also
-        nudges the customer to peek at the phone, which closes
-        the loop on the most common follow-up question
-        ("เห็นแล้วยังเป็นคลิปเก่าอยู่").
+        Page-destroyed guard
+        --------------------
+        ``run_encode_push`` runs on a daemon thread that outlives
+        the dashboard page if the customer navigates to Settings
+        / Activation while an encode is in-flight. ``self.after``
+        in the worker schedules this method to run on the next Tk
+        tick — but by that tick ``self`` may have been destroyed
+        by ``StudioApp.show_page``, and every widget access raises
+        ``_tkinter.TclError: invalid command name``. Bail out
+        early when that happens. The task object itself stays in
+        the registry, so when the customer comes back to the
+        dashboard ``_refresh_main`` will paint the latest state
+        from there.
         """
-        def _ui():
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # pragma: no cover -- defensive
+            return
+
+        # The selected device might have changed between the
+        # runner thread firing and this callback running. We
+        # always update the sidebar (so the right row's badge
+        # repaints), but only update the encode card when the
+        # task belongs to the device currently on screen.
+        try:
+            self._refresh_sidebar_badge_for(task.serial)
+        except Exception:
+            log.debug("sidebar badge refresh during encode-update failed",
+                      exc_info=True)
+
+        if self.app.selected_serial == task.serial:
+            self._render_encode_card_for(task)
+
+        # On completion, surface a modal — but ONLY if this device
+        # is the one the customer is currently looking at. For
+        # background completions (they switched away while encode
+        # was running) the sidebar badge alone is enough; popping
+        # a modal would steal focus from whatever they're doing on
+        # the new device's panel.
+        if (
+            task.is_terminal()
+            and task.state != STATE_CANCELLED
+            and self.app.selected_serial == task.serial
+        ):
+            self._show_encode_modal(task)
+
+    def _render_encode_card_for(self, task: EncodePushTask) -> None:
+        """Sync the action-card widgets with ``task``'s current state.
+
+        Uses one widget set (the existing ``btn_encode_push`` /
+        ``progress`` / ``lbl_encode_status`` instances) but pulls
+        every field off the task object — so when the customer
+        flips between devices, ``_refresh_main`` simply re-renders
+        the card for whichever task that device has (or the
+        pristine state if no task has run yet).
+        """
+        if task.state == STATE_QUEUED:
+            self.btn_encode_push.configure(
+                state="disabled", text="กำลังเตรียม…",
+            )
+            self.progress.set(0.0)
+            self.lbl_encode_status.configure(
+                text=task.message, text_color=THEME.fg_secondary,
+            )
+            return
+        if task.state in (STATE_ENCODING, STATE_PUSHING):
+            label = (
+                "กำลัง encode…" if task.state == STATE_ENCODING
+                else "กำลัง push…"
+            )
+            self.btn_encode_push.configure(state="disabled", text=label)
+            self.progress.set(task.progress)
+            self.lbl_encode_status.configure(
+                text=task.message, text_color=THEME.fg_secondary,
+            )
+            return
+        if task.state == STATE_DONE:
             self.btn_encode_push.configure(
                 state="normal", text="▶  Encode + Push",
             )
-            self.progress.set(1.0 if ok else 0.0)
+            self.progress.set(1.0)
             self.lbl_encode_status.configure(
-                text=msg,
-                text_color=THEME.success if ok else THEME.danger,
+                text=task.message, text_color=THEME.success,
             )
-            if ok:
-                messagebox.showinfo(
-                    "✓ ส่งคลิปสำเร็จ",
-                    f"{msg}\n\n"
-                    "TikTok บนมือถือกำลังโหลดคลิปใหม่ให้อัตโนมัติ "
-                    "(≤ 2 วิ).\n\n"
-                    "ถ้ายังเห็นคลิปเก่าอยู่ — ปิด-เปิดกล้อง / ปิด TikTok "
-                    "แล้วเปิดใหม่ 1 ครั้ง.",
-                )
-            else:
-                messagebox.showerror(
-                    "Encode + Push ล้มเหลว",
-                    f"{msg}\n\n"
-                    "ลองตรวจ:\n"
-                    "• สาย USB / WiFi ADB ยังต่ออยู่ไหม\n"
-                    "• พื้นที่บนมือถือพอไหม (ต้องมี ≥ 500 MB)\n"
-                    "• คลิปต้นฉบับเสีย/ขนาดใหญ่เกินไปไหม",
-                )
-        self.after(0, _ui)
+            return
+        if task.state == STATE_ERROR:
+            self.btn_encode_push.configure(
+                state="normal", text="▶  Encode + Push (ลองใหม่)",
+            )
+            self.progress.set(0.0)
+            self.lbl_encode_status.configure(
+                text=task.message, text_color=THEME.danger,
+            )
+            return
+        if task.state == STATE_CANCELLED:
+            # Cancelled is "expected" termination — not an error.
+            # Reset the button to a fresh "Encode + Push" so the
+            # customer can immediately retry on next launch / next
+            # click without the alarming red "(ลองใหม่)" suffix.
+            self.btn_encode_push.configure(
+                state="normal", text="▶  Encode + Push",
+            )
+            self.progress.set(0.0)
+            self.lbl_encode_status.configure(
+                text=task.message, text_color=THEME.fg_muted,
+            )
+            return
+
+    def _render_encode_card_idle(self) -> None:
+        """No task has been run for this device — pristine state."""
+        self.btn_encode_push.configure(
+            state="normal", text="▶  Encode + Push",
+        )
+        self.progress.set(0.0)
+        self.lbl_encode_status.configure(
+            text="พร้อม", text_color=THEME.fg_muted,
+        )
+
+    def _show_encode_modal(self, task: EncodePushTask) -> None:
+        """Modal nudge for terminal-state task on the visible device.
+
+        Up through v1.7.3 the result lived only in a small
+        green/red label under the button. Multiple customers
+        reported "ไฟล์ไม่เข้าเครื่อง" even when the push had
+        succeeded — they never registered the small-text update
+        because the action takes minutes and their attention had
+        drifted. v1.7.4 added a modal so the result is impossible
+        to miss; v1.8.6 keeps it but ONLY for the currently-
+        displayed device so parallel completions don't stack 5
+        modals on top of each other.
+        """
+        if task.state == STATE_DONE:
+            messagebox.showinfo(
+                "✓ ส่งคลิปสำเร็จ",
+                f"{task.message}\n\n"
+                "TikTok บนมือถือกำลังโหลดคลิปใหม่ให้อัตโนมัติ "
+                "(≤ 2 วิ).\n\n"
+                "ถ้ายังเห็นคลิปเก่าอยู่ — ปิด-เปิดกล้อง / ปิด TikTok "
+                "แล้วเปิดใหม่ 1 ครั้ง.",
+            )
+        elif task.state == STATE_ERROR:
+            messagebox.showerror(
+                "Encode + Push ล้มเหลว",
+                f"{task.message}\n\n"
+                "ลองตรวจ:\n"
+                "• สาย USB / WiFi ADB ยังต่ออยู่ไหม\n"
+                "• พื้นที่บนมือถือพอไหม (ต้องมี ≥ 500 MB)\n"
+                "• คลิปต้นฉบับเสีย/ขนาดใหญ่เกินไปไหม",
+            )
 
     def _on_open_tiktok(self) -> None:
         e = self.app.selected_entry()
@@ -5600,7 +6006,6 @@ class SettingsPage(ctk.CTkFrame):
                 row=1, column=0, sticky="w", padx=20, pady=(0, 20)
             )
         else:
-            today = date.today()
             exp_color = (
                 THEME.success
                 if v.days_left > 7
@@ -5685,17 +6090,15 @@ class SettingsPage(ctk.CTkFrame):
 
     # ── encode quality card ──────────────────────────────────────
     def _build_encode_card(self, parent: ctk.CTkFrame) -> None:
-        """Encode resolution + horizontal-mirror toggle.
+        """Encode resolution + optional front-camera mirror (legacy).
 
         Stored as ``cfg.encode_width`` / ``cfg.encode_height``
         (landscape) — the phone's rotation chain shows it portrait
         on screen, so we label the button with the *portrait* size
         (1080×1920) which matches what the user sees in TikTok.
 
-        ``cfg.mirror_horizontal`` controls a pre-encode ``hflip``
-        that cancels TikTok's implicit front-camera mirror. Default
-        on; turn off if the customer's phone routes through the
-        rear camera and the broadcast already looks correct.
+        Default hook encode targets **rear** injection; mirror is off
+        unless the customer enables it here and re-encodes.
         """
         _h2(parent, "🎞  คุณภาพวิดีโอ").grid(
             row=0, column=0, sticky="w", padx=20, pady=(20, 4)
@@ -5746,16 +6149,16 @@ class SettingsPage(ctk.CTkFrame):
         ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 4))
         _muted(
             parent,
-            "TikTok ดึงคลิปผ่าน front-camera ทำให้ภาพสะท้อนเป็นกระจก\n"
-            "(ตัวอักษร/โลโก้กลับด้าน). เปิดสวิตช์นี้เพื่อกลับด้านล่วงหน้า\n"
-            "ให้คนดูเห็นภาพปกติ.",
+            "การไลฟ์ฉีดผ่านกล้องหลังเป็นค่าเริ่มต้น — ไม่ต้องตั้งบ่อย\n"
+            "สวิตช์นี้ใช้เฉพาะโหมดเก่า (เชนกล้องหน้า) หรือเมื่อตัวหนังสือ/โลโก้\n"
+            "กลับด้านผิดปกติ ให้เปิดแล้วกด encode + push ใหม่",
         ).grid(row=5, column=0, sticky="w", padx=20, pady=(0, 8))
 
         self._mirror_var = ctk.BooleanVar(
-            value=bool(getattr(cfg, "mirror_horizontal", True))
+            value=bool(getattr(cfg, "mirror_horizontal", False))
         )
         ctk.CTkSwitch(
-            parent, text="แก้ภาพสะท้อนอัตโนมัติ (แนะนำเปิดไว้)",
+            parent, text="แก้ภาพสะท้อนแบบกล้องหน้า (ปิดไว้ตามค่าเริ่มต้น)",
             variable=self._mirror_var,
             text_color=THEME.fg_primary,
             progress_color=THEME.primary,

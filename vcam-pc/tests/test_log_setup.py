@@ -183,7 +183,9 @@ class TestDiagnosticZip:
             }],
         }), encoding="utf-8")
 
-        monkeypatch.setattr(log_setup, "PROJECT_ROOT", proj)
+        import src.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "CONFIG_PATH", proj / "config.json")
+        monkeypatch.setattr(cfg_mod, "DATA_ROOT", proj)
         monkeypatch.setattr(log_setup, "LOG_DIR", log_dir)
         monkeypatch.setattr(log_setup, "LOG_FILE", log_file)
         return proj
@@ -263,9 +265,11 @@ class TestDiagnosticZip:
         log_file = proj / "logs" / "npcreate.log"
         log_file.write_text("...", encoding="utf-8")
 
-        monkeypatch.setattr(log_setup, "PROJECT_ROOT", proj)
         monkeypatch.setattr(log_setup, "LOG_DIR", proj / "logs")
         monkeypatch.setattr(log_setup, "LOG_FILE", log_file)
+        import src.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "CONFIG_PATH", proj / "config.json")
+        monkeypatch.setattr(cfg_mod, "DATA_ROOT", proj)
 
         out = tmp_path / "diag.zip"
         log_setup.collect_diagnostic_zip(out)

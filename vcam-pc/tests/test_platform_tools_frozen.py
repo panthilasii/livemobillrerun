@@ -101,6 +101,67 @@ class TestToolsRootBase:
                 ".exe, not above it. This was the v1.7.8 break."
             )
 
+    def test_macos_app_inside_customer_zip_finds_tools(self, tmp_path):
+        """The 1.8.3 regression — macOS PyInstaller .app double-clicked
+        from inside the customer ZIP must still find ``.tools/``.
+
+        Layout the customer ZIP unpacks to::
+
+            <bundle>/
+              .tools/                                  ← the goal
+              app/
+                NP-Create.app/
+                  Contents/
+                    MacOS/                             ← PROJECT_ROOT
+                      NP-Create
+
+        The walk has to climb four directories (MacOS → Contents →
+        NP-Create.app → app → bundle) to reach ``.tools/``. The 1.8.2
+        bounded-3-level walk stopped at ``NP-Create.app/`` and
+        returned None for find_adb / find_ffmpeg / find_lspatch_jar /
+        find_vcam_apk — leaving the dashboard with every device
+        permanently offline because the device-poller had no adb to
+        call.
+
+        v1.8.4 extended the walk to 5 levels; this test pins that
+        contract so the bug can't re-surface silently when someone
+        "tightens up" the resolver later.
+        """
+        bundle = tmp_path / "NP-Create-customer-macos-1.8.4"
+        tools_dir = bundle / ".tools"
+        tools_dir.mkdir(parents=True)
+        macos_dir = bundle / "app" / "NP-Create.app" / "Contents" / "MacOS"
+        macos_dir.mkdir(parents=True)
+
+        with mock.patch.object(sys, "frozen", True, create=True):
+            pt = _reload_platform_tools(macos_dir)
+            assert pt._tools_root_base() == bundle, (
+                "The walk must escape Contents/MacOS/ → Contents/ → "
+                ".app/ → app/ → bundle/ and find .tools/ there. "
+                "Stopping early = silent 'every device offline' bug "
+                "shipped to customers in v1.8.3."
+            )
+            assert pt.LEGACY_TOOLS_ROOT == tools_dir.resolve()
+
+    def test_walk_does_not_escape_to_user_home(self, tmp_path):
+        """Bound the walk so a missing ``.tools/`` doesn't accidentally
+        find one in a parent path the customer didn't intend (e.g.
+        the dev's workspace, or someone else's NP Create install).
+        """
+        # Build a deep path with no .tools/ anywhere.
+        deep = tmp_path / "a" / "b" / "c" / "d" / "e" / "f" / "g"
+        deep.mkdir(parents=True)
+
+        with mock.patch.object(sys, "frozen", True, create=True):
+            pt = _reload_platform_tools(deep)
+            # Should fall back to ``start`` (PROJECT_ROOT), not climb
+            # all the way out into tmp_path or beyond.
+            base = pt._tools_root_base()
+            assert base == deep, (
+                "When no .tools/ exists, walk must not wander — "
+                f"it landed at {base!r} instead of staying at {deep!r}."
+            )
+
 
 # ── find_adb fallback chain ───────────────────────────────────────
 

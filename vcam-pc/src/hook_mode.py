@@ -413,13 +413,15 @@ class HookModePipeline:
 
         1. ``profile.rotation_filter`` (rare; only for the deprecated
            HAL-hook path where the file *is* the camera).
-        2. ``hflip`` — pre-cancel TikTok's implicit front-camera
-           mirror. Must run BEFORE ``transpose=1`` so the flip axis
-           is horizontal in the source frame; flipping after the
-           90° rotation would invert the vertical axis and produce
-           an upside-down picture once TikTok rotates it back.
-        3. ``transpose=1`` — 90° CW rotation so the downstream
-           Camera2 sensor-orientation rotation lands us upright.
+        2. **Rear-facing default** (``hook_encode_rear_facing``): no
+           ``hflip``; ``transpose=2`` then ``vflip`` — same math as
+           ``device_profiles.json`` for Redmi 13C/14C/Poco C75 (those
+           profiles are skipped during hook encode because
+           ``apply_profile_rotation`` defaults false; this chain bakes
+           the confirmed upright orientation into every MP4).
+        3. **Legacy front path** (``hook_encode_rear_facing`` false):
+           optional ``hflip`` before ``transpose=1`` (mirror must run
+           before the 90° rotation).
         4. ``scale + pad`` — letterbox the source to the configured
            encode dims (default 1920×1080 landscape, becomes
            1080×1920 portrait on screen).
@@ -434,14 +436,17 @@ class HookModePipeline:
             and profile.rotation_filter != "none"
         ):
             vf.append(profile.rotation_filter)
-        # Math (where R = rotate 90° CW, H = our hflip,
-        # M = TikTok's selfie mirror, both M and H are involutions):
-        #   file    = transpose(hflip(src)) = R(H(src))
-        #   display = M(R⁻¹(file))           = M(H(src))
-        #                                    = src       (since M = H)
-        if getattr(self.cfg, "mirror_horizontal", True):
-            vf.append("hflip")
-        vf.append("transpose=1")
+        rear = getattr(self.cfg, "hook_encode_rear_facing", True)
+        if rear:
+            vf.append("transpose=2")
+            vf.append("vflip")
+        else:
+            # Legacy: front-camera mirror cancellation + 90° CW.
+            #   file    = transpose(hflip(src)) = R(H(src))
+            #   display = M(R⁻¹(file))           = M(H(src)) = src (M = H)
+            if getattr(self.cfg, "mirror_horizontal", True):
+                vf.append("hflip")
+            vf.append("transpose=1")
         vf.append(
             f"scale={out_w}:{out_h}:"
             "force_original_aspect_ratio=decrease:flags=lanczos"
@@ -466,6 +471,7 @@ class HookModePipeline:
         max_seconds: int = 0,
         apply_profile_rotation: bool = False,
         progress_cb: ProgressCB = None,
+        cancel_event: "threading.Event | None" = None,
     ) -> HookEncodeResult:
         """Re-encode the FFmpeg concat playlist into a single MP4.
 
@@ -486,14 +492,12 @@ class HookModePipeline:
         rear). TikTok's display layer then rotates that landscape
         frame into the portrait viewport you see on the phone.
 
-        To make our injected video appear *upright* through that same
-        rotation, we encode landscape (``cfg.encode_width`` ×
-        ``cfg.encode_height`` — default 1920×1080) and pre-rotate the
-        source by 90° CW (``transpose=1``). The downstream display
-        rotation cancels ours out and the user sees an upright
-        portrait clip. The phone-side ``FlipRenderer`` can then nudge
-        it further if a particular device's sensor orientation
-        differs.
+        The LSPatch hook injects on the **rear** lens only; by default
+        (``hook_encode_rear_facing``) we run ``transpose=2`` then
+        ``vflip`` (Redmi/Poco reference from ``device_profiles.json``)
+        so portrait lands upright on TikTok without per-device knobs.
+        Set ``hook_encode_rear_facing`` to false for the older
+        front-camera ``hflip`` + ``transpose=1`` chain.
 
         ``apply_profile_rotation`` is left as a manual override for the
         deprecated HAL-hook path (where the file is consumed *as the
@@ -602,6 +606,7 @@ class HookModePipeline:
             timeout_s=timeout_s,
             progress_cb=progress_cb,
             t0=t0,
+            cancel_event=cancel_event,
         )
 
     def _run_ffmpeg_with_progress(
@@ -612,6 +617,7 @@ class HookModePipeline:
         timeout_s: int,
         progress_cb: ProgressCB,
         t0: float,
+        cancel_event: "threading.Event | None" = None,
     ) -> HookEncodeResult:
         """Spawn ffmpeg, stream its ``-progress pipe:1`` output to
         compute a 0..1 percentage, and bound wall-clock to
@@ -667,6 +673,25 @@ class HookModePipeline:
         last_pct = 0.0
         try:
             for line in proc.stdout or []:
+                # Cooperative cancel — fired from outside (e.g. app
+                # close handler hits ``encode_tasks.cancel_all_running``).
+                # Killing the child here is what makes parallel
+                # encodes *exit cleanly* on shutdown instead of
+                # turning into orphaned 100 %-CPU ffmpeg processes
+                # the customer has to find in Task Manager / Activity
+                # Monitor and kill manually.
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        log.warning(
+                            "ffmpeg refused to die after kill on cancel"
+                        )
+                    return HookEncodeResult(
+                        False, output_path, 0.0, 0,
+                        "ยกเลิกระหว่าง encode (cancelled)",
+                    )
                 if time.monotonic() > deadline:
                     proc.kill()
                     proc.wait(timeout=5)
@@ -742,6 +767,7 @@ class HookModePipeline:
         target: str = TARGET_PATH_ON_PHONE,
         progress_cb: ProgressCB = None,
         tiktok_pkg: str = TIKTOK_PACKAGE_DEFAULT,
+        cancel_event: "threading.Event | None" = None,
     ) -> HookPushResult:
         """`adb push` the encoded MP4 to the phone.
 
@@ -822,22 +848,75 @@ class HookModePipeline:
                 stop_evt=stop_evt,
             )
 
+        # Switched from ``subprocess.run`` to ``Popen`` + poll loop
+        # in v1.8.6 so we can interrupt the push when the customer
+        # closes the app (or hits a future "หยุด" button) instead
+        # of leaving an orphaned ``adb push`` running on a 1 GB
+        # MP4 transfer that the kernel keeps alive even after the
+        # parent Python process exits. ``subprocess.run`` blocks
+        # in C-land and ignores Python-level signals on Windows
+        # specifically — Popen + ``proc.wait(timeout=0.1)`` lets
+        # us steer the lifecycle from outside.
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout_s, check=False)
-        except subprocess.TimeoutExpired:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
             stop_evt.set()
-            mins = timeout_s // 60
             return HookPushResult(
                 False, size, 0.0, target,
-                f"adb push เกินเวลา {mins} นาที\n"
-                "ตรวจสายเชื่อม / WiFi กับมือถือ และลองอีกครั้ง",
+                f"ไม่สามารถเรียก adb push ได้: {exc}",
             )
+        deadline = t0 + timeout_s
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        log.warning(
+                            "adb push refused to die after kill on cancel"
+                        )
+                    stop_evt.set()
+                    return HookPushResult(
+                        False, size, 0.0, target,
+                        "ยกเลิกระหว่าง push (cancelled)",
+                    )
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    stop_evt.set()
+                    mins = timeout_s // 60
+                    return HookPushResult(
+                        False, size, 0.0, target,
+                        f"adb push เกินเวลา {mins} นาที\n"
+                        "ตรวจสายเชื่อม / WiFi กับมือถือ และลองอีกครั้ง",
+                    )
         finally:
             stop_evt.set()
+        # Drain stdout / stderr so callers can surface them on
+        # failure. ``communicate`` here is a no-op on the IO side
+        # (process is already exited) but it does close the pipes
+        # cleanly so we don't leak file descriptors when this
+        # method is called many times across a long session.
+        try:
+            stdout_text, stderr_text = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout_text, stderr_text = "", ""
         elapsed = time.monotonic() - t0
         if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            err = (stderr_text or stdout_text or "").strip().splitlines()[-3:]
             return HookPushResult(False, size, elapsed, target, "\n".join(err))
 
         if progress_cb is not None:
@@ -903,6 +982,45 @@ class HookModePipeline:
                            timeout=5, check=False)
         except subprocess.TimeoutExpired:
             log.debug("force-reload broadcast timed out (harmless)")
+
+    def broadcast_flip_transform_to_tiktok(
+        self,
+        *,
+        tiktok_pkg: str,
+        rotation_deg: int,
+        flip_x: bool,
+        flip_y: bool,
+        zoom: float = 1.0,
+        serial: str | None = None,
+    ) -> None:
+        """Send rotation / mirror / zoom to the patched TikTok process.
+
+        Uses ``-p <tiktok_pkg>`` (no ``-n``) so the hook's runtime
+        ``BroadcastReceiver`` inside TikTok receives the intent — same
+        pattern as ``_broadcast_force_reload``. Integer ``rotation``
+        matches ``CameraHook.InProcessModeReceiver``.
+        """
+        adb = self._resolve_adb() or self.cfg.adb_path
+        cmd = [adb]
+        if serial:
+            cmd += ["-s", serial]
+        rot = int(rotation_deg) % 360
+        z = max(float(zoom), 0.01)
+        cmd += [
+            "shell", "am", "broadcast",
+            "-a", "com.livemobillrerun.vcam.SET_MODE",
+            "-p", tiktok_pkg,
+            "--ei", "mode", "2",
+            "--ei", "rotation", str(rot),
+            "--ez", "flipX", str(flip_x).lower(),
+            "--ez", "flipY", str(flip_y).lower(),
+            "--ef", "zoom", f"{z:.2f}",
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=5, check=False)
+        except subprocess.TimeoutExpired:
+            log.debug("broadcast_flip_transform_to_tiktok timed out")
 
     # ────────────────────────────────────────────────────────────
     #  push standalone audio override
@@ -1151,7 +1269,7 @@ class HookModePipeline:
             "--ei", "mode", str(mode),
             "--es", "videoPath", video_path,
             "--ez", "loop", str(loop).lower(),
-            "--ef", "rotation", f"{rotation:.2f}",
+            "--ei", "rotation", str(int(round(rotation)) % 360),
             "--ef", "zoom", f"{zoom:.2f}",
             "--ez", "flipX", str(flip_x).lower(),
             "--ez", "flipY", str(flip_y).lower(),

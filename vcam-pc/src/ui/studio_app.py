@@ -33,6 +33,7 @@ from ..adb import AdbController, AdbDevice
 from ..branding import BRAND, THEME
 from ..config import ProfileLibrary, StreamConfig
 from ..customer_devices import DeviceEntry, DeviceLibrary
+from ..encode_push_tasks import EncodePushRegistry, device_local_mp4
 from ..hook_mode import HookModePipeline, default_local_mp4
 from ..license_key import (
     LicenseError,
@@ -236,6 +237,16 @@ class StudioApp(ctk.CTk):
     WIDTH = 1100
     HEIGHT = 720
 
+    # ``reconnect_wifi`` consecutive-failure budget before the saved
+    # WiFi address is treated as stale and cleared from the library.
+    # Three matches the ``_WifiReconnector`` backoff threshold so the
+    # background poller and the dashboard manual-reconnect agree on
+    # when an IP is "dead enough" to give up on. Lower = clears too
+    # eagerly when WiFi is briefly flaky; higher = customer keeps
+    # mashing a button that's never going to work again because they
+    # rebooted the phone last week and DHCP issued a new IP.
+    WIFI_RECONNECT_FAIL_LIMIT = 3
+
     def __init__(
         self,
         port_override: int | None = None,
@@ -293,6 +304,26 @@ class StudioApp(ctk.CTk):
         self.selected_serial: str | None = None
         self._current_page: Optional[ctk.CTkFrame] = None
 
+        # Per-serial consecutive failure counter for the dashboard
+        # ``Reconnect WiFi`` button. Reset on success, incremented
+        # when both the saved-IP probe AND any USB-fallback re-tcpip
+        # fail. After ``WIFI_RECONNECT_FAIL_LIMIT`` strikes we drop
+        # the saved address so the UI flips back to "ตั้งค่า WiFi"
+        # and stops the customer from re-trying a dead IP forever.
+        self._wifi_reconnect_fails: dict[str, int] = {}
+
+        # Per-device encode + push task registry (v1.8.6).
+        # ``self.local_mp4`` was the single shared cache path used
+        # by the v1.8.5-and-earlier "one device at a time" flow;
+        # we keep it as a fallback for the legacy ``ui/app.py``
+        # window (kept under ``--legacy``) but the studio dashboard
+        # now allocates a per-serial cache via ``device_local_mp4``
+        # so several encodes can run in parallel without their
+        # ffmpeg children clobbering each other's bytes. The
+        # registry below tracks who's currently running so the
+        # dashboard button can reject double-clicks and the
+        # sidebar can render a per-device progress badge.
+        self.encode_tasks = EncodePushRegistry()
         self.local_mp4 = default_local_mp4(self.cfg)
 
         # ── poller
@@ -774,10 +805,10 @@ class StudioApp(ctk.CTk):
 
         from tkinter import messagebox
 
+        from ..config import DATA_ROOT
         from .._startup_diagnostic import DIAGNOSTIC_FILENAME
-        from ..config import PROJECT_ROOT
 
-        diag_path = PROJECT_ROOT / "logs" / DIAGNOSTIC_FILENAME
+        diag_path = DATA_ROOT / "logs" / DIAGNOSTIC_FILENAME
 
         self._adb_resolution_warned = True
         messagebox.showwarning(
@@ -978,19 +1009,133 @@ class StudioApp(ctk.CTk):
         )
 
     def reconnect_wifi(self, serial: str) -> tuple[bool, str]:
-        """Manual reconnect from the Dashboard. Tries the saved
-        ``IP:port`` for this entry. Returns ``(ok, thai_msg)``."""
+        """Manual reconnect from the Dashboard with smart fallback (v1.8.5).
+
+        Three-level recovery — designed around the observation that
+        the saved ``wifi_ip`` was captured at *patch time* and may be
+        days or weeks old by the time the customer hits this button.
+        DHCP renewals on phone reboot/WiFi reconnect routinely flip
+        the address (we've seen 6 stale entries in a 7-device library
+        from a single customer with the LAN's lease set to 24 h), so
+        a single ``adb connect`` against a frozen IP is the wrong
+        primitive to ship as the only recovery action.
+
+        Recovery ladder
+        ---------------
+
+        1. **Fast path** — ``adb connect <saved_ip>:<port>``. Wins in
+           the common case where the phone hasn't rebooted since
+           patch (~80 % of "the cable just dropped" reports).
+
+        2. **USB-assisted re-discovery** — if the phone is *also*
+           plugged in over USB right now, run the same
+           ``setup_wifi_after_patch`` plumbing the wizard uses:
+           re-read ``wlan0``'s current IP, re-run ``adb tcpip``,
+           and persist the fresh address. Customers patching today
+           will almost always fall here when their saved IP is
+           stale, because the cable is still plugged in from the
+           preceding patch step. One click → fresh IP → connected.
+
+        3. **Adaptive give-up** — track consecutive failures per
+           serial. After ``WIFI_RECONNECT_FAIL_LIMIT`` strikes, drop
+           the saved ``wifi_ip``. The dashboard refresh then flips
+           the button from "เชื่อม WiFi อีกครั้ง" to "ตั้งค่า WiFi",
+           which tells the customer in plain terms what they need
+           to do next (plug the cable back in for the wizard's
+           re-tcpip flow). Without this clearing step, the customer
+           would mash the same dead button forever, because every
+           ``adb connect`` to a non-existent host takes ~3 s and
+           still feels "responsive" — there's no obvious signal that
+           the IP itself has aged out.
+
+        Returns ``(ok, thai_msg)`` for the dashboard's status dialog.
+        """
         e = self.devices_lib.get(serial)
         if e is None or not e.has_wifi():
-            return False, "ยังไม่ได้ตั้งค่า WiFi — เสียบ USB แล้ว Patch ใหม่"
+            return False, (
+                "ยังไม่ได้ตั้งค่า WiFi — เสียบ USB แล้วกด '📶 ตั้งค่า WiFi'"
+            )
+
+        # ── 1. Fast path: try the saved IP ────────────────────────
         if wifi_adb.adb_connect(
             self.cfg.adb_path, e.wifi_ip, int(e.wifi_port or 5555),
         ):
+            self._wifi_reconnect_fails.pop(serial, None)
             return True, f"✅ เชื่อมต่อ WiFi สำเร็จ ({e.wifi_address()})"
+
+        # ── 2. USB-assisted re-discovery ──────────────────────────
+        # If USB transport is up right now, the customer is most
+        # likely in "just patched, cable still plugged" territory.
+        # Re-running ``adb tcpip`` is cheap (~2 s) and fixes the
+        # stale-IP problem at the source instead of just nagging
+        # the customer to "reboot phone + plug USB" (the old copy).
+        if self.transport_of(serial) == "usb":
+            log.info(
+                "WiFi reconnect: saved IP %s stale, attempting USB-assisted "
+                "re-discovery for %s",
+                e.wifi_ip, serial,
+            )
+            stale_ip = e.wifi_ip
+            msg = self.setup_wifi_after_patch(serial)
+            # ``setup_wifi_after_patch`` returns a Thai status string
+            # whose first emoji classifies the outcome:
+            #   ✅  full success (re-tcpip + adb connect verified)
+            #   📶  partial   (got fresh IP but not yet connected -
+            #                  cable still holding adbd in USB mode)
+            #   ⚠️  failure   (couldn't read wlan0 / tcpip rc!=0)
+            if msg.startswith("✅"):
+                self._wifi_reconnect_fails.pop(serial, None)
+                # Surface whatever fresh IP we actually landed on,
+                # not the (now-stale) IP the user clicked from.
+                refreshed = self.devices_lib.get(serial)
+                addr = (
+                    refreshed.wifi_address()
+                    if refreshed is not None and refreshed.has_wifi()
+                    else stale_ip
+                )
+                return True, (
+                    f"✅ เชื่อม WiFi สำเร็จที่ IP ใหม่ ({addr})\n"
+                    f"(IP เก่า {stale_ip} ใช้ไม่ได้แล้ว — ระบบอัปเดตให้เรียบร้อย)"
+                )
+            # Partial / fail — bubble the diagnostic up to the
+            # customer, but DON'T increment the fail counter:
+            # ``setup_wifi_after_patch`` already persisted whatever
+            # progress it made (e.g. fresher IP, mark_seen_via), so
+            # the next click has a real chance of succeeding without
+            # us nuking the saved IP prematurely.
+            return False, msg
+
+        # ── 3. Adaptive give-up: increment fail counter ───────────
+        fails = self._wifi_reconnect_fails.get(serial, 0) + 1
+        self._wifi_reconnect_fails[serial] = fails
+
+        if fails >= self.WIFI_RECONNECT_FAIL_LIMIT:
+            # Clear stale IP so the next dashboard refresh shows
+            # the "ตั้งค่า WiFi" button instead, and reset the
+            # counter for whenever the customer plugs the cable
+            # back in to re-pair.
+            self.devices_lib.clear_wifi(serial)
+            self.save_devices()
+            self._wifi_reconnect_fails.pop(serial, None)
+            log.info(
+                "WiFi reconnect: cleared stale IP for %s after %d failures",
+                serial, fails,
+            )
+            return False, (
+                f"❌ เชื่อม {e.wifi_address()} ไม่สำเร็จ {fails} ครั้งติด "
+                "— ลบ IP เก่าออกแล้ว\n\n"
+                "วิธีต่อ: เสียบสาย USB → กดปุ่ม '📶 ตั้งค่า WiFi' "
+                "(ปุ่มจะปรากฏแทนที่ปุ่มนี้)"
+            )
+
         return False, (
-            f"❌ เชื่อม {e.wifi_address()} ไม่สำเร็จ\n"
-            "• เช็คว่าโทรศัพท์อยู่วง WiFi เดียวกับคอม\n"
-            "• ลอง reboot โทรศัพท์แล้วเสียบ USB เพื่อ enable tcpip ใหม่"
+            f"❌ เชื่อม {e.wifi_address()} ไม่สำเร็จ "
+            f"({fails}/{self.WIFI_RECONNECT_FAIL_LIMIT})\n\n"
+            "วิธีแก้:\n"
+            "1. เสียบสาย USB เครื่องนี้\n"
+            "2. กดปุ่มนี้อีกครั้ง — ระบบจะอ่าน IP ใหม่ให้อัตโนมัติ\n\n"
+            "หรือเช็คว่าโทรศัพท์อยู่ LAN เดียวกับคอม (อาจ DHCP เปลี่ยน IP "
+            "หลัง phone reboot / WiFi reconnect)"
         )
 
     # ── selected device helpers ──────────────────────────────────
@@ -1009,6 +1154,18 @@ class StudioApp(ctk.CTk):
             return None
         return self.devices_lib.get(self.selected_serial)
 
+    def device_local_mp4(self, serial: str) -> Path:
+        """Per-serial MP4 cache path (v1.8.6+).
+
+        Two devices encoding at the same time get different output
+        files so libx264 can't race on the same descriptor — that
+        was the silent-corruption hazard that capped the v1.8.5
+        dashboard at one task at a time. Mirrors
+        ``hook_mode.default_local_mp4``'s ``cache/`` directory but
+        with a serial-derived filename suffix.
+        """
+        return device_local_mp4(self.cfg, serial)
+
     # ── persistence ──────────────────────────────────────────────
 
     def save_devices(self) -> None:
@@ -1020,6 +1177,50 @@ class StudioApp(ctk.CTk):
     # ── shutdown ─────────────────────────────────────────────────
 
     def _on_close(self) -> None:
+        # Cancel every in-flight encode/push BEFORE any other
+        # teardown so the pipeline's polling loops see the event
+        # and ``proc.kill()`` their ffmpeg / adb children. Without
+        # this step, daemon worker threads die when ``destroy()``
+        # exits the Tk mainloop but their subprocess children
+        # outlive the parent process — customers ended up with
+        # ghost ffmpeg encoders pinning a CPU core and orphaned
+        # ``adb push`` transfers blocking the next session's USB.
+        # See encode_push_runner cancellation contract.
+        try:
+            cancelled = self.encode_tasks.cancel_all_running()
+        except Exception:
+            log.exception("cancel_all_running failed during close")
+            cancelled = 0
+        if cancelled:
+            log.info(
+                "shutdown: signalled %d encode/push task(s) to cancel",
+                cancelled,
+            )
+            # Brief, bounded wait for daemon threads to drain. We
+            # do NOT block forever — if a worker is genuinely stuck
+            # we'd rather close the window than freeze the customer's
+            # exit. 3 s is enough for ffmpeg / adb to receive SIGKILL
+            # and for the runner thread to mark STATE_CANCELLED.
+            deadline = time.monotonic() + 3.0
+            drained = False
+            while time.monotonic() < deadline:
+                still_running = any(
+                    t.is_running() for t in self.encode_tasks.snapshot()
+                )
+                if not still_running:
+                    drained = True
+                    break
+                time.sleep(0.1)
+            if not drained:
+                log.warning(
+                    "shutdown: %d encode/push task(s) still running "
+                    "after 3s grace; closing anyway",
+                    sum(
+                        1 for t in self.encode_tasks.snapshot()
+                        if t.is_running()
+                    ),
+                )
+
         try:
             self._poller.stop()
         except Exception:

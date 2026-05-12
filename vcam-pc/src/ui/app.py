@@ -790,7 +790,11 @@ class VcamApp(tk.Tk):
             self.after(0, show)
         except Exception as e:
             log.exception("Go Live failed")
-            self.after(0, lambda: messagebox.showerror("vcam-pc", f"Go Live error:\n{e}"))
+            # Snapshot ``e`` into a default-arg so the lambda sees a
+            # captured value rather than referring to the (deleted)
+            # ``except as e`` name when it runs on the next Tk tick.
+            err_msg = f"Go Live error:\n{e}"
+            self.after(0, lambda m=err_msg: messagebox.showerror("vcam-pc", m))
             self.after(0, lambda: self.btn_go_live.config(state="normal"))
 
     # ── one-click "open the app on the phone" ──────────────────
@@ -1069,8 +1073,12 @@ class VcamApp(tk.Tk):
             self.after(0, self._refresh_hook_status)
         except Exception as e:
             log.exception("hook encode/push failed")
-            self.after(0, lambda: messagebox.showerror(
-                "vcam-pc — Hook Mode", f"Unexpected error:\n{e}",
+            # Same dead-name hazard as the Go Live handler above:
+            # capture ``e`` into a snapshot before the except block
+            # exits and Python 3 deletes the binding.
+            err_msg = f"Unexpected error:\n{e}"
+            self.after(0, lambda m=err_msg: messagebox.showerror(
+                "vcam-pc — Hook Mode", m,
             ))
         finally:
             self.after(0, lambda: self.btn_hook_encode.config(

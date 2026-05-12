@@ -58,7 +58,13 @@ class VCamModeReceiver : BroadcastReceiver() {
 
         intent?.let {
             VideoFeeder.loopEnabled = it.getBooleanExtra("loop", VideoFeeder.loopEnabled)
-            if (it.hasExtra("rotation")) VideoFeeder.rotationDegrees = it.getFloatExtra("rotation", 0f)
+            if (it.hasExtra("rotation")) {
+                val raw = it.extras?.get("rotation")
+                VideoFeeder.rotationDegrees = when (raw) {
+                    is Number -> raw.toFloat()
+                    else -> it.getFloatExtra("rotation", 0f)
+                }
+            }
             if (it.hasExtra("zoom")) VideoFeeder.zoomLevel = it.getFloatExtra("zoom", 1f)
             if (it.hasExtra("flipX")) VideoFeeder.flipX = it.getBooleanExtra("flipX", false)
             if (it.hasExtra("flipY")) VideoFeeder.flipY = it.getBooleanExtra("flipY", false)

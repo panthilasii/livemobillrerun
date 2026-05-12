@@ -12,7 +12,9 @@ Without on-disk logs there is nothing for the admin to read. The
 customer can describe the symptom but not the stack trace. So we:
 
 1. Configure a **rotating file handler** that writes structured
-   logs to ``PROJECT_ROOT/logs/npcreate.log`` for every run. Three
+   logs to ``<DATA_ROOT>/logs/npcreate.log`` for every run (on frozen
+   macOS ``DATA_ROOT`` is ``~/Library/Application Support/NP Create``
+   so App Translocation read-only mounts do not break startup). Three
    rotated copies of 5 MB each = ~20 MB total ceiling.
 2. Provide ``collect_diagnostic_zip()`` that bundles the recent
    logs + a sanitised system snapshot into a single ZIP the
@@ -56,13 +58,13 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .branding import BRAND
-from .config import PROJECT_ROOT
+from . import config as _cfg
 
 
 # ── locations ───────────────────────────────────────────────────
 
 
-LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR = _cfg.DATA_ROOT / "logs"
 LOG_FILE = LOG_DIR / "npcreate.log"
 
 # 5 MB per file × 3 backups = ~20 MB ceiling per install. The
@@ -221,7 +223,8 @@ def _system_info() -> dict:
         "platform": platform.platform(),
         "python": sys.version,
         "executable": sys.executable,
-        "project_root": str(PROJECT_ROOT),
+        "project_root": str(_cfg.PROJECT_ROOT),
+        "data_root": str(_cfg.DATA_ROOT),
         "log_file": str(LOG_FILE),
         "exported_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
@@ -320,7 +323,7 @@ def collect_diagnostic_zip(
 
         # 3) Redacted config.json
         if include_config:
-            cfg = _safe_read_json(PROJECT_ROOT / "config.json")
+            cfg = _safe_read_json(_cfg.CONFIG_PATH)
             if cfg is not None:
                 redacted = _redact_value("config", cfg)
                 zf.writestr(
@@ -333,7 +336,7 @@ def collect_diagnostic_zip(
         #    redact license_key but keep version + machine_id so
         #    the admin can debug "stuck activation" issues).
         for fname in ("activation.json",):
-            data = _safe_read_json(PROJECT_ROOT / fname)
+            data = _safe_read_json(_cfg.DATA_ROOT / fname)
             if data is not None:
                 zf.writestr(
                     f"{fname.replace('.json', '.redacted.json')}",
@@ -344,7 +347,7 @@ def collect_diagnostic_zip(
         # 5) Devices (NOT redacted -- serials are fine to share for
         #    support, and "ไม่เจอเครื่อง" investigations need them).
         if include_devices:
-            devs = _safe_read_json(PROJECT_ROOT / "customer_devices.json")
+            devs = _safe_read_json(_cfg.DATA_ROOT / "customer_devices.json")
             if devs is not None:
                 zf.writestr(
                     "customer_devices.json",

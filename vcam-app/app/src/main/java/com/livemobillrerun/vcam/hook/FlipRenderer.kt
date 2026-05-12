@@ -58,6 +58,29 @@ class FlipRenderer(
     @Volatile var mirrorV: Boolean = false
     @Volatile var zoom: Float = 1.0f
 
+    /**
+     * Offset baked into [rotationDegrees] for rear-facing injection only.
+     * When SET_MODE updates [CameraHook.liveRotationDegrees], we re-apply
+     * `liveRotationDegrees + rearLensExtraRotation` so the dashboard knob
+     * stays relative to an upright baseline (see [CameraHook]).
+     */
+    @Volatile var rearLensExtraRotation: Int = 0
+
+    /**
+     * When true, [mirrorH] is driven as `liveMirrorH != true` from SET_MODE
+     * — i.e. default horizontal flip matches front-camera (selfie) preview;
+     * user toggle "flip X" on the PC still inverts that baseline.
+     */
+    @Volatile var rearLensMirrorLikeFront: Boolean = false
+
+    /**
+     * After [SurfaceTexture.getTransformMatrix], multiply in a 180° fix in
+     * texture space for rear-lens injection: [rot180] * [texMatrix] so the
+     * OEM matrix applies to UVs first, then the upright correction (MVP-only
+     * rotation was insufficient on some TikTok / encoder pipelines).
+     */
+    @Volatile var rearLensCorrectTex180: Boolean = false
+
     private val thread = HandlerThread("vcam-fliprender").apply { start() }
     private val handler = Handler(thread.looper)
 
@@ -243,6 +266,17 @@ class FlipRenderer(
     private fun drawFrameInner(st: SurfaceTexture) {
         st.updateTexImage()
         st.getTransformMatrix(texMatrix)
+        if (rearLensCorrectTex180) {
+            val rot180 = FloatArray(16)
+            Matrix.setIdentityM(rot180, 0)
+            Matrix.rotateM(rot180, 0, 180f, 0f, 0f, 1f)
+            val combined = FloatArray(16)
+            // Texture coords: OEM/ST matrix first on samples, then 180° upright
+            // fix → combined = rot180 * texMatrix (see drawFrameInner comment
+            // above; texMatrix * rot180 left some rear-camera pipelines upside-down).
+            Matrix.multiplyMM(combined, 0, rot180, 0, texMatrix, 0)
+            System.arraycopy(combined, 0, texMatrix, 0, 16)
+        }
 
         // Build mvp = userTransform. Identity by default; user-set
         // rotation/mirror/zoom modify it in place.

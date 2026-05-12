@@ -84,18 +84,16 @@ def test_handles_broken_imports_gracefully():
         assert result is None
 
 
-def test_default_log_dir_is_project_root_logs(tmp_path):
+def test_default_log_dir_is_data_root_logs(tmp_path):
     """When no log_dir is passed, the diagnostic lands at
-    ``PROJECT_ROOT/logs/`` — same place as ``npcreate.log``, so
-    one ZIP from "Send Logs" picks up both files.
+    ``DATA_ROOT/logs/`` — same place as ``npcreate.log``.
     """
     from src import _startup_diagnostic, config
 
     fake_root = tmp_path / "fakeproj"
     fake_root.mkdir()
 
-    with mock.patch.object(config, "PROJECT_ROOT", fake_root):
-        # Reload the module's binding of PROJECT_ROOT.
+    with mock.patch.object(config, "DATA_ROOT", fake_root):
         import importlib
 
         importlib.reload(_startup_diagnostic)

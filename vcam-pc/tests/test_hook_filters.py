@@ -3,9 +3,9 @@
 The exact order of filters in the ``ffmpeg -vf`` chain is
 load-bearing for live-stream correctness:
 
-* ``hflip`` MUST run **before** ``transpose=1`` so the mirror axis
-  stays horizontal. Reversing the order rotates the flip axis 90°
-  and produces an upside-down picture once TikTok mirrors it back.
+* **Rear default:** ``transpose=1`` then ``vflip`` (no ``hflip``).
+* **Legacy front:** ``hflip`` MUST run **before** ``transpose=1`` so
+  the mirror axis stays horizontal in the source frame.
 * ``scale`` MUST run before ``pad`` so the letterboxing math works
   on the already-fitted frame; otherwise pad would crop or stretch.
 
@@ -35,7 +35,7 @@ def _profile() -> DeviceProfile:
 
 class TestVideoFilterOrdering:
     def test_hflip_precedes_transpose_when_mirror_on(self):
-        pipe = _pipeline(mirror_horizontal=True)
+        pipe = _pipeline(mirror_horizontal=True, hook_encode_rear_facing=False)
         vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
         assert "hflip" in vf, "mirror_horizontal=True must inject hflip"
         assert vf.index("hflip") < vf.index("transpose=1"), (
@@ -43,13 +43,20 @@ class TestVideoFilterOrdering:
             "axis horizontal in the source frame"
         )
 
-    def test_no_hflip_when_mirror_off(self):
-        pipe = _pipeline(mirror_horizontal=False)
+    def test_no_hflip_when_mirror_off_legacy(self):
+        pipe = _pipeline(mirror_horizontal=False, hook_encode_rear_facing=False)
         vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
         assert "hflip" not in vf, (
             "mirror_horizontal=False must skip hflip entirely"
         )
         assert "transpose=1" in vf, "transpose=1 is always required"
+        assert "vflip" not in vf, "legacy chain has no vflip"
+
+    def test_rear_facing_default_transpose2_then_vflip_no_hflip(self):
+        pipe = _pipeline()
+        vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
+        assert "hflip" not in vf
+        assert vf.index("transpose=2") < vf.index("vflip")
 
     def test_scale_precedes_pad(self):
         pipe = _pipeline()
@@ -75,11 +82,10 @@ class TestVideoFilterOrdering:
         assert cfg.encode_width == 1920
         assert cfg.encode_height == 1080
 
-    def test_default_mirror_is_on(self):
-        # Customers shipping to TikTok almost always need this; we
-        # default it on and let them turn it off in Settings.
+    def test_defaults_rear_hook_encode_path(self):
         cfg = StreamConfig()
-        assert cfg.mirror_horizontal is True
+        assert cfg.hook_encode_rear_facing is True
+        assert cfg.mirror_horizontal is False
 
     def test_filter_chain_resolution_propagates(self):
         # 720p preset.
