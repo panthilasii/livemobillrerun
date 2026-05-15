@@ -601,8 +601,22 @@ class CameraHook : IXposedHookLoadPackage {
         /** Horizontal flip baseline like TikTok front preview (selfie mirror). */
         mirrorLikeFrontCamera: Boolean = false,
     ): Surface? {
-        // Re-use an existing renderer if we already wrapped this surface.
-        FlipRenderer.instances[outputSurface]?.let { return it.inputSurface }
+        // Re-use an existing renderer if we already wrapped this
+        // surface — but only if its inputSurface is still live. v1.8.16
+        // belt-and-braces: stopAnyInjectionFor now removes the entry on
+        // facing change, so in normal flow this branch is reached only
+        // when the same Surface is wrapped twice in a row without an
+        // intervening stop. Still, on some OEMs we've seen TikTok
+        // recycle MediaCodec encoder surfaces in odd orders during
+        // Live re-init, which leaves a stale entry. Drop it and rebuild
+        // rather than handing MediaPlayer a released Surface.
+        FlipRenderer.instances[outputSurface]?.let { existing ->
+            val input = existing.inputSurface
+            if (input != null && input.isValid) return input
+            FlipRenderer.instances.remove(outputSurface)
+            runCatching { existing.stop() }
+            log("🧹 dropped stale FlipRenderer for $outputSurface (rebuilding)")
+        }
         // NB: we used to call FlipRenderer.stopOthers() here to keep
         // memory bounded, but that killed the preview pipeline the
         // moment TikTok created a *second* encoder for Live broadcast
@@ -760,9 +774,22 @@ class CameraHook : IXposedHookLoadPackage {
      *
      * Safe to call on a Surface that was never wrapped — both
      * lookups return null and the method becomes a no-op.
+     *
+     * **v1.8.16:** Removes the entry from [FlipRenderer.instances] up-front
+     * (using [MutableMap.remove] rather than `[…]` lookup) so a later
+     * [wrapWithFlipRenderer] call on the same Surface starts fresh.
+     * Before this fix, repeatedly flipping front↔rear during Live left
+     * the map pointing at an already-`stop()`'d renderer whose
+     * `inputSurface` had been `release()`'d — the next wrap would hand
+     * MediaPlayer a dead Surface, the player would loop on
+     * OnErrorListener with exponential backoff (up to 30 s), and the
+     * customer saw "system frozen" on the encoded feed. Symmetrically
+     * cleans up any [StreamReceiver] holding [surface] so its
+     * decoder thread doesn't keep writing into a Surface the real
+     * camera now owns.
      */
     private fun stopAnyInjectionFor(surface: Surface) {
-        val fr = FlipRenderer.instances[surface]
+        val fr = FlipRenderer.instances.remove(surface)
         if (fr != null) {
             // Stop the MediaPlayer first so its callbacks can't
             // race with the renderer teardown — VideoFeeder.stopFor
@@ -776,6 +803,14 @@ class CameraHook : IXposedHookLoadPackage {
             // No FlipRenderer wrap — but the camera/preview path
             // may have fed the surface directly. Stop just in case.
             VideoFeeder.stopFor(surface)
+        }
+        // v1.8.16: TCP path symmetry — without this, a StreamReceiver
+        // decoder thread keeps pushing H.264 frames into a Surface
+        // the camera now owns, racing SurfaceFlinger and freezing
+        // the encoder on the next rear-cam toggle.
+        StreamReceiver.instances.remove(surface)?.let { rx ->
+            runCatching { rx.stop() }
+                .onFailure { log("StreamReceiver.stop() failed on $surface: $it") }
         }
     }
 

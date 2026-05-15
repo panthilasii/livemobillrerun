@@ -126,8 +126,30 @@ class FlipRenderer(
         }
     }
 
+    /**
+     * Tear down EGL, release SurfaceTexture/Surface, and quit the
+     * render thread. **Blocks** the caller for up to 2 s waiting for
+     * teardown to actually finish.
+     *
+     * v1.8.16: the previous fire-and-forget shape (`handler.post` then
+     * `quitSafely` and return) raced with the next [setupGl] when the
+     * customer flipped front↔rear faster than the handler thread could
+     * drain. The next FlipRenderer would call
+     * `eglCreateWindowSurface(outputSurface)` while we still owned the
+     * EGL window on the *same* Android Surface — some drivers returned
+     * `EGL_BAD_NATIVE_WINDOW`, others silently produced a black
+     * encoder feed. Mirroring the latch pattern from [start] keeps the
+     * 2 s upper bound so a misbehaving driver still can't deadlock the
+     * camera hook thread.
+     */
     fun stop() {
-        handler.post { teardownGl() }
+        val latch = java.util.concurrent.CountDownLatch(1)
+        handler.post {
+            try { teardownGl() } finally { latch.countDown() }
+        }
+        runCatching {
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        }
         thread.quitSafely()
     }
 
