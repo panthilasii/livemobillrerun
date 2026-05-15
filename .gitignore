@@ -49,6 +49,12 @@ vcam-app/app/build/
 *.aab
 *.keystore
 !vcam-magisk/module/keystore.example
+# Local-only APK rollback snapshots + apksigner artefacts.
+# We keep the *current* signed APK in apk/ but ignore version-tagged
+# backups (created by the release script) and the .idsig signature
+# blocks that apksigner writes next to every signed APK.
+apk/*.bak.*
+apk/*.idsig
 
 # Magisk module build artifacts
 vcam-magisk/dist/
