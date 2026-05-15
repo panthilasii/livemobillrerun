@@ -290,6 +290,24 @@ class StudioApp(ctk.CTk):
         self._adb_resolution_warned = False
         self.after(800, self._check_adb_or_warn)
 
+        # Pre-warm Gatekeeper / SmartScreen on the bundled JDK so
+        # the customer's first ``Patch & ติดตั้ง TikTok`` click
+        # doesn't pay the 10-30 s cold-start cost. The JDK lives
+        # under ``.tools/<os>/jdk-21/`` and on first launch the OS
+        # walks every ``Contents/Home/lib/*.dylib`` (macOS) or
+        # ``bin/*.dll`` (Windows) checking notarization / MOTW.
+        # That verdict is cached for the rest of the boot. By
+        # firing ``java -version`` in a daemon thread *now* (as the
+        # window opens), the cache is hot well before the customer
+        # navigates to the Dashboard. v1.8.13 fix for "tools fail
+        # check on first patch" reports across both Win + Mac.
+        try:
+            from ..lspatch_pipeline import warm_up_java
+            from .. import platform_tools as _pt
+            warm_up_java(_pt.find_java())
+        except Exception:
+            log.debug("java warm-up dispatch failed", exc_info=True)
+
         # ── runtime state
         self.license: VerifiedLicense | None = None
         self.activation: dict | None = None
@@ -779,6 +797,13 @@ class StudioApp(ctk.CTk):
         broke and where the diagnostic file lives. Without this,
         the wizard's Step 2 just shows "🔄 รอเครื่อง" forever and
         the customer pings support with "doesn't work".
+
+        The dialog adapts per-OS so the cause-hint + help steps
+        actually point at the right knob:
+
+        * Windows → Defender quarantine + VC++ Redistributable
+        * macOS   → Gatekeeper + ``chmod +x`` + "Allow Anyway"
+        * Linux   → ``chmod +x`` + libc / executable-flag mismatch
         """
         if self._adb_resolution_warned:
             return
@@ -787,18 +812,54 @@ class StudioApp(ctk.CTk):
         except Exception:
             adb_path = None  # type: ignore[assignment]
 
+        import sys as _sys
+        is_windows = _sys.platform.startswith("win")
+        is_macos = _sys.platform == "darwin"
+        adb_name = "adb.exe" if is_windows else "adb"
+
+        if is_windows:
+            cause_hint = (
+                " แต่รันไม่ได้ (อาจถูก antivirus กักหรือ\n"
+                "ขาด Visual C++ Redistributable)"
+            )
+            help_steps = (
+                "1. รีสตาร์ทเครื่อง แล้วเปิด NP Create อีกครั้ง\n"
+                f"2. ตรวจสอบว่า Windows Defender ไม่กัก {adb_name}"
+                " ไว้\n3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+        elif is_macos:
+            cause_hint = (
+                " แต่รันไม่ได้ (อาจถูก macOS Gatekeeper บล็อก\n"
+                "หรือไฟล์ไม่มี execute permission)"
+            )
+            help_steps = (
+                f'1. เปิด Terminal แล้วพิมพ์:  chmod +x "<path>/'
+                f'{adb_name}'
+                '"\n   (path เห็นข้างบน) แล้วเปิด NP Create อีกครั้ง\n'
+                "2. ถ้ายังไม่ผ่าน ลอง: System Settings → Privacy & Security\n"
+                f"   → กด 'Allow Anyway' ถ้าเห็นการบล็อก {adb_name}"
+                "\n3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+        else:
+            cause_hint = (
+                " แต่รันไม่ได้ (ตรวจสอบ execute permission\n"
+                "หรือ libc/library version ไม่ตรง)"
+            )
+            help_steps = (
+                f'1. ลอง:  chmod +x "<path>/{adb_name}'
+                '"  ตามตำแหน่งข้างบน\n'
+                "2. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+            )
+
         broken_reason: str | None = None
         if not adb_path or (
             adb_path.is_absolute() and not adb_path.is_file()
         ):
             broken_reason = (
-                f"ไม่พบ adb.exe ที่ตำแหน่ง:\n  {adb_path}"
+                f"ไม่พบ {adb_name} ที่ตำแหน่ง:\n  {adb_path}"
             )
         elif not self.adb.is_available():
-            broken_reason = (
-                "พบ adb.exe แต่รันไม่ได้ (อาจถูก antivirus กักหรือ\n"
-                "ขาด Visual C++ Redistributable)"
-            )
+            broken_reason = f"พบ {adb_name}{cause_hint}"
 
         if broken_reason is None:
             return
@@ -814,13 +875,12 @@ class StudioApp(ctk.CTk):
         messagebox.showwarning(
             "NP Create — adb ไม่พร้อมใช้งาน",
             (
-                "ไม่สามารถใช้งาน adb.exe ที่บันเดิลมาในโปรแกรมได้ครับ\n"
+                f"ไม่สามารถใช้งาน {adb_name}"
+                " ที่บันเดิลมาในโปรแกรมได้ครับ\n"
                 "หน้า 'เพิ่มเครื่อง' จะค้างที่ 'รอเครื่อง...' เพราะเหตุนี้\n\n"
                 f"{broken_reason}\n\n"
                 "วิธีช่วยแก้ไข\n"
-                "1. รีสตาร์ทเครื่อง แล้วเปิด NP Create อีกครั้ง\n"
-                "2. ตรวจสอบว่า Windows Defender ไม่กัก adb.exe ไว้\n"
-                "3. ส่งไฟล์ diagnostic ให้แอดมิน:\n"
+                f"{help_steps}"
                 f"   {diag_path}\n\n"
                 "ติดต่อ Line OA: @npcreate"
             ),
@@ -1248,5 +1308,66 @@ class StudioApp(ctk.CTk):
             scrcpy_mirror.stop_all()
         except Exception:
             log.exception("scrcpy mirror cleanup on shutdown failed")
+        # Apply prefetched patch right before destroying the window
+        # so the *next* launch boots on the new version. The customer
+        # gets to skip the explicit "อัปเดตเลย" click when they
+        # opted in to install-on-close in Settings.
+        try:
+            self._apply_update_on_close_if_ready()
+        except Exception:
+            log.exception("install-on-close hook")
         self.save_devices()
         self.destroy()
+
+    def _apply_update_on_close_if_ready(self) -> None:
+        """Apply a prefetched patch on close when the customer
+        opted in via Settings → "ติดตั้งตอนปิดโปรแกรม". Returns
+        silently if the toggle is off, no manifest is in hand, no
+        cached zip is on disk, or the cached zip is the wrong sha
+        (``find_cached_patch`` handles the sha check + cleanup).
+        """
+        try:
+            from .. import auto_update, update_prefs
+        except Exception:
+            log.exception("install-on-close: prefs load failed")
+            return
+        try:
+            prefs = update_prefs.UpdatePrefs.load()
+        except Exception:
+            log.exception("install-on-close: prefs load failed")
+            return
+        if not prefs.install_on_close:
+            return
+
+        manifest = getattr(self, "_latest_update", None)
+        if manifest is None:
+            return
+        if getattr(manifest, "kind", None) != "source":
+            return
+
+        try:
+            cached = auto_update.find_cached_patch(manifest)
+        except Exception:
+            log.exception("install-on-close: find_cached_patch failed")
+            return
+
+        if cached is None:
+            log.info(
+                "install-on-close: no cached patch for v%s — skipping",
+                manifest.version,
+            )
+            return
+
+        log.info(
+            "install-on-close: applying prefetched patch v%s",
+            manifest.version,
+        )
+        try:
+            auto_update.apply_patch(cached)
+        except Exception:
+            log.exception("install-on-close: apply_patch failed")
+            return
+        log.info(
+            "install-on-close: applied — next launch will run v%s",
+            manifest.version,
+        )

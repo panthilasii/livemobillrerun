@@ -155,6 +155,36 @@ def _write_unsafe(log_dir: Path | None) -> Path | None:
         kv(name, r)
     w()
 
+    # ── jdk health (no subprocess — safe even when java hangs) ───
+    w("JDK health")
+    w("-" * 40)
+    try:
+        from .lspatch_pipeline import jdk_diagnostic
+        info = jdk_diagnostic(platform_tools.find_java())
+        kv("java.path", info["java_path"] or "(not found)")
+        kv("java.exists", info["java_exists"])
+        kv("jdk.root", info["jdk_root"] or "(unknown)")
+        # jvm size sanity-check: Adoptium Temurin 21 ships a
+        # ~17 MB libjvm — anything <1 MB usually means AV
+        # quarantined or truncated the file mid-extract.
+        kv("jvm.size_bytes", info["jvm_size"])
+        if 0 < info["jvm_size"] < 1_000_000:
+            kv("  WARNING", "jvm too small — likely truncated by AV")
+        kv("cloud_sync_in_path", info["cloud_sync"] or "(local disk)")
+        if info["cloud_sync"]:
+            kv("  HINT", "move folder off cloud-sync to local disk")
+        kv("non_ascii_in_path", info["non_ascii_path"])
+        if info["non_ascii_path"]:
+            kv("  HINT", "move folder to ASCII-only path (e.g. C:\\NP-Create\\)")
+        kv("java_dll_present", info["java_dll_present"])
+        if info["java_exists"] and not info["java_dll_present"] \
+                and platform_tools.current_os() == "windows":
+            kv("  HINT", "java.dll missing — likely AV quarantined or "
+                        "extracted with non-Unicode-aware tool")
+    except Exception as exc:
+        kv("jdk diagnostic error", repr(exc))
+    w()
+
     # ── adb live test ────────────────────────────────────────────
     w("ADB liveness test")
     w("-" * 40)

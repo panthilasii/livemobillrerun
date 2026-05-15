@@ -130,6 +130,103 @@ def run_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_writable_install_location() -> bool:
+    """Detect a read-only install location (a customer running
+    NP-Create.app straight from the mounted .dmg) and refuse to
+    boot.
+
+    Why this exists
+    ---------------
+    The whole app — logs, config.json, device_profiles.json,
+    license activation ledger, update cache, sqlite — writes
+    relative to ``PROJECT_ROOT``. If the customer double-clicks
+    NP-Create.app while it's still inside the .dmg volume (which
+    macOS mounts read-only), the first ``logs/`` mkdir explodes
+    with ``OSError: [Errno 30] Read-only file system`` and they
+    see a stack-trace popup. The fix everyone expects on macOS
+    is the same as OBS / Discord / Notion: a clear dialog telling
+    them to drag the app to /Applications/ first.
+
+    Returns ``True`` when the install location is writable (boot
+    should continue). Returns ``False`` when it isn't (caller
+    must exit).
+
+    Skipped entirely in dev mode (``sys.frozen`` is False) so
+    running ``python -m src.main`` from the source tree keeps
+    working even on a read-only checkout.
+    """
+    if not getattr(sys, "frozen", False):
+        return True
+
+    looks_like_volume = str(PROJECT_ROOT).startswith("/Volumes/")
+    probe = PROJECT_ROOT / ".npcreate-writable-probe"
+    try:
+        probe.write_bytes(b"")
+        # Best-effort cleanup; failure here is harmless.
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return True
+    except OSError as exc:
+        # errno 30 = read-only filesystem, 13 = permission denied
+        if exc.errno not in (30, 13):
+            # Some other I/O glitch — don't block the launch on it.
+            return True
+
+    if looks_like_volume:
+        title = "NP Create — กรุณาติดตั้งก่อนเปิดใช้งาน"
+        message = (
+            "ตอนนี้คุณกำลังเปิด NP Create จากในแผ่นภาพดิสก์ (.dmg)\n"
+            "ซึ่งเป็นพื้นที่อ่านอย่างเดียว ทำให้โปรแกรมเขียน\n"
+            "ค่าตั้งค่า / log / cache ไม่ได้\n\n"
+            "วิธีติดตั้งให้ถูกต้อง:\n"
+            "  1. ลาก  NP-Create  ใส่ทางลัด  Applications  ในหน้าต่างเดียวกัน\n"
+            "  2. ปิดหน้าต่างนี้ (Eject) แผ่นภาพดิสก์\n"
+            "  3. เปิด  NP-Create  จาก  /Applications/  (Launchpad / Finder)\n\n"
+            "โปรแกรมจะปิดตัวเองตอนนี้ — เปิดอีกครั้งหลังลากเสร็จได้เลยครับ"
+        )
+    else:
+        title = "NP Create — กรุณาติดตั้งก่อนเปิดใช้งาน"
+        message = (
+            "NP Create ติดตั้งอยู่ในตำแหน่งที่เขียนไฟล์ไม่ได้:\n  "
+            f"{PROJECT_ROOT}"
+            "\n\nกรุณาย้ายโปรแกรมไป /Applications/ หรือโฟลเดอร์ที่\n"
+            "เขียนได้ก่อนเปิดใช้งานครับ"
+        )
+
+    # Build a transient Tk root just for the dialog. Customtkinter is
+    # heavier than we need here and slow to import; vanilla tkinter
+    # ships with the Python bundle.
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showwarning(title, message)
+        root.destroy()
+    except Exception:
+        # If even tkinter is unavailable, fall back to stderr so the
+        # message at least makes it into Console.app / Event Viewer.
+        sys.stderr.write(f"{title}\n\n{message}\n")
+
+    if looks_like_volume:
+        # Helper: open /Applications/ in Finder so the customer can
+        # drag the .app there without hunting for it.
+        import subprocess
+        try:
+            subprocess.run(
+                ["open", "/Applications/"],
+                check=False,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    return False
+
+
 def run_studio(args: argparse.Namespace) -> int:
     # Imported lazily so the heavier customtkinter import doesn't
     # slow down --cli launches.
@@ -154,6 +251,12 @@ def run_legacy(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     _setup_logging(args.verbose)
+
+    # macOS .dmg footgun guard: refuse to boot when PROJECT_ROOT is
+    # on a read-only mount. We do this *before* the diagnostic write
+    # because that itself would crash on the .dmg.
+    if not _check_writable_install_location():
+        return 1
 
     # Always emit a startup diagnostic. This is the file we ask
     # customers to send when "the wizard never finds my phone" —

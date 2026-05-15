@@ -141,6 +141,20 @@ class DeviceEntry:
     # only had ``patched_at`` filled — kept here so dashboards
     # that sort by "newest" don't get confused by NULL values.
     created_at: str = ""
+    # ── Live clip visibility (v1.8.15) ──────────────────────────
+    # Mirrors the broadcast we last fired to the hook for THIS
+    # device: True = ``SET_MODE`` mode 2 (replace camera with clip),
+    # False = ``SET_MODE`` mode 0 (passthrough, show the real
+    # camera). The PC client toggles this independently of the
+    # push pipeline so the customer can hide the clip mid-live
+    # without re-encoding or re-pushing the MP4.
+    #
+    # Persisted so reopening the desktop app restores the right
+    # button label ("⏸ หยุดแสดงคลิป" vs "▶ แสดงคลิป") even if the
+    # phone has rebooted since (the hook will be re-armed at the
+    # state we last asked for, not the state the phone happens to
+    # be in right now).
+    clip_showing: bool = True
 
     def display_name(self) -> str:
         return self.label or self.model or self.serial
@@ -240,6 +254,7 @@ class DeviceLibrary:
                     transport=str(raw.get("transport", "usb") or "usb"),
                     vcam_app_key=str(raw.get("vcam_app_key", "")),
                     created_at=str(raw.get("created_at", "")),
+                    clip_showing=bool(raw.get("clip_showing", True)),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)

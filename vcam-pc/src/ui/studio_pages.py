@@ -1059,14 +1059,28 @@ class DashboardPage(ctk.CTkFrame):
         _muted(
             act,
             f"Encode คลิปเป็น MP4 {portrait_w}×{portrait_h} + push เข้าเครื่อง. "
-            "TikTok ในโทรศัพท์จะดึงไฟล์นี้ขึ้นไลฟ์.",
+            "TikTok ในโทรศัพท์จะดึงไฟล์นี้ขึ้นไลฟ์. "
+            "ถ้าเลือกคลิปผิด — กด ยกเลิก ระหว่าง encode หรือ push ได้",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
 
+        encode_row = ctk.CTkFrame(act, fg_color="transparent")
+        encode_row.grid(row=2, column=0, sticky="ew", padx=20, pady=4)
+        encode_row.grid_columnconfigure(0, weight=1)
+
         self.btn_encode_push = _primary_button(
-            act, "▶  Encode + Push",
+            encode_row, "▶  Encode + Push",
             command=self._on_encode_push,
         )
-        self.btn_encode_push.grid(row=2, column=0, sticky="ew", padx=20, pady=4)
+        self.btn_encode_push.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.btn_encode_cancel = _danger_button(
+            encode_row,
+            "■  ยกเลิก",
+            command=self._on_encode_cancel,
+            width=100,
+            state="disabled",
+        )
+        self.btn_encode_cancel.grid(row=0, column=1, sticky="e")
 
         self.progress = ctk.CTkProgressBar(
             act, progress_color=THEME.primary,
@@ -3147,11 +3161,23 @@ class DashboardPage(ctk.CTkFrame):
                         "ระบบจะตรวจจับเครื่องที่เสียบ USB อีกครั้งภายใน 1-2 วินาที",
                     )
                 else:
+                    # v1.8.x: prefer the controller's detailed
+                    # ``last_restart_error`` (names the specific
+                    # process holding port 5037 if we could find
+                    # it) over the legacy generic blurb. The
+                    # generic text is only useful when the holder
+                    # probe also failed.
+                    detail = getattr(
+                        self.app.adb, "last_restart_error", "",
+                    ) or (
+                        "ลองปิดโปรแกรมที่ใช้ ADB อยู่ "
+                        "(scrcpy / Android Studio / Vysor / "
+                        "Bluestacks / MEmu / Microsoft Phone Link) "
+                        "แล้วลองกดปุ่มนี้อีกครั้ง"
+                    )
                     messagebox.showwarning(
-                        "ผิดพลาด",
-                        "รีสตาร์ท ADB ไม่สำเร็จ\n"
-                        "ลองปิดโปรแกรมที่ใช้ ADB อยู่ (scrcpy / Android Studio "
-                        "/ Vysor) แล้วลองกดปุ่มนี้อีกครั้ง",
+                        "รีสตาร์ท ADB ไม่สำเร็จ",
+                        detail,
                     )
 
             self.after(0, _show_result)
@@ -3496,6 +3522,17 @@ class DashboardPage(ctk.CTkFrame):
             name=f"encode-push-{e.serial}",
         ).start()
 
+    def _on_encode_cancel(self) -> None:
+        """Stop encode/push for the selected device (wrong clip picked)."""
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        task = self.app.encode_tasks.get(e.serial)
+        if task is None or not task.is_running():
+            return
+        task.request_cancel()
+        log.info("encode-push cancel requested for %s", e.serial)
+
     def _run_encode_push(self, task: EncodePushTask, profile) -> None:
         """Worker-thread body. The runner does all the heavy
         lifting; we just bridge its updates back to the Tk loop."""
@@ -3598,6 +3635,7 @@ class DashboardPage(ctk.CTkFrame):
             self.btn_encode_push.configure(
                 state="disabled", text="กำลังเตรียม…",
             )
+            self.btn_encode_cancel.configure(state="normal")
             self.progress.set(0.0)
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.fg_secondary,
@@ -3609,6 +3647,7 @@ class DashboardPage(ctk.CTkFrame):
                 else "กำลัง push…"
             )
             self.btn_encode_push.configure(state="disabled", text=label)
+            self.btn_encode_cancel.configure(state="normal")
             self.progress.set(task.progress)
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.fg_secondary,
@@ -3618,6 +3657,7 @@ class DashboardPage(ctk.CTkFrame):
             self.btn_encode_push.configure(
                 state="normal", text="▶  Encode + Push",
             )
+            self.btn_encode_cancel.configure(state="disabled")
             self.progress.set(1.0)
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.success,
@@ -3627,6 +3667,7 @@ class DashboardPage(ctk.CTkFrame):
             self.btn_encode_push.configure(
                 state="normal", text="▶  Encode + Push (ลองใหม่)",
             )
+            self.btn_encode_cancel.configure(state="disabled")
             self.progress.set(0.0)
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.danger,
@@ -3640,6 +3681,7 @@ class DashboardPage(ctk.CTkFrame):
             self.btn_encode_push.configure(
                 state="normal", text="▶  Encode + Push",
             )
+            self.btn_encode_cancel.configure(state="disabled")
             self.progress.set(0.0)
             self.lbl_encode_status.configure(
                 text=task.message, text_color=THEME.fg_muted,
@@ -3651,6 +3693,7 @@ class DashboardPage(ctk.CTkFrame):
         self.btn_encode_push.configure(
             state="normal", text="▶  Encode + Push",
         )
+        self.btn_encode_cancel.configure(state="disabled")
         self.progress.set(0.0)
         self.lbl_encode_status.configure(
             text="พร้อม", text_color=THEME.fg_muted,
@@ -5543,9 +5586,12 @@ class WizardPage(ctk.CTkFrame):
                         "ถ้ามี popup 'อนุญาต' บนมือถือ ให้กด อนุญาต และติ๊ก 'จดจำเสมอ'",
                     )
                 else:
+                    detail = getattr(
+                        self.app.adb, "last_restart_error", "",
+                    ) or "ลองปิดเปิดโปรแกรมใหม่ — ถ้ายังไม่ได้แจ้ง support"
                     messagebox.showerror(
                         "รีสตาร์ท ADB ไม่สำเร็จ",
-                        "ลองปิดเปิดโปรแกรมใหม่ — ถ้ายังไม่ได้แจ้ง support",
+                        detail,
                     )
                 # Reset the 15-s timer for the driver-help nudge so
                 # the customer can decide if they need to escalate.
@@ -6072,9 +6118,20 @@ class SettingsPage(ctk.CTkFrame):
         support_card.grid_columnconfigure(0, weight=1)
         self._build_support_card(support_card)
 
+        # Update card (v1.8.13) — manual update check + auto-prefetch
+        # toggle + install-on-close. The auto-update poller still
+        # fires every 6 h in the background (see ``UpdatePoller`` in
+        # ``auto_update``), but this card gives the customer:
+        #   1. visibility ("ตรวจล่าสุด X นาทีที่แล้ว"), and
+        #   2. control ("ตรวจเลย" / two opt-in toggles).
+        update_card = _card(body)
+        update_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
+        update_card.grid_columnconfigure(0, weight=1)
+        self._build_update_settings_card(update_card)
+
         # About card
         about_card = _card(body)
-        about_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
+        about_card.grid(row=6, column=0, sticky="ew", padx=40, pady=10)
         about_card.grid_columnconfigure(0, weight=1)
 
         _h2(about_card, "เกี่ยวกับ").grid(
@@ -6377,6 +6434,19 @@ class SettingsPage(ctk.CTkFrame):
             width=180,
         ).pack(side="left", padx=(0, 8))
 
+        # คู่มือ -- opens the public Drive folder with the latest
+        # customer-facing manual + tutorial clips. Hosted on Drive
+        # (not bundled in-app) so the admin can update artwork +
+        # screenshots without shipping a new desktop build.
+        _ghost_button(
+            btns, "📖  คู่มือ",
+            command=lambda: webbrowser.open(
+                "https://drive.google.com/drive/folders/"
+                "1l-V0ZWWdGP5rQcqt3OQbuhmagFO2WZvE"
+            ),
+            width=120,
+        ).pack(side="left", padx=(0, 8))
+
         # Status line under the buttons; we re-use it for both
         # success ("เซฟไว้ที่ ...") and failure messages so the
         # customer always gets feedback in the same spot.
@@ -6571,6 +6641,219 @@ class SettingsPage(ctk.CTkFrame):
             "ปิดโปรแกรมแล้วเปิดใหม่ — License และรายการเครื่องจะถูกโหลด\n"
             "ตามที่เก็บไว้ใน Backup",
         )
+
+    # ── auto-update card ──────────────────────────────────────────
+    def _build_update_settings_card(self, parent: ctk.CTkFrame) -> None:
+        """Manual update check + auto-prefetch toggle + install-on-close.
+
+        The auto-update poller still fires every 6 h in the background
+        (see ``UpdatePoller`` in ``auto_update``), but Pack A gives
+        the customer:
+
+        1. Visibility — ``ตรวจล่าสุด X นาที/ชั่วโมง/วันที่แล้ว``
+           so a customer who's offline knows when the last poll ran.
+        2. Manual probe — ``🔍 ตรวจอัปเดตเลย`` fires ``poll_now``
+           on a worker thread, so they don't wait the full 6 h cycle.
+        3. Opt-in toggles — auto-prefetch (download in the background
+           when banner appears) + install-on-close (apply on next exit
+           without an explicit click).
+        """
+        _h2(parent, "🔄 อัปเดตโปรแกรม").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(20, 4),
+        )
+
+        # Current version + last-check timestamp.
+        info_row = ctk.CTkFrame(parent, fg_color="transparent")
+        info_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+        info_row.grid_columnconfigure(1, weight=1)
+
+        self._update_version_label = ctk.CTkLabel(
+            info_row,
+            text=f"เวอร์ชันปัจจุบัน: {BRAND.version}",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=13),
+            anchor="w",
+        )
+        self._update_version_label.grid(row=0, column=0, sticky="w")
+
+        self._update_lastcheck_label = ctk.CTkLabel(
+            info_row,
+            text="ตรวจล่าสุด: ยังไม่เคยตรวจ",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+        )
+        self._update_lastcheck_label.grid(
+            row=1, column=0, sticky="w", pady=(2, 0),
+        )
+
+        # Manual check button.
+        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 8))
+
+        self._update_check_btn = _primary_button(
+            btn_row,
+            "🔍  ตรวจอัปเดตเลย",
+            command=self._on_manual_update_check,
+        )
+        self._update_check_btn.pack(side="left")
+
+        self._update_check_status = ctk.CTkLabel(
+            btn_row,
+            text="",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=12),
+        )
+        self._update_check_status.pack(side="left", padx=(12, 0))
+
+        # Load current prefs to seed the toggles.
+        try:
+            from ..update_prefs import UpdatePrefs
+            self._update_prefs_cls = UpdatePrefs
+            self._update_prefs = UpdatePrefs.load()
+        except Exception:
+            log.exception("update_prefs load failed in settings card")
+            self._update_prefs_cls = None
+            self._update_prefs = None
+
+        # Toggle: auto-prefetch.
+        self._prefetch_var = tk.BooleanVar(
+            value=getattr(self._update_prefs, "auto_prefetch", True),
+        )
+        prefetch_cb = ctk.CTkCheckBox(
+            parent,
+            text="ดาวน์โหลดอัปเดตล่วงหน้า (กดติดตั้งแล้วเร็วทันที)",
+            variable=self._prefetch_var,
+            command=self._on_prefetch_toggle,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=13),
+        )
+        prefetch_cb.grid(row=3, column=0, sticky="w", padx=20, pady=(4, 0))
+
+        # Toggle: install-on-close.
+        self._install_close_var = tk.BooleanVar(
+            value=getattr(self._update_prefs, "install_on_close", False),
+        )
+        install_cb = ctk.CTkCheckBox(
+            parent,
+            text="ติดตั้งตอนปิดโปรแกรม (ไม่ขัดงานระหว่างใช้งาน)",
+            variable=self._install_close_var,
+            command=self._on_install_close_toggle,
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=13),
+        )
+        install_cb.grid(row=4, column=0, sticky="w", padx=20, pady=(2, 4))
+
+        # Helper text under the install-on-close toggle so the
+        # customer knows what "ปิดโปรแกรม" actually triggers.
+        _muted(
+            parent,
+            "เมื่อกดปุ่ม × ปิดหน้าต่าง โปรแกรมจะติดตั้งอัปเดตที่ดาวน์โหลด\n"
+            "ไว้แล้วก่อน — รอบหน้าเปิดมาเป็นเวอร์ชันใหม่อัตโนมัติ",
+        ).grid(row=5, column=0, sticky="w", padx=20, pady=(0, 20))
+
+        # Initial timestamp paint.
+        self._refresh_update_lastcheck()
+
+    def _format_relative_th(self, ts: float) -> str:
+        """Render the prefs timestamp into Thai-friendly relative
+        copy. We avoid ``relativedelta`` to keep dependencies stdlib
+        only — the resolution we surface is "minutes / hours / days
+        / never" which is enough for "เมื่อวานยังไม่ได้ตรวจเลย" vs
+        "เพิ่งตรวจไปสักครู่"."""
+        if not ts:
+            return "ยังไม่เคยตรวจ"
+        import time as _time
+        delta = max(0, int(_time.time() - ts))
+        if delta < 60:
+            return f"{delta} วินาทีที่แล้ว"
+        if delta < 3600:
+            return f"{delta // 60} นาทีที่แล้ว"
+        if delta < 86400:
+            return f"{delta // 3600} ชั่วโมงที่แล้ว"
+        return f"{delta // 86400} วันที่แล้ว"
+
+    def _refresh_update_lastcheck(self) -> None:
+        try:
+            prefs = self._update_prefs
+            if prefs is None:
+                return
+            ts = float(getattr(prefs, "last_check_ts", 0) or 0)
+            self._update_lastcheck_label.configure(
+                text=f"ตรวจล่าสุด: {self._format_relative_th(ts)}",
+            )
+        except Exception:
+            log.exception("refresh update last-check label")
+
+    def _on_prefetch_toggle(self) -> None:
+        prefs = self._update_prefs
+        if prefs is None or self._update_prefs_cls is None:
+            return
+        prefs.auto_prefetch = bool(self._prefetch_var.get())
+        prefs.save()
+
+    def _on_install_close_toggle(self) -> None:
+        prefs = self._update_prefs
+        if prefs is None or self._update_prefs_cls is None:
+            return
+        prefs.install_on_close = bool(self._install_close_var.get())
+        prefs.save()
+
+    def _on_manual_update_check(self) -> None:
+        """Manual probe: kick the poller AND fire a one-shot
+        synchronous fetch from a worker thread (so the UI doesn't
+        freeze on the network call). The poller's ``poll_now``
+        deduplicates against the last-seen-version so a manual
+        click followed by the next 6 h tick won't re-fire the
+        banner if nothing changed."""
+        poller = getattr(self.app, "update_poller", None)
+        if poller is None:
+            self._update_check_status.configure(text="(ปิด auto-update ไว้)")
+            return
+
+        self._update_check_btn.configure(state="disabled")
+        self._update_check_status.configure(text="กำลังตรวจสอบ...")
+
+        def worker() -> None:
+            try:
+                poller.poll_now()
+            except Exception:
+                log.exception("manual update check failed")
+            try:
+                if self._update_prefs is not None:
+                    self._update_prefs.mark_checked()
+            except Exception:
+                log.exception("mark_checked failed")
+            try:
+                self.app.after(0, self._on_manual_check_done)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=worker,
+            name="np-settings-check-update",
+            daemon=True,
+        ).start()
+
+    def _on_manual_check_done(self) -> None:
+        # Re-enable the button + refresh the relative timestamp.
+        try:
+            self._update_check_btn.configure(state="normal")
+        except Exception:
+            pass
+        # Refresh prefs from disk so the new ``last_check_ts`` shows.
+        try:
+            if self._update_prefs_cls is not None:
+                self._update_prefs = self._update_prefs_cls.load()
+        except Exception:
+            log.exception("update_prefs load failed; assuming defaults")
+        self._refresh_update_lastcheck()
+        # Clear the spinner copy. The actual banner (if there's an
+        # update) is rendered by DashboardPage.set_update, not here.
+        try:
+            self._update_check_status.configure(text="")
+        except Exception:
+            pass
 
     def _kv(
         self,
