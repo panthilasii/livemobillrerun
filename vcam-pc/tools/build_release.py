@@ -174,15 +174,26 @@ SHIP_TOOLS_PATTERNS = (
                                         # the in-app auto-installer (still
                                         # works, just needs internet on
                                         # first Mirror click).
-    "adb-driver/",                      # Google USB Driver (~9 MB,
-                                        # Windows only) — bundled INF
-                                        # so the in-app help dialog
-                                        # (WizardPage._show_driver_help)
-                                        # can point Device Manager at
-                                        # a known-good local folder
-                                        # without an internet round-
-                                        # trip. v1.7.11 fix for
-                                        # "Mac เทสได้แต่ Windows ไม่ได้"
+    "adb-driver/",                      # Google USB Driver (~9 MB)
+                                        # *plus* ClockworkMod's
+                                        # Universal ADB Driver MSI
+                                        # (~16 MB) — both Windows-
+                                        # only. The Google INF
+                                        # covers VID 18D1 only; the
+                                        # MSI maps OPPO/Realme/
+                                        # OnePlus (22D9), Xiaomi
+                                        # (2717), Samsung (04E8),
+                                        # Vivo (2D95) and ~30 more
+                                        # VIDs onto WinUSB in one
+                                        # signed installer. v1.8.18
+                                        # added the MSI after
+                                        # customers on OPPO CPH2735
+                                        # reported "Mac เทสได้แต่
+                                        # Windows ไม่ได้" — the
+                                        # generic Google driver had
+                                        # no entry for BBK's 22D9
+                                        # VID so adb.exe never saw
+                                        # the phone.
     "mediamtx/",                        # MediaMTX RTMP server (~26 MB)
                                         # — powers v1.8.0's "Mode B"
                                         # no-USB live path (PC →
@@ -733,11 +744,16 @@ def build_one(target: str, os_name: str, dist: Path) -> Path:
                 )
             if os_name == "windows":
                 drv_inf = tools_dir / "adb-driver" / "usb_driver" / "android_winusb.inf"
-                if not drv_inf.is_file():
+                drv_msi = tools_dir / "adb-driver" / "UniversalAdbDriverSetup.msi"
+                if not drv_inf.is_file() or not drv_msi.is_file():
                     print(
-                        "   [!] .tools/windows/adb-driver/ missing — Xiaomi/Redmi\n"
-                        "       customers will be stuck on \"Allow USB Debugging\"\n"
-                        "       prompt without an OEM driver. To bundle, run:\n"
+                        "   [!] .tools/windows/adb-driver/ incomplete:\n"
+                        f"       Google INF      : {'OK' if drv_inf.is_file() else 'MISSING'}\n"
+                        f"       Universal MSI   : {'OK' if drv_msi.is_file() else 'MISSING'}\n"
+                        "       Customers on OPPO / Realme / OnePlus / Xiaomi / Samsung\n"
+                        "       will be stuck on \"Allow USB Debugging\" without the\n"
+                        "       Universal MSI (Google's INF only covers VID 18D1).\n"
+                        "       To bundle, run:\n"
                         "          python tools/setup_ci_tools.py --os windows --skip platform-tools --skip jdk --skip lspatch --skip ffmpeg",
                         file=sys.stderr,
                     )

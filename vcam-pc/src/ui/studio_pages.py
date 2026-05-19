@@ -5658,16 +5658,28 @@ class WizardPage(ctk.CTkFrame):
         macOS ships ADB-over-USB support in the kernel, so customers
         who developed/tested NP Create on Mac never hit the driver
         layer. On Windows, **every** USB-Android connection requires
-        an OEM-signed INF — Pixel, Xiaomi, Samsung, etc. all need
-        their own. Without one, the phone shows up under "Other
-        devices" with a yellow ⚠ in Device Manager and ``adb
-        devices`` returns an empty list. That's exactly the
+        an OEM-signed INF — Pixel, Xiaomi, Samsung, OPPO etc. all
+        need their own. Without one, the phone shows up under
+        "Other devices" with a yellow ⚠ in Device Manager and
+        ``adb devices`` returns an empty list. That's exactly the
         "phone won't connect" symptom the customer reported.
 
-        We bundle Google's signed USB driver as a generic fallback
-        (covers Pixel + most modern WCID-friendly Androids), and
-        link out to OEM downloads for brands where the bundled
-        one is too old (notably Xiaomi/Redmi running HyperOS).
+        v1.8.18: Universal ADB Driver MSI as primary path
+        -------------------------------------------------
+        Original v1.7.11 plan bundled Google's ``android_winusb.inf``
+        as a "generic" fallback, but Google's INF only covers VID
+        ``18D1`` (Pixel / Nexus) — every OPPO / Realme / OnePlus
+        customer (BBK Electronics VID ``22D9``) silently failed on
+        Windows even though the same phones worked on Mac. The OPPO
+        Reno13 (CPH2735) field report is what flushed this out.
+
+        Fix: bundle ClockworkMod's signed Universal ADB Driver MSI
+        alongside the Google INF. The MSI maps **all major Android
+        VIDs** (22D9, 2717, 04E8, 2D95, 18D1 …) to WinUSB in one go,
+        so customers no longer have to guess which OEM driver to
+        download. The MSI takes priority in the UI; the Google INF
+        and OEM-specific download links stay as fall-backs for
+        corporate Windows builds that block MSI execution.
         """
         import os as _os
         import subprocess as _sub
@@ -5677,6 +5689,7 @@ class WizardPage(ctk.CTkFrame):
         from .. import platform_tools
 
         driver_dir = platform_tools.find_adb_driver_dir()
+        universal_msi = platform_tools.find_universal_adb_driver_msi()
 
         win = ctk.CTkToplevel(self)
         win.title("ลง driver USB สำหรับ Windows")
@@ -5684,7 +5697,9 @@ class WizardPage(ctk.CTkFrame):
         win.transient(self.winfo_toplevel())
         win.grab_set()
         win.resizable(False, False)
-        win.geometry("640x520")
+        # Bigger height — extra OEM-fallback buttons need the room
+        # and Tk auto-grow inside CTk frames is unreliable on Win11.
+        win.geometry("640x680")
 
         wrap = ctk.CTkFrame(win, fg_color=THEME.bg_card, corner_radius=12)
         wrap.pack(fill="both", expand=True, padx=16, pady=16)
@@ -5696,8 +5711,10 @@ class WizardPage(ctk.CTkFrame):
 
         _muted(
             wrap,
-            "Windows ต้องลง driver USB ของยี่ห้อโทรศัพท์ก่อน adb ถึงจะเห็น\n"
-            "เครื่อง (Mac ไม่ต้อง — มี driver มาในตัว)",
+            "Windows ต้องลง driver USB ก่อน adb ถึงจะเห็นเครื่อง\n"
+            "(Mac ไม่ต้อง — มี driver มาในตัว)\n\n"
+            "ปุ่มแรกข้างล่าง ลง 'Universal Driver' ครั้งเดียวรองรับ\n"
+            "ทุกยี่ห้อ — OPPO, Realme, OnePlus, Xiaomi, Samsung, Vivo, Pixel",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
 
         steps = ctk.CTkFrame(wrap, fg_color=THEME.bg_input, corner_radius=8)
@@ -5705,12 +5722,14 @@ class WizardPage(ctk.CTkFrame):
         ctk.CTkLabel(
             steps,
             text=(
-                "ขั้นตอนแก้ (เครื่อง Xiaomi / Redmi / POCO):\n"
-                "1.  เปิด \"การตั้งค่านักพัฒนา\" บนมือถือ\n"
-                "2.  เปิด USB Debugging  +  USB Debugging (Security settings)\n"
-                "3.  เสียบ USB → เลือกโหมด \"File transfer / MTP\" (ห้าม Charging)\n"
-                "4.  ลง driver โดยกดปุ่มด้านล่าง → ถอด/เสียบ USB ใหม่\n"
-                "5.  มือถือจะมี popup \"อนุญาต USB Debugging\" — กด Allow"
+                "ขั้นตอนแก้ (ทำตามนี้ตามลำดับ):\n"
+                "1.  บนมือถือ: เปิด \"ตัวเลือกผู้พัฒนา\" + USB Debugging\n"
+                "2.  เสียบสาย USB → เลือกโหมด \"File Transfer / MTP\"\n"
+                "    (ห้ามเลือก 'ชาร์จเท่านั้น')\n"
+                "3.  PC: กดปุ่มสีฟ้าด้านล่าง → ลง Universal Driver\n"
+                "4.  รอจน Windows ขึ้น 'Installation succeeded'\n"
+                "5.  ถอด-เสียบสายใหม่ → มือถือเด้ง popup \"อนุญาต\"\n"
+                "    → ✅ ติ๊ก \"จดจำเสมอ\" + กด อนุญาต"
             ),
             text_color=THEME.fg_secondary,
             font=ctk.CTkFont(size=12),
@@ -5718,14 +5737,61 @@ class WizardPage(ctk.CTkFrame):
             anchor="w",
         ).pack(fill="x", padx=14, pady=12)
 
-        # ── action buttons ───────────────────────────────────────
+        # ── action helpers ───────────────────────────────────────
         actions = ctk.CTkFrame(wrap, fg_color="transparent")
         actions.grid(row=3, column=0, sticky="ew", padx=20, pady=(4, 12))
         actions.grid_columnconfigure(0, weight=1)
 
+        def _run_universal_msi() -> None:
+            """Launch ``msiexec /i UniversalAdbDriverSetup.msi`` on
+            Windows so the customer doesn't have to find the MSI in
+            Explorer and double-click it. Falls back to opening the
+            folder on non-Windows (admin testing the dialog on Mac)
+            and on missing-MSI cases (legacy ZIP)."""
+            if universal_msi is None:
+                messagebox.showwarning(
+                    "ไม่พบ Universal ADB Driver",
+                    "โปรแกรมตัวนี้ build ก่อน v1.8.18 จึงไม่ได้บันเดิล MSI มา\n"
+                    "ดาวน์โหลดได้จาก  https://adb.clockworkmod.com/\n\n"
+                    "หรือใช้ driver โฟลเดอร์ที่บันเดิลมา (ปุ่ม 'เปิดโฟลเดอร์')\n"
+                    "แล้ว Update Driver ผ่าน Device Manager แทน",
+                )
+                return
+            if _sys.platform != "win32":
+                # Admin smoke-testing the dialog on Mac/Linux —
+                # just open the folder so they can see the MSI.
+                try:
+                    _sub.Popen(
+                        ["open" if _sys.platform == "darwin" else "xdg-open",
+                         str(universal_msi.parent)],
+                    )
+                except Exception:
+                    pass
+                messagebox.showinfo(
+                    "Universal ADB Driver (admin preview)",
+                    f"MSI พร้อมใช้ที่:\n{universal_msi}\n\n"
+                    "ปุ่มนี้จะรัน msiexec บน Windows จริงเท่านั้นครับ",
+                )
+                return
+            try:
+                # ``start /wait`` keeps the dialog modal-ish from the
+                # customer's POV — they see the MSI wizard complete
+                # before our Toplevel comes back to the foreground.
+                _sub.Popen(
+                    ["msiexec", "/i", str(universal_msi)],
+                    shell=False,
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "เปิด installer ไม่ได้",
+                    f"รัน msiexec ไม่สำเร็จ:\n{exc}\n\n"
+                    f"ลองดับเบิ้ลคลิกไฟล์เองที่:\n{universal_msi}",
+                )
+
         def _open_driver_folder() -> None:
             """Open the bundled-driver folder in Windows Explorer so
-            the customer can right-click the .inf and "Install"."""
+            the customer can right-click the .inf and "Install"
+            (fallback for the rare cases where the MSI is blocked)."""
             if driver_dir is None:
                 messagebox.showwarning(
                     "ไม่พบ driver บันเดิล",
@@ -5736,11 +5802,11 @@ class WizardPage(ctk.CTkFrame):
             try:
                 if _sys.platform == "win32":
                     _os.startfile(str(driver_dir))  # type: ignore[attr-defined]
+                elif _sys.platform == "darwin":
+                    _sub.Popen(["open", str(driver_dir)])
                 else:
                     _sub.Popen(["xdg-open", str(driver_dir)])
             except Exception:
-                # If startfile crashes (rare), at least show the
-                # path so the customer can paste it into Explorer.
                 messagebox.showinfo(
                     "ตำแหน่ง driver",
                     f"คัดลอก path นี้ไปวางในช่อง Address ของ\n"
@@ -5750,7 +5816,7 @@ class WizardPage(ctk.CTkFrame):
         def _open_device_manager() -> None:
             """Spawn Device Manager so the customer can do
             'Update driver' → 'Browse my computer' against the
-            bundled folder."""
+            bundled folder (fallback for MSI-blocked environments)."""
             if _sys.platform != "win32":
                 return
             try:
@@ -5762,46 +5828,105 @@ class WizardPage(ctk.CTkFrame):
                     "เลือก Device Manager แทนครับ",
                 )
 
+        # OEM-specific download links. Used only when the Universal
+        # MSI fails to bind (rare — corporate AD policies that block
+        # signed MSIs, or very old MIUI 10 builds that need Mi's
+        # OEM-signed driver explicitly).
+        def _open_oppo_driver_dl() -> None:
+            """OPPO / Realme / OnePlus all share BBK's VID 22D9.
+            The OPPO USB Driver page covers the whole BBK family."""
+            _wb.open("https://adb-tool.com/oppo-usb-driver/")
+
         def _open_mi_driver_dl() -> None:
-            """OEM-signed Mi USB driver covers older MIUI 10–13
-            devices that the Google generic driver can't bind to.
-            Opens the official Xiaomi download page."""
+            """Mi USB Driver — needed for MIUI 10–13 phones that
+            won't bind to the Universal driver."""
             _wb.open(
                 "https://www.mi.com/global/service/support/usb-driver.html"
             )
 
+        def _open_samsung_driver_dl() -> None:
+            """Samsung Android USB Driver — official Samsung
+            developer page (signed)."""
+            _wb.open("https://developer.samsung.com/android-usb-driver")
+
+        # ── primary action ───────────────────────────────────────
+        # The Universal driver is the high-value action — make it
+        # visually distinct (primary blue button) and put it at the
+        # very top of the actions panel.
         _primary_button(
             actions,
-            "📂  เปิดโฟลเดอร์ driver ที่บันเดิลมา",
-            command=_open_driver_folder,
-        ).grid(row=0, column=0, sticky="ew", pady=4)
+            "🚀  ลง Universal ADB Driver (รองรับทุกยี่ห้อ)",
+            command=_run_universal_msi,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
+        # Inline help under the primary button so first-time users
+        # know what to expect (Windows Security prompt + ClockworkMod
+        # certificate name).
+        _muted(
+            actions,
+            "(จะมีหน้าต่าง 'Windows Security' ขึ้น — กด Install)",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        # ── fall-back actions ────────────────────────────────────
         _ghost_button(
             actions,
-            "🔧  เปิด Device Manager",
+            "🔧  เปิด Device Manager (ถ้า MSI ใช้ไม่ได้)",
             command=_open_device_manager,
-        ).grid(row=1, column=0, sticky="ew", pady=4)
-
-        _ghost_button(
-            actions,
-            "🔗  ดาวน์โหลด Mi USB Driver (ถ้า driver ที่บันเดิลใช้ไม่ได้)",
-            command=_open_mi_driver_dl,
         ).grid(row=2, column=0, sticky="ew", pady=4)
 
         _ghost_button(
-            actions, "ปิดหน้าต่างนี้", command=win.destroy,
-        ).grid(row=3, column=0, sticky="ew", pady=(12, 4))
+            actions,
+            "📂  เปิดโฟลเดอร์ driver ที่บันเดิลมา",
+            command=_open_driver_folder,
+        ).grid(row=3, column=0, sticky="ew", pady=4)
 
-        if driver_dir is None:
+        # OEM-specific links — collapsed under a label to keep the
+        # primary path obvious. Used only when the Universal MSI
+        # fails (rare, but happens with locked-down corporate Win10).
+        ctk.CTkLabel(
+            actions,
+            text="ถ้า Universal driver ใช้ไม่ได้ ลอง OEM driver:",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="w", pady=(12, 2))
+
+        _ghost_button(
+            actions,
+            "🔗  OPPO / Realme / OnePlus USB Driver",
+            command=_open_oppo_driver_dl,
+        ).grid(row=5, column=0, sticky="ew", pady=2)
+
+        _ghost_button(
+            actions,
+            "🔗  Xiaomi / Redmi / POCO — Mi USB Driver",
+            command=_open_mi_driver_dl,
+        ).grid(row=6, column=0, sticky="ew", pady=2)
+
+        _ghost_button(
+            actions,
+            "🔗  Samsung Android USB Driver",
+            command=_open_samsung_driver_dl,
+        ).grid(row=7, column=0, sticky="ew", pady=2)
+
+        _ghost_button(
+            actions, "ปิดหน้าต่างนี้", command=win.destroy,
+        ).grid(row=8, column=0, sticky="ew", pady=(12, 4))
+
+        # Path hints — kept at the bottom in muted text so the
+        # support team can debug "did this customer actually get
+        # the new bundle?" from a screenshot.
+        if universal_msi is None and driver_dir is None:
             _muted(
                 wrap,
-                "(ไม่พบ driver บันเดิล — โปรแกรมตัวนี้ build ก่อน v1.7.11\n"
+                "(ไม่พบ driver บันเดิล — โปรแกรมตัวนี้ build ก่อน v1.8.18\n"
                 " ส่งข้อความให้แอดมิน Line @npcreate ได้เลยครับ)",
             ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 12))
         else:
             _muted(
                 wrap,
-                f"driver path: {driver_dir}",
+                (f"MSI: {universal_msi}\n" if universal_msi else "MSI: (ไม่มี)\n")
+                + (f"INF: {driver_dir}" if driver_dir else "INF: (ไม่มี)"),
             ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 12))
 
     # ── step 3 — patch ───────────────────────────────────────────

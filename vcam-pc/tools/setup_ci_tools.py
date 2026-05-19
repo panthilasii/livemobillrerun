@@ -170,6 +170,33 @@ GOOGLE_USB_DRIVER_URL = (
     "https://dl.google.com/android/repository/usb_driver_r13-windows.zip"
 )
 
+# ClockworkMod *Universal* ADB Driver — single MSI that maps **all
+# major Android VIDs** (Google 18D1, OPPO/Realme/OnePlus 22D9,
+# Xiaomi 2717, Samsung 04E8, Vivo 2D95, plus ~30 more) to WinUSB.
+# Distributed as a signed MSI via the koush/adb.clockworkmod.com
+# GitHub release channel (homepage: https://adb.clockworkmod.com/).
+#
+# Why we ship this *in addition to* Google's android_winusb.inf
+# -------------------------------------------------------------
+# Google's INF only covers VID 18D1 (Pixel/Nexus). Customers on
+# every other brand — OPPO, Realme, OnePlus, Xiaomi, Samsung,
+# Vivo — would otherwise need to download an OEM-specific driver
+# (Mi USB Driver, Samsung USB Driver, OPPO USB Driver, etc.) and
+# guess which one to install. The Universal MSI removes that
+# guesswork. We keep the Google INF too because some locked-down
+# corporate Win10 builds reject MSIs but allow .inf side-loading.
+#
+# Customer flow inside NP Create:
+#
+#     Settings -> Driver Help -> "ลง Universal ADB Driver"
+#       -> msiexec /i UniversalAdbDriverSetup.msi
+#       -> Windows Security prompt (signed by ClockworkMod)
+#       -> replug USB; adb devices now sees the phone
+UNIVERSAL_ADB_DRIVER_URL = (
+    "https://github.com/koush/adb.clockworkmod.com/releases/latest/"
+    "download/UniversalAdbDriverSetup.msi"
+)
+
 # MediaMTX — single-binary RTMP/RTSP/HLS server (Go). Powers
 # v1.8.0's "Mode B" no-USB live path: the customer installs a
 # Play-Store virtual-cam app (CameraFi/Larix/DU Recorder) on
@@ -504,6 +531,23 @@ def install_adb_driver(os_name: str, force: bool) -> None:
     print(f"  [OK] installed {dest_dir.relative_to(WORKSPACE)} "
           f"({size_mb:,.1f} MB)")
 
+    # Also fetch ClockworkMod's Universal ADB Driver MSI — see the
+    # docstring on UNIVERSAL_ADB_DRIVER_URL for why this is the
+    # *primary* path we point customers at now. The MSI lives
+    # alongside Google's ``usb_driver/`` inside ``adb-driver/`` so
+    # ``find_universal_adb_driver_msi()`` can resolve it without an
+    # extra subdirectory.
+    msi_dst = dest_dir / "UniversalAdbDriverSetup.msi"
+    if msi_dst.is_file() and not force:
+        size_mb = msi_dst.stat().st_size / 1024 / 1024
+        print(f"  [OK] Universal ADB Driver MSI cached "
+              f"({size_mb:,.1f} MB)")
+    else:
+        print("  -> downloading ClockworkMod Universal ADB Driver MSI")
+        _safe_download(UNIVERSAL_ADB_DRIVER_URL, msi_dst)
+        size_mb = msi_dst.stat().st_size / 1024 / 1024
+        print(f"  [OK] Universal ADB Driver MSI ({size_mb:,.1f} MB)")
+
 
 def install_mediamtx(os_name: str, force: bool) -> None:
     """Drop the MediaMTX binary + a stub config under
@@ -603,6 +647,10 @@ def _verify(os_name: str) -> int:
         checks.append((
             "adb-driver/.../inf",
             base / "adb-driver" / "usb_driver" / "android_winusb.inf",
+        ))
+        checks.append((
+            "universal driver",
+            base / "adb-driver" / "UniversalAdbDriverSetup.msi",
         ))
     else:
         # Adoptium macOS layout: jdk-21/Contents/Home/bin/java

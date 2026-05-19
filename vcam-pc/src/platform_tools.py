@@ -362,6 +362,11 @@ def find_adb_driver_dir() -> Path | None:
     (``ui.studio_pages.WizardPage._show_driver_help``) opens this
     folder via Explorer / shows the path so non-technical users
     don't have to navigate the install tree manually.
+
+    For the brand-agnostic / OPPO / Realme / OnePlus / Vivo /
+    Samsung / Xiaomi case use :func:`find_universal_adb_driver_msi`
+    — Google's INF only covers VID 18D1 (Pixel / Nexus) and is
+    useless for everyone else.
     """
     if not is_windows():
         return None
@@ -373,6 +378,57 @@ def find_adb_driver_dir() -> Path | None:
     if inf is None:
         return None
     return inf.parent.resolve()
+
+
+def find_universal_adb_driver_msi() -> Path | None:
+    """Locate the bundled ClockworkMod *Universal* ADB Driver MSI
+    (Windows-only). macOS / Linux callers always get ``None``.
+
+    Why this is the *primary* driver path now (v1.8.18)
+    ---------------------------------------------------
+    Google's ``android_winusb.inf`` only covers VID ``18D1``
+    (Pixel / Nexus), so on Windows it fails silently for every
+    other brand:
+
+    =================  ======  ===============================
+    Brand              VID     Covered by Google INF?
+    =================  ======  ===============================
+    OPPO / Realme /    22D9    no  ← BBK Electronics
+      OnePlus
+    Xiaomi / Redmi /   2717    no  (needs Mi USB Driver)
+      POCO
+    Samsung            04E8    no  (needs Samsung USB Driver)
+    Vivo               2D95    no
+    Pixel / Nexus      18D1    yes
+    =================  ======  ===============================
+
+    The Universal ADB Driver
+    (https://github.com/koush/UniversalAdbDriver, signed MSI
+    distributed via the ClockworkMod release channel) ships an
+    INF that maps all of the above VIDs (plus ~30 more) onto
+    WinUSB in one go, so customers can stop guessing which OEM
+    driver to download.
+
+    Bundle path::
+
+        .tools/windows/adb-driver/UniversalAdbDriverSetup.msi
+
+    Customer flow::
+
+        Settings ▸ Driver Help ▸ "ลง Universal ADB Driver"
+            → msiexec /i UniversalAdbDriverSetup.msi
+            → Windows Security prompt ("ClockworkMod" cert)
+            → reboot not required; replug USB → adb devices works
+
+    Returns the absolute MSI path, or ``None`` if the bundle is
+    missing (older customer ZIP built before this knob existed,
+    or admin host hasn't run ``setup_windows_tools.py`` yet).
+    """
+    if not is_windows():
+        return None
+    return _first_existing([
+        "adb-driver/UniversalAdbDriverSetup.msi",
+    ])
 
 
 def find_scrcpy() -> Path | None:
