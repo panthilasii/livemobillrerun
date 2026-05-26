@@ -447,9 +447,40 @@ class HookModePipeline:
             if getattr(self.cfg, "mirror_horizontal", True):
                 vf.append("hflip")
             vf.append("transpose=1")
+        # Color-aware scale (v1.8.19):
+        #
+        # * ``flags=lanczos+full_chroma_int+full_chroma_inp``
+        #   — Lanczos resampling (sharpest separable downscale)
+        #   plus full-precision chroma resampling. Without the
+        #   chroma flags libswscale defaults to 8-bit chroma
+        #   interpolation, which smears red/blue edges and
+        #   crushes saturated text. With them, chroma stays at
+        #   full 16-bit precision through the filter chain.
+        #
+        # * ``in_color_matrix=auto:out_color_matrix=bt709``
+        #   — libswscale picks the matrix from the source's
+        #   tagged metadata (or guesses from height), and ALWAYS
+        #   outputs BT.709. Combined with the ``-colorspace
+        #   bt709`` flag downstream, this makes sure the entire
+        #   pipeline speaks one color matrix and Android's
+        #   MediaCodec never has to guess. Without this,
+        #   un-tagged 1080p sources are sometimes decoded as
+        #   BT.601 on ColorOS / MIUI / OneUI, which is the
+        #   "ผิวเหลืองซีดเหมือนป่วย" customer complaint we got
+        #   pre-v1.8.19.
+        #
+        # * ``in_range=auto:out_range=tv`` — Same idea for
+        #   limited (16-235) vs full (0-255) range. We always
+        #   emit TV range because that's what every Android
+        #   MediaCodec expects; if the source was in PC range,
+        #   the scaler does the contraction correctly instead
+        #   of leaving the encoder to clip blacks/whites.
         vf.append(
             f"scale={out_w}:{out_h}:"
-            "force_original_aspect_ratio=decrease:flags=lanczos"
+            "force_original_aspect_ratio=decrease:"
+            "flags=lanczos+full_chroma_int+full_chroma_inp:"
+            "in_color_matrix=auto:out_color_matrix=bt709:"
+            "in_range=auto:out_range=tv"
         )
         vf.append(f"fps={self.cfg.fps}")
         vf.append(
@@ -557,25 +588,70 @@ class HookModePipeline:
         if max_seconds > 0:
             cmd += ["-t", str(max_seconds)]
 
+        # v1.8.19: switched from CBR ``-b:v 2000k`` veryfast/baseline
+        # to CRF 18 medium/high. Same source, 3× larger file, but
+        # the customer's "ผิวเหลือง/ขอบเลอะ/ภาพเบลอ" complaint goes
+        # away because:
+        #
+        #   * CRF assigns bits by motion complexity, so high-motion
+        #     scenes get the budget they need; static scenes don't
+        #     waste bits. The result is consistent perceived
+        #     sharpness across the whole clip.
+        #   * ``high`` profile enables CABAC + B-frames (15-25 %
+        #     better compression efficiency at the same quality
+        #     vs ``baseline``).
+        #   * ``medium`` preset improves motion estimation enough
+        #     that the encoder stops smearing fast-moving edges.
+        #   * Explicit BT.709 color tagging tells Android's
+        #     MediaCodec which color matrix to use during decode;
+        #     without it ColorOS / MIUI guess wrong on un-tagged
+        #     1080p sources and we get the "ผิวเหลืองซีด" symptom.
+        #   * ``-x264-params`` re-asserts the colormatrix inside
+        #     the H.264 VUI so even players that ignore container
+        #     metadata still decode in BT.709.
+        crf = max(0, min(51, int(getattr(self.cfg, "encode_crf", 18))))
+        preset = getattr(self.cfg, "encode_preset", "medium") or "medium"
+        profile = getattr(self.cfg, "encode_profile", "high") or "high"
         cmd += [
             "-vf", ",".join(vf),
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-profile:v", "baseline",
-            "-level", "4.0",
+            "-preset", preset,
+            "-profile:v", profile,
+            # Level 4.1 covers 1080p @ up to 12 Mbps; level 4.0
+            # tops out at 10 Mbps which our new maxrate exceeds.
+            "-level", "4.1",
             "-pix_fmt", "yuv420p",
             "-r", str(self.cfg.fps),
             "-g", str(keyint),
             "-keyint_min", str(keyint),
             "-sc_threshold", "0",
-            "-b:v", self.cfg.video_bitrate,
+            # CRF as primary rate control; -maxrate caps spikes so
+            # a 60-s clip never blows up to 200 MB on a high-motion
+            # scene. Bufsize is 2× maxrate per x264's rate-control
+            # guidance.
+            "-crf", str(crf),
             "-maxrate", self.cfg.video_maxrate,
             "-bufsize", self.cfg.video_bufsize,
+            # ── Color metadata (v1.8.19) ────────────────────────
+            # Container-level tags + H.264 VUI so every decoder
+            # on the planet knows this stream is BT.709 limited
+            # range. Pre-v1.8.19 we shipped un-tagged streams and
+            # MIUI / ColorOS sometimes decoded them as BT.601 →
+            # visible green/yellow skin-tone shift.
+            "-color_range", "tv",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-x264-params",
+            "colormatrix=bt709:colorprim=bt709:transfer=bt709",
             # Audio — TikTok expects audio. Re-encode to AAC LC.
+            # 192 kbps / 48 kHz matches Android MediaCodec's native
+            # path; 44.1 kHz used to force an extra resample on
+            # the phone which sometimes inserted clicks under load.
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             "-ac", "2",
-            "-ar", "44100",
+            "-ar", "48000",
             # MP4 with moov-at-front for streaming-friendly playback.
             "-movflags", "+faststart",
             "-f", "mp4",

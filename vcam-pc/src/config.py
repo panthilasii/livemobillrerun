@@ -112,9 +112,47 @@ class StreamConfig:
     # MediaTek Redmi/Poco phones. Set false in ``config.json`` for the
     # legacy front-camera ``hflip`` + ``transpose=1`` chain.
     hook_encode_rear_facing: bool = True
-    video_bitrate: str = "2000k"
-    video_maxrate: str = "2500k"
-    video_bufsize: str = "4000k"
+    # ── Hook-mode H.264 quality knobs (v1.8.19) ─────────────────
+    # Bitrate / maxrate / bufsize stay as the *cap* even in CRF
+    # mode — without ``-maxrate`` a high-motion clip on CRF 18
+    # can spike to 25-30 Mbps and create a 200 MB file out of a
+    # 60 s source. With the cap the file size grows ~3× over the
+    # legacy 2 Mbps CBR output, which is the price for "ภาพคมชัด,
+    # สีไม่เพี้ยน" that the customer asked for in v1.8.19.
+    video_bitrate: str = "4500k"
+    video_maxrate: str = "12000k"
+    video_bufsize: str = "24000k"
+
+    # ── Encoder quality (v1.8.19) ───────────────────────────────
+    # CRF (Constant Rate Factor) replaces ``-b:v`` as the primary
+    # rate control. CRF assigns bits proportionally to the
+    # *complexity* of each frame, so the perceived sharpness is
+    # constant regardless of motion — exactly the property the
+    # customer asked for ("คมชัด"). CRF 18 is "visually
+    # transparent" (humans can't tell apart from the lossless
+    # source); CRF 23 is x264's default. Lower = sharper + bigger
+    # file; higher = blurrier + smaller. We default to 18 and
+    # surface it in Settings for customers on slow PCs to relax
+    # if encode time is critical.
+    encode_crf: int = 18
+
+    # x264 preset trades CPU time against compression efficiency.
+    # Same CRF + slower preset = SAME visual quality, but SMALLER
+    # file (because the encoder finds better motion-comp matches).
+    # ``medium`` is the canonical x264 default — gives the rate-
+    # distortion curve x264 was tuned against. Customers with
+    # slow PCs can drop to ``fast`` in config.json.
+    encode_preset: str = "medium"
+
+    # H.264 profile. ``baseline`` was the historical choice for
+    # max compatibility but every Android since 4.4 (2013)
+    # supports ``high`` profile, and ``baseline`` disables CABAC
+    # + B-frames which costs ~25 % efficiency at the same bitrate.
+    # ``high`` is now the safe modern default; drop to ``main``
+    # only if the customer reports MediaCodec stutter on very old
+    # Redmi 5A / Realme C1-era phones.
+    encode_profile: str = "high"
+
     keyint_seconds: int = 2
     loop_playlist: bool = True
     auto_adb_reverse: bool = True
