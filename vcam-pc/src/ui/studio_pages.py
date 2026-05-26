@@ -6118,9 +6118,30 @@ class WizardPage(ctk.CTkFrame):
             if d.serial == self._candidate_serial:
                 model = d.model
                 break
-        self.app.devices_lib.upsert(
-            self._candidate_serial, model=model, label=label,
+        # v1.8.20: gate by license cap. The wizard reaches here when
+        # a customer ran "+ เพิ่มเครื่อง" and walked through the
+        # onboarding — but they can ALSO get here from the dashboard
+        # auto-launch when adb sees a new device, so it's not safe
+        # to assume the UI's "+ เพิ่มเครื่อง" button already
+        # gate-kept this path. We re-check here to close the loop:
+        # if the customer is at cap, refuse the adopt and surface
+        # the same overflow dialog as auto-discovery.
+        v = self.app.license
+        cap = v.max_devices if v else 1
+        admitted = self.app.devices_lib.try_admit_new(
+            self._candidate_serial,
+            model=model,
+            label=label,
+            max_devices=cap,
         )
+        if admitted is None:
+            # Cap reached. Show the overflow dialog and bail back to
+            # the dashboard without adopting.
+            self.app._notify_license_overflow(
+                self._candidate_serial, model or label,
+            )
+            self.app.go_dashboard()
+            return
         self.app.save_devices()
         self.app.select_device(self._candidate_serial)
         self.app.go_dashboard()

@@ -294,7 +294,15 @@ class DeviceLibrary:
     ) -> DeviceEntry:
         """Insert or update an entry; returns the live entry. Pass
         ``label`` to rename, ``model`` when ADB has just reported the
-        product model."""
+        product model.
+
+        WARNING (v1.8.20): this method does **not** check the license
+        cap. It exists so internal callers that update an *existing*
+        device (label rename, model probe refresh, online-status
+        change) don't have to plumb the cap through. For the
+        *new-device* path use :meth:`try_admit_new` instead — that's
+        what blocks customers from operating more than
+        ``license.max_devices`` phones at once."""
         with self._lock:
             e = self.entries.get(serial)
             if e is None:
@@ -305,6 +313,63 @@ class DeviceLibrary:
                 e.model = model
             if label is not None:
                 e.label = label
+            return e
+
+    def try_admit_new(
+        self,
+        serial: str,
+        *,
+        model: str | None = None,
+        label: str | None = None,
+        max_devices: int,
+    ) -> DeviceEntry | None:
+        """License-aware new-device admission.
+
+        Behavior:
+
+        * If ``serial`` already exists in the library → behaves
+          exactly like :meth:`upsert` (no cap check). The customer
+          paid for this seat, they can update its label/model
+          forever.
+        * If ``serial`` is new and the library is **under** ``max_devices``
+          → admit it (creates a fresh ``DeviceEntry`` like upsert)
+          and return the entry.
+        * If ``serial`` is new and the library is **at or over**
+          ``max_devices`` → return ``None`` without mutating state.
+          The caller is expected to surface a "license cap reached"
+          message and keep the phone out of the sidebar.
+
+        Why this is a separate method (v1.8.20)
+        ---------------------------------------
+        Pre-v1.8.20 the auto-discovery loop in
+        ``studio_app._on_devices_changed`` called ``upsert()`` for
+        every USB row, which silently bypassed the license check —
+        customers were getting unlimited devices in the sidebar
+        even though the UI's "+ เพิ่มเครื่อง" button correctly
+        refused to add past the cap. This method closes that gap
+        without breaking the label-edit / model-refresh flows that
+        still need an unconditional upsert.
+        """
+        cap = max(1, int(max_devices))
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                # Existing seat — always allow update (paid for).
+                if model is not None and model:
+                    e.model = model
+                if label is not None:
+                    e.label = label
+                return e
+            # New seat — gate.
+            if len(self.entries) >= cap:
+                return None
+            e = DeviceEntry(serial=serial)
+            e.added_at = datetime.now().isoformat(timespec="seconds")
+            if model is not None and model:
+                e.model = model
+            if label is not None:
+                e.label = label
+            self.entries[serial] = e
             return e
 
     def remove(self, serial: str) -> bool:

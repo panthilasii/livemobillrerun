@@ -290,6 +290,17 @@ class StudioApp(ctk.CTk):
         self._adb_resolution_warned = False
         self.after(800, self._check_adb_or_warn)
 
+        # ── license-overflow notifier (v1.8.20) ──────────────────
+        # Auto-discovery in ``_on_devices_polled`` calls
+        # ``devices_lib.try_admit_new()`` for unknown USB serials;
+        # when that returns None (cap reached) we surface a single
+        # toast per serial per session so the customer understands
+        # *why* their 4th/5th/Nth phone never appeared in the
+        # sidebar. Tracked per-serial because the ADB poller fires
+        # every 2 s and we'd otherwise spam the user with the same
+        # dialog on every tick.
+        self._license_overflow_notified: set[str] = set()
+
         # Pre-warm Gatekeeper / SmartScreen on the bundled JDK so
         # the customer's first ``Patch & ติดตั้ง TikTok`` click
         # doesn't pay the 10-30 s cold-start cost. The JDK lives
@@ -888,6 +899,56 @@ class StudioApp(ctk.CTk):
 
     # ── device polling ───────────────────────────────────────────
 
+    def _notify_license_overflow(self, serial: str, model: str) -> None:
+        """One-time toast when an unknown USB device is refused by
+        the license-cap gate in ``_on_devices_polled``.
+
+        Customer impact (v1.8.20)
+        -------------------------
+        Pre-v1.8.20 the auto-discovery loop silently exceeded
+        ``license.max_devices`` — customers paying for "3 seats"
+        ended up running 6-8 phones from one PC, which the license
+        UI showed correctly ("6/3") but didn't block. This dialog
+        is the customer-visible half of the cap-enforcement fix:
+        the phone never appears in the sidebar, AND the customer
+        sees why.
+
+        Suppressed after the first hit per serial because the ADB
+        poller fires every 2 s; without the dedup set the dialog
+        would loop indefinitely as long as the phone stays
+        connected, blocking the rest of the UI.
+        """
+        if serial in self._license_overflow_notified:
+            return
+        self._license_overflow_notified.add(serial)
+        cap = self.license.max_devices if self.license else 0
+        cur = self.devices_lib.count()
+        log.warning(
+            "license overflow: refused %s (%s); cap=%d, used=%d",
+            serial, model, cap, cur,
+        )
+        # Schedule the modal off the poll callback so the poller
+        # thread isn't blocked waiting for the user to click OK.
+        def _show() -> None:
+            try:
+                messagebox.showwarning(
+                    "License เต็ม — ไม่สามารถเพิ่มเครื่องได้",
+                    f"ตรวจพบโทรศัพท์เครื่องใหม่:\n"
+                    f"   {model}  ({serial})\n\n"
+                    f"แต่ License ของคุณรองรับสูงสุด {cap} เครื่อง\n"
+                    f"ปัจจุบันใช้อยู่ {cur}/{cap} เครื่อง\n\n"
+                    "ถ้าต้องการเพิ่มเครื่องใหม่ ให้ลบเครื่องเดิม\n"
+                    "ที่ไม่ใช้แล้วก่อน (Settings → จัดการเครื่อง)\n"
+                    "หรือติดต่อแอดมิน Line @npcreate\n"
+                    "เพื่ออัพเกรด License",
+                )
+            except Exception:
+                log.exception("license-overflow toast")
+        try:
+            self.after(0, _show)
+        except Exception:
+            pass
+
     def _wifi_targets(self) -> list[tuple[str, int]]:
         """Snapshot of saved WiFi addresses for the poller's
         reconnect loop. Called from a worker thread."""
@@ -936,10 +997,39 @@ class StudioApp(ctk.CTk):
                 adb_id_for[d.serial] = d.serial
                 # Auto-track unknown USB devices so they show up in
                 # the sidebar before the user runs the wizard.
-                if self.devices_lib.get(d.serial) is None:
+                #
+                # v1.8.20 license-cap gate: previously this called
+                # ``upsert`` unconditionally, which silently added the
+                # 4th/5th/Nth phone past the license limit. Now we
+                # split the path:
+                #
+                #   * known serial → ``upsert`` (paid seat, refresh
+                #     model/label freely)
+                #   * unknown serial → ``try_admit_new`` with
+                #     ``license.max_devices`` so the cap is enforced
+                #
+                # When admission is refused we surface a one-time
+                # notification per serial per session so customers
+                # see *why* their new phone didn't appear in the
+                # sidebar instead of "ระบบ broken" support tickets.
+                existing = self.devices_lib.get(d.serial)
+                if existing is not None:
                     self.devices_lib.upsert(d.serial, model=d.model)
                 else:
-                    self.devices_lib.upsert(d.serial, model=d.model)
+                    cap = self.license.max_devices if self.license else 1
+                    admitted = self.devices_lib.try_admit_new(
+                        d.serial, model=d.model, max_devices=cap,
+                    )
+                    if admitted is None:
+                        self._notify_license_overflow(
+                            d.serial, d.model or "เครื่องใหม่",
+                        )
+                        # Don't add to online_serials either — keep
+                        # the phone fully out of the workflow until
+                        # the customer removes one of their paid seats.
+                        online_serials.discard(d.serial)
+                        transport_for.pop(d.serial, None)
+                        adb_id_for.pop(d.serial, None)
 
         self.online_serials = online_serials
         self.transport_for = transport_for
