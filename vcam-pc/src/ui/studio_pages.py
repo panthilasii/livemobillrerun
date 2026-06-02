@@ -987,6 +987,30 @@ class DashboardPage(ctk.CTkFrame):
             font=ctk.CTkFont(size=13),
         ).grid(row=0, column=5, sticky="w")
 
+        bypass_row = ctk.CTkFrame(rot, fg_color="transparent")
+        bypass_row.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 16))
+        _muted(
+            bypass_row,
+            "ฉีดคลิปผ่านกล้อง:",
+        ).pack(side="left", padx=(0, 8))
+        self.bypass_facing_var = ctk.StringVar(value="กล้องหลัง")
+        self.bypass_facing_menu = ctk.CTkOptionMenu(
+            bypass_row,
+            values=["กล้องหลัง", "กล้องหน้า", "ทั้งคู่"],
+            variable=self.bypass_facing_var,
+            command=self._on_bypass_facing_change,
+            fg_color=THEME.bg_input,
+            button_color=THEME.primary,
+            button_hover_color=THEME.primary_hover,
+            text_color=THEME.fg_primary,
+            width=130,
+        )
+        self.bypass_facing_menu.pack(side="left")
+        _muted(
+            bypass_row,
+            "ค่าแนะนำคือกล้องหลัง เพื่อให้ TikTok ตรวจหน้าได้ตามปกติ",
+        ).pack(side="left", padx=(10, 0))
+
         # Audio card — separate audio file overrides the MP4's audio.
         aud = _card(main)
         aud.grid(row=5, column=0, sticky="ew", padx=20, pady=8)
@@ -1052,13 +1076,17 @@ class DashboardPage(ctk.CTkFrame):
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 4))
 
         cfg = self.app.cfg
-        # Show landscape encode size as portrait (rotation cancels
-        # out on the phone so users see WxH portrait on screen).
-        portrait_w = max(2, int(cfg.encode_height or 1080))
-        portrait_h = max(2, int(cfg.encode_width or 1920))
+        if getattr(cfg, "encode_match_source", True):
+            encode_desc = "Encode คลิปเป็น MP4 ตามความละเอียด/สัดส่วนต้นฉบับ"
+        else:
+            # Show landscape encode size as portrait (rotation cancels
+            # out on the phone so users see WxH portrait on screen).
+            portrait_w = max(2, int(cfg.encode_height or 1080))
+            portrait_h = max(2, int(cfg.encode_width or 1920))
+            encode_desc = f"Encode คลิปเป็น MP4 {portrait_w}×{portrait_h}"
         _muted(
             act,
-            f"Encode คลิปเป็น MP4 {portrait_w}×{portrait_h} + push เข้าเครื่อง. "
+            f"{encode_desc} + push เข้าเครื่อง. "
             "TikTok ในโทรศัพท์จะดึงไฟล์นี้ขึ้นไลฟ์. "
             "ถ้าเลือกคลิปผิด — กด ยกเลิก ระหว่าง encode หรือ push ได้",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
@@ -1683,6 +1711,7 @@ class DashboardPage(ctk.CTkFrame):
         self.rotation_var.set(e.rotation)
         self.mirror_h_var.set(e.mirror_h)
         self.mirror_v_var.set(e.mirror_v)
+        self.bypass_facing_var.set(self._bypass_facing_to_label(e.bypass_facing))
 
         # Patch button text
         if e.is_patched():
@@ -2203,6 +2232,33 @@ class DashboardPage(ctk.CTkFrame):
             row=3, column=0, sticky="w", padx=20, pady=(0, 6),
         )
 
+        self.btn_clip_mode = ctk.CTkButton(
+            parent,
+            text="↩  คืนกล้องจริง",
+            fg_color=THEME.warning,
+            hover_color=THEME.warning,
+            text_color="#1A1206",
+            corner_radius=8,
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._on_clip_mode_toggle,
+        )
+        self.btn_clip_mode.grid(
+            row=4, column=0, sticky="ew", padx=20, pady=(4, 4),
+        )
+        self.lbl_clip_mode_hint = ctk.CTkLabel(
+            parent,
+            text="ใช้เมื่อลูกค้าต้องการกลับไปใช้กล้องจริง โดยไม่ต้องปิด TikTok",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        )
+        self.lbl_clip_mode_hint.grid(
+            row=5, column=0, sticky="w", padx=20, pady=(0, 8),
+        )
+
         # Power-user shortcut tip. Surfaced inline so customers
         # discover scrcpy's killer features without reading a
         # manual. The list is short on purpose — three items max
@@ -2221,7 +2277,7 @@ class DashboardPage(ctk.CTkFrame):
             anchor="w",
             justify="left",
             wraplength=520,
-        ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 16))
+        ).grid(row=6, column=0, sticky="w", padx=20, pady=(0, 16))
 
         # Subscribe to scrcpy session lifecycle so closing the
         # mirror window externally re-renders the button label.
@@ -2374,7 +2430,11 @@ class DashboardPage(ctk.CTkFrame):
                 text="วางโทรศัพท์เฉยๆ • ใช้เมาส์/คีย์บอร์ดควบคุมจาก PC ได้เลย",
                 text_color=THEME.fg_muted,
             )
+            self._render_clip_mode_state(None, False)
             return
+
+        is_online = self.app.is_online(e.serial)
+        self._render_clip_mode_state(e, is_online)
 
         # scrcpy not on PATH → orange status + grey-styled button.
         # We don't fully disable the button: the dialog the click
@@ -2405,7 +2465,6 @@ class DashboardPage(ctk.CTkFrame):
         # opened mirror on a WiFi device would not flip the button
         # state until the next render.
         adb_id = self.app.adb_id_for(e)
-        is_online = self.app.is_online(e.serial)
         is_mir = scm.is_mirroring(adb_id)
 
         if is_mir:
@@ -2459,6 +2518,129 @@ class DashboardPage(ctk.CTkFrame):
                 ),
                 text_color=THEME.fg_muted,
             )
+
+    def _render_clip_mode_state(self, e, is_online: bool) -> None:
+        if not hasattr(self, "btn_clip_mode"):
+            return
+        if e is None:
+            self.btn_clip_mode.configure(
+                state="disabled",
+                text="↩  คืนกล้องจริง",
+                fg_color=THEME.warning,
+                hover_color=THEME.warning,
+                text_color="#1A1206",
+            )
+            self.lbl_clip_mode_hint.configure(
+                text="เลือกเครื่องก่อน",
+                text_color=THEME.fg_muted,
+            )
+            return
+
+        if getattr(e, "clip_showing", True):
+            self.btn_clip_mode.configure(
+                state=("normal" if is_online else "disabled"),
+                text="↩  คืนกล้องจริง",
+                fg_color=THEME.warning,
+                hover_color=THEME.warning,
+                text_color="#1A1206",
+            )
+            self.lbl_clip_mode_hint.configure(
+                text=(
+                    "ตอนนี้ระบบกำลังฉีดคลิปแทนกล้อง — กดเพื่อคืนกล้องจริง"
+                    if is_online else
+                    "เครื่อง offline — เชื่อมต่อก่อนคืนกล้องจริง"
+                ),
+                text_color=THEME.warning if is_online else THEME.fg_muted,
+            )
+        else:
+            self.btn_clip_mode.configure(
+                state=("normal" if is_online else "disabled"),
+                text="▶  แสดงคลิปอีกครั้ง",
+                fg_color=THEME.primary,
+                hover_color=THEME.primary_hover,
+                text_color="white",
+            )
+            self.lbl_clip_mode_hint.configure(
+                text=(
+                    "ตอนนี้คืนกล้องจริงแล้ว — กดเพื่อกลับไปแสดงคลิป"
+                    if is_online else
+                    "เครื่อง offline — เชื่อมต่อก่อนแสดงคลิปอีกครั้ง"
+                ),
+                text_color=THEME.fg_secondary if is_online else THEME.fg_muted,
+            )
+
+    def _on_clip_mode_toggle(self) -> None:
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        if not self.app.is_online(e.serial):
+            messagebox.showwarning(
+                "เครื่องไม่ได้เชื่อมต่อ",
+                "เสียบ USB หรือเชื่อม WiFi ADB ก่อนครับ",
+            )
+            return
+
+        show_clip = not bool(getattr(e, "clip_showing", True))
+        if show_clip and not e.last_video:
+            messagebox.showwarning(
+                "ยังไม่มีคลิป",
+                "เครื่องนี้ยังไม่มีคลิปที่เลือกไว้ — กด Encode + Push ก่อนครับ",
+            )
+            return
+
+        self.btn_clip_mode.configure(state="disabled")
+        self.lbl_clip_mode_hint.configure(
+            text="กำลังส่งคำสั่งไป TikTok…",
+            text_color=THEME.fg_secondary,
+        )
+
+        threading.Thread(
+            target=self._run_clip_mode_toggle,
+            args=(e.serial, show_clip),
+            daemon=True,
+            name=f"clip-mode-{e.serial}",
+        ).start()
+
+    def _run_clip_mode_toggle(self, serial: str, show_clip: bool) -> None:
+        e = self.app.devices_lib.get(serial)
+        if e is None:
+            return
+        try:
+            from ..hook_mode import TIKTOK_PACKAGE_DEFAULT, target_for_package
+
+            pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
+            ok = self.app.hook.broadcast_clip_mode_to_tiktok(
+                tiktok_pkg=pkg,
+                mode=2 if show_clip else 0,
+                video_path=target_for_package(pkg),
+                loop=True,
+                rotation_deg=int(getattr(e, "rotation", 0)),
+                flip_x=bool(getattr(e, "mirror_h", False)),
+                flip_y=bool(getattr(e, "mirror_v", False)),
+                bypass_facing=getattr(e, "bypass_facing", "back"),
+                serial=self.app.adb_id_for(e),
+            )
+        except Exception:
+            log.exception("clip mode toggle crashed")
+            ok = False
+
+        def _done() -> None:
+            if ok:
+                self.app.devices_lib.update_clip_showing(serial, show_clip)
+                self.app.save_devices()
+                self._refresh_main()
+                self._refresh_sidebar()
+            else:
+                messagebox.showwarning(
+                    "ส่งคำสั่งไม่สำเร็จ",
+                    "เช็คว่า USB / WiFi ADB ยังต่ออยู่ และ TikTok ที่ patch แล้วเปิดอยู่",
+                )
+                self._render_live_control_state()
+
+        try:
+            self.after(0, _done)
+        except Exception:
+            pass
 
     def _on_mirror_toggle(self) -> None:
         """Start or stop a scrcpy mirror window for the selected
@@ -3361,6 +3543,50 @@ class DashboardPage(ctk.CTkFrame):
         except Exception:
             log.exception("remove audio crashed")
 
+    @staticmethod
+    def _bypass_facing_to_label(value: str) -> str:
+        raw = (value or "back").strip().lower()
+        if raw == "front":
+            return "กล้องหน้า"
+        if raw == "both":
+            return "ทั้งคู่"
+        return "กล้องหลัง"
+
+    @staticmethod
+    def _bypass_label_to_facing(label: str) -> str:
+        if label == "กล้องหน้า":
+            return "front"
+        if label == "ทั้งคู่":
+            return "both"
+        return "back"
+
+    def _on_bypass_facing_change(self, _label: str | None = None) -> None:
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        facing = self._bypass_label_to_facing(self.bypass_facing_var.get())
+        self.app.devices_lib.update_bypass_facing(e.serial, facing)
+        self.app.save_devices()
+
+        def _poke_tiktok_bypass() -> None:
+            try:
+                from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
+
+                pkg = e.tiktok_package or TIKTOK_PACKAGE_DEFAULT
+                self.app.hook.broadcast_flip_transform_to_tiktok(
+                    tiktok_pkg=pkg,
+                    rotation_deg=int(self.rotation_var.get()),
+                    flip_x=bool(self.mirror_h_var.get()),
+                    flip_y=bool(self.mirror_v_var.get()),
+                    bypass_facing=facing,
+                    serial=self.app.adb_id_for(e),
+                )
+            except Exception:
+                log.exception("broadcast bypass-facing change failed")
+
+        if self.app.is_online(e.serial):
+            threading.Thread(target=_poke_tiktok_bypass, daemon=True).start()
+
     def _on_rotation_change(self) -> None:
         e = self.app.selected_entry()
         if e is None:
@@ -3383,6 +3609,7 @@ class DashboardPage(ctk.CTkFrame):
                     rotation_deg=int(self.rotation_var.get()),
                     flip_x=bool(self.mirror_h_var.get()),
                     flip_y=bool(self.mirror_v_var.get()),
+                    bypass_facing=getattr(e, "bypass_facing", "back"),
                     serial=self.app.adb_id_for(e),
                 )
             except Exception:
@@ -3504,6 +3731,7 @@ class DashboardPage(ctk.CTkFrame):
             source=Path(e.last_video),
             output=self.app.device_local_mp4(e.serial),
             tiktok_pkg=pkg,
+            bypass_facing=getattr(e, "bypass_facing", "back"),
         )
         self.app.encode_tasks.upsert(task)
 

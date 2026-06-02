@@ -155,6 +155,12 @@ class DeviceEntry:
     # state we last asked for, not the state the phone happens to
     # be in right now).
     clip_showing: bool = True
+    # Runtime camera target for the hook replacement. ``back`` is
+    # the historical default and safest TikTok Live path because
+    # the front camera remains real for liveness checks. ``front``
+    # and ``both`` are support toggles for devices whose camera
+    # mapping / live flow differs.
+    bypass_facing: str = "back"
 
     def display_name(self) -> str:
         return self.label or self.model or self.serial
@@ -255,6 +261,7 @@ class DeviceLibrary:
                     vcam_app_key=str(raw.get("vcam_app_key", "")),
                     created_at=str(raw.get("created_at", "")),
                     clip_showing=bool(raw.get("clip_showing", True)),
+                    bypass_facing=str(raw.get("bypass_facing", "back") or "back"),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)
@@ -408,6 +415,29 @@ class DeviceLibrary:
                 e.mirror_h = bool(mirror_h)
             if mirror_v is not None:
                 e.mirror_v = bool(mirror_v)
+
+    def update_bypass_facing(self, serial: str, bypass_facing: str) -> None:
+        """Persist which camera lens receives the hook replacement.
+
+        Valid values mirror the Android hook: ``back`` (default),
+        ``front`` and ``both``. Unknown values fall back to ``back``
+        so a malformed devices.json cannot leave the customer in a
+        surprising injection mode.
+        """
+        raw = (bypass_facing or "back").strip().lower()
+        if raw not in {"back", "front", "both"}:
+            raw = "back"
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                e.bypass_facing = raw
+
+    def update_clip_showing(self, serial: str, clip_showing: bool) -> None:
+        """Persist whether the hook should replace camera frames with the clip."""
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                e.clip_showing = bool(clip_showing)
 
     def mark_patched(
         self,

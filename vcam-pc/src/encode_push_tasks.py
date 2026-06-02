@@ -105,6 +105,9 @@ class EncodePushTask:
                          path matches whichever TikTok variant
                          (international / Lite / Douyin) that
                          specific phone has installed.
+    ``bypass_facing``  — hook camera target: back / front / both.
+                        Captured per device so every push re-arms
+                        the setting after a phone or TikTok restart.
     ``state``          — see STATE_* constants above.
     ``progress``       — 0..1 combined; encode contributes 0..0.5
                          and push contributes 0.5..1.0 so the UI
@@ -129,6 +132,7 @@ class EncodePushTask:
     source: Path
     output: Path
     tiktok_pkg: str
+    bypass_facing: str = "back"
     state: str = STATE_QUEUED
     progress: float = 0.0
     message: str = "เตรียม encode…"

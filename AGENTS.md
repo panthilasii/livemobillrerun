@@ -141,6 +141,20 @@ From the codebase docstrings:
   `tools/init_keys.py`.
 - **`studio_pages.py`** — the wizard tells customers "DO NOT tap
   Update inside TikTok"; preserve that UX.
+- **`customer_devices.py` license cap (v1.8.20)** — new devices must
+  go through `DeviceLibrary.try_admit_new(serial, *, max_devices=...)`,
+  NEVER raw `upsert()`. `upsert` skips the cap (it's for label/model
+  updates to *existing* paid seats only). The auto-discovery loop in
+  `studio_app._on_devices_polled` learned this the hard way: it called
+  `upsert` unconditionally, so customers ran 6-8 phones on a 3-seat
+  license. If you add a new device-admission path, gate it with
+  `try_admit_new` + surface `StudioApp._notify_license_overflow`.
+- **`hook_mode.py` encode color (v1.8.19)** — the FFmpeg encode MUST
+  tag BT.709 end-to-end (`-colorspace bt709 -color_primaries bt709
+  -color_trc bt709 -color_range tv` + the scaler's
+  `out_color_matrix=bt709` + the `-x264-params colormatrix=bt709...`).
+  Dropping any of these reintroduces the "ผิวเหลืองซีด" skin-tone
+  shift on ColorOS/MIUI, which guess BT.601 on un-tagged 1080p.
 
 ## Customer-environment gotchas
 
@@ -174,6 +188,24 @@ in roughly this order:
    quarantine retry.
 8. **USB selective suspend on Windows** — host-side suspend of "idle"
    USB devices during long transfers.
+9. **Missing OEM USB driver on Windows (v1.8.18)** — macOS sees every
+   Android over libusb without a driver; Windows needs a signed INF
+   that maps the phone's `VID&PID` to WinUSB. Google's bundled
+   `android_winusb.inf` only covers VID `18D1` (Pixel/Nexus), so
+   OPPO/Realme/OnePlus (BBK VID `22D9`), Xiaomi (`2717`), Samsung
+   (`04E8`), Vivo (`2D95`) all fail with "Mac works, Windows doesn't".
+   Fix shipped: ClockworkMod's signed Universal ADB Driver MSI bundled
+   at `.tools/windows/adb-driver/UniversalAdbDriverSetup.msi`; resolver
+   is `platform_tools.find_universal_adb_driver_msi()`, surfaced in the
+   driver-help dialog (`studio_pages.WizardPage._show_driver_help`).
+10. **Windows driver-binding cache stale** — if the phone first
+    enumerates as MTP-only (USB debugging off, or PTP mode) Windows
+    caches that binding and won't re-bind to the ADB interface even
+    after USB debugging is enabled + the MSI is installed. Symptom:
+    Device Manager shows nothing under "ADB Interface" but the phone
+    appears as a drive in Explorer. Fix is host-side: uninstall the
+    cached device (Device Manager → show hidden → delete driver),
+    reboot, kill any port-5037 holder, replug.
 
 ## Bundled tools layout
 
@@ -194,3 +226,30 @@ CI populates `.tools/` via `python tools/setup_scrcpy.py` +
   `startup-diagnostic.txt` — ask for these from support tickets.
 - Don't add a new feature without a Thai customer-facing message
   and at least one test that pins the new behavior.
+
+## Recent significant changes
+
+Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
+`v*` trigger the release workflow (4 artifacts: Windows .exe +
+.zip, macOS .dmg + .zip).
+
+- **v1.8.20** — License cap enforced in auto-discovery.
+  `DeviceLibrary.try_admit_new` gates new serials by
+  `license.max_devices`; `_on_devices_polled` + wizard `_finish`
+  both route through it; `StudioApp._notify_license_overflow`
+  shows a one-time Thai toast per refused serial. Tests in
+  `tests/test_customer_devices_license_cap.py`.
+- **v1.8.19** — Hook-mode encode color + sharpness. BT.709 tagging
+  end-to-end, CRF 18 + `high` profile + `medium` preset (was
+  `-b:v 2000k` veryfast/baseline), audio 192k/48 kHz. New tunable
+  `StreamConfig.encode_crf / encode_preset / encode_profile`.
+- **v1.8.18** — Bundle ClockworkMod Universal ADB Driver MSI for
+  OPPO/Realme/OnePlus/Xiaomi/Samsung/Vivo (Google INF only covered
+  Pixel VID 18D1). New `platform_tools.find_universal_adb_driver_msi`;
+  driver-help dialog rewritten brand-agnostic.
+- **v1.8.17** — Merged external UX/UI build: `update_prefs.py`,
+  resumable patch prefetch + install-on-close in `auto_update.py`,
+  OS-aware ADB warning dialog, Update settings card, per-device
+  `clip_showing` toggle, macOS .dmg read-only mount guard.
+- **v1.8.16** — Fix camera-switch freeze during Live (front↔rear
+  toggle) in `vcam-app` `CameraHook.kt` / `FlipRenderer.kt`.

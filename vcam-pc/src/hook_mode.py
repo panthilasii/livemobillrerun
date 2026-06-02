@@ -475,6 +475,29 @@ class HookModePipeline:
         #   MediaCodec expects; if the source was in PC range,
         #   the scaler does the contraction correctly instead
         #   of leaving the encoder to clip blacks/whites.
+        match_source = getattr(self.cfg, "encode_match_source", True)
+        if match_source:
+            # v1.8.21 match-source path: keep the source's native
+            # resolution + aspect ratio. We still run a ``scale``
+            # filter — but only to (a) round to even dimensions
+            # (H.264 mandates even W/H) and (b) carry the SAME
+            # color-matrix + chroma-precision conversion the fixed
+            # path used. ``trunc(iw/2)*2`` is a no-op for the vast
+            # majority of clips (already even) and at worst shaves
+            # 1px — it never up/down-samples, so sharpness is
+            # preserved bit-for-bit relative to the source grid.
+            # No ``pad`` → no letterbox bars → on-screen size
+            # matches the real clip.
+            vf.append(
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2:"
+                "flags=lanczos+full_chroma_int+full_chroma_inp:"
+                "in_color_matrix=auto:out_color_matrix=bt709:"
+                "in_range=auto:out_range=tv"
+            )
+            vf.append(f"fps={self.cfg.fps}")
+            vf.append("setsar=1")
+            return vf
+        # Legacy fixed-box + letterbox path (config opt-in).
         vf.append(
             f"scale={out_w}:{out_h}:"
             "force_original_aspect_ratio=decrease:"
@@ -560,6 +583,33 @@ class HookModePipeline:
             profile, apply_profile_rotation, out_w, out_h,
         )
 
+        # v1.8.21 issue-4 guard: make sure we can actually WRITE the
+        # output before we burn CPU on a multi-minute encode. The
+        # recurring "encode คลิปใหม่ไม่ได้" report after the program
+        # has been open a while traces back to one of three host-side
+        # conditions, all of which surface here with a clear Thai
+        # cause instead of a cryptic ffmpeg "Permission denied" tail:
+        #
+        #   1. the cache dir lives inside OneDrive / iCloud / Google
+        #      Drive and the cloud client evicted the old MP4 to a
+        #      placeholder (can't be overwritten in place),
+        #   2. a stale ffmpeg from a non-clean shutdown still holds a
+        #      lock on the per-serial output file (Windows),
+        #   3. the disk filled up (the v1.8.19 quality bump tripled
+        #      cache file sizes).
+        writable_err = self._ensure_output_writable(output_path)
+        if writable_err is not None:
+            return HookEncodeResult(False, output_path, 0.0, 0, writable_err)
+
+        # Encode to a unique sibling temp file, then atomically
+        # ``os.replace`` onto the final path. Two wins: (a) a crash /
+        # timeout mid-encode never leaves a truncated MP4 that the
+        # push step would happily ship, and (b) we never have to
+        # truncate-in-place a file another process might hold open.
+        tmp_out = output_path.with_name(
+            f"{output_path.stem}.part-{os.getpid()}{output_path.suffix}"
+        )
+
         keyint = max(1, int(self.cfg.fps * self.cfg.keyint_seconds))
         # ``-progress pipe:1`` makes ffmpeg dump structured key=value
         # blocks to stdout every ~500 ms (out_time_us, frame, fps, …).
@@ -617,9 +667,13 @@ class HookModePipeline:
             "-c:v", "libx264",
             "-preset", preset,
             "-profile:v", profile,
-            # Level 4.1 covers 1080p @ up to 12 Mbps; level 4.0
-            # tops out at 10 Mbps which our new maxrate exceeds.
-            "-level", "4.1",
+            # v1.8.21: no hard-coded ``-level``. With match-source
+            # geometry the output can exceed 1080p (e.g. a 4K
+            # source kept at native res), which level 4.1 forbids
+            # and would make ffmpeg abort. Letting x264 auto-derive
+            # the level from the actual resolution / fps / bitrate
+            # keeps every source encodable while still emitting a
+            # valid level tag in the SPS for the decoder.
             "-pix_fmt", "yuv420p",
             "-r", str(self.cfg.fps),
             "-g", str(keyint),
@@ -655,7 +709,7 @@ class HookModePipeline:
             # MP4 with moov-at-front for streaming-friendly playback.
             "-movflags", "+faststart",
             "-f", "mp4",
-            str(output_path),
+            str(tmp_out),
         ]
 
         # Probe the playlist so we can size the timeout to match the
@@ -675,15 +729,118 @@ class HookModePipeline:
             progress_cb(0.0, "เริ่ม encode…")
 
         t0 = time.monotonic()
-        return self._run_ffmpeg_with_progress(
-            cmd=cmd,
-            output_path=output_path,
-            duration_s=duration_s,
-            timeout_s=timeout_s,
-            progress_cb=progress_cb,
-            t0=t0,
-            cancel_event=cancel_event,
-        )
+        try:
+            result = self._run_ffmpeg_with_progress(
+                cmd=cmd,
+                output_path=tmp_out,
+                duration_s=duration_s,
+                timeout_s=timeout_s,
+                progress_cb=progress_cb,
+                t0=t0,
+                cancel_event=cancel_event,
+            )
+
+            if not result.ok:
+                # Leave the (possibly partial) temp file for the
+                # finally-block to remove; the real output is left
+                # untouched so the previous good clip survives a
+                # failed re-encode.
+                return result
+
+            # Atomic promote temp → final. ``os.replace`` is atomic
+            # within a filesystem and overwrites the destination, so
+            # a concurrent push that opened the OLD final never sees
+            # a half-written file.
+            try:
+                os.replace(tmp_out, output_path)
+            except OSError as exc:
+                log.warning("could not promote temp encode → final: %s", exc)
+                return HookEncodeResult(
+                    False, output_path, result.duration_s, 0,
+                    "บันทึกไฟล์ที่ encode แล้วไม่สำเร็จ "
+                    f"({exc.__class__.__name__})\n"
+                    "ไฟล์ปลายทางอาจถูกโปรแกรมอื่นเปิดค้างอยู่ — "
+                    "ปิดโปรแกรมที่อาจเปิดไฟล์นี้ แล้วลองใหม่ "
+                    "(หรือรีสตาร์ทเครื่อง)",
+                )
+
+            size = output_path.stat().st_size if output_path.is_file() else 0
+            return HookEncodeResult(
+                True, output_path, result.duration_s, size, "",
+            )
+        finally:
+            # Always clean up the temp encode — on success it's
+            # already been renamed away (unlink is a no-op), on
+            # failure / cancel / timeout we don't want to leak a
+            # half-written multi-hundred-MB file in the cache dir.
+            try:
+                tmp_out.unlink(missing_ok=True)
+            except OSError:
+                log.debug("temp encode cleanup failed: %s", tmp_out,
+                          exc_info=True)
+
+    def _ensure_output_writable(self, output_path: Path) -> str | None:
+        """Pre-flight the encode output location (v1.8.21).
+
+        Returns ``None`` when the directory is writable and the
+        (stale) output file — if any — can be removed. Otherwise
+        returns a Thai-language error string describing the most
+        likely cause, ready to drop straight into a
+        ``HookEncodeResult``.
+
+        We probe by actually writing + deleting a tiny file in the
+        target directory rather than trusting ``os.access`` — the
+        latter lies on Windows (ACL vs. POSIX bits) and on cloud-
+        synced folders that report writable but fail on the real
+        write because the byte range is a placeholder.
+        """
+        parent = output_path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return (
+                f"สร้างโฟลเดอร์ cache ไม่ได้: {parent}\n"
+                f"({exc.__class__.__name__})\n"
+                "ตรวจสอบสิทธิ์การเขียน หรือพื้นที่ดิสก์"
+            )
+
+        probe = parent / f".vcam_write_probe_{os.getpid()}"
+        try:
+            probe.write_bytes(b"ok")
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return (
+                "โฟลเดอร์ cache เขียนไฟล์ไม่ได้:\n"
+                f"  {parent}\n"
+                f"({exc.__class__.__name__})\n\n"
+                "สาเหตุที่พบบ่อย:\n"
+                "• โฟลเดอร์อยู่ใน OneDrive / iCloud / Google Drive "
+                "(ไฟล์ถูกย้ายขึ้น cloud) — ย้ายโปรแกรมออกมาไว้ในไดรฟ์ "
+                "ปกติ เช่น C:\\NP Create\n"
+                "• ดิสก์เต็ม — ลบไฟล์เพื่อเพิ่มพื้นที่\n"
+                "• โดน antivirus ล็อกโฟลเดอร์"
+            )
+
+        # Best-effort removal of the stale final so a placeholder /
+        # locked old file is caught HERE (clear message) instead of
+        # at the os.replace step.
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except OSError as exc:
+            return (
+                "ลบไฟล์ cache เดิมไม่ได้:\n"
+                f"  {output_path}\n"
+                f"({exc.__class__.__name__})\n\n"
+                "ไฟล์อาจถูกโปรแกรมอื่นเปิดค้างอยู่ (เช่น ffmpeg เดิม "
+                "ที่ยังไม่ปิด, media player) — ปิดโปรแกรมเหล่านั้น "
+                "แล้วลองใหม่ หรือรีสตาร์ทเครื่อง"
+            )
+        return None
 
     def _run_ffmpeg_with_progress(
         self,
@@ -843,6 +1000,7 @@ class HookModePipeline:
         target: str = TARGET_PATH_ON_PHONE,
         progress_cb: ProgressCB = None,
         tiktok_pkg: str = TIKTOK_PACKAGE_DEFAULT,
+        bypass_facing: str = "back",
         cancel_event: "threading.Event | None" = None,
     ) -> HookPushResult:
         """`adb push` the encoded MP4 to the phone.
@@ -1020,7 +1178,11 @@ class HookModePipeline:
         # passing the default here when the customer is on TikTok
         # Lite silently breaks live-update, which is exactly the
         # bug we fixed in this change.
-        self._broadcast_force_reload(serial=serial, tiktok_pkg=tiktok_pkg)
+        self._broadcast_force_reload(
+            serial=serial,
+            tiktok_pkg=tiktok_pkg,
+            bypass_facing=bypass_facing,
+        )
 
         return HookPushResult(True, size, elapsed, target, "")
 
@@ -1029,6 +1191,7 @@ class HookModePipeline:
         serial: str | None = None,
         tiktok_pkg: str = TIKTOK_PACKAGE_DEFAULT,
         audio_reload: bool = False,
+        bypass_facing: str = "back",
     ) -> None:
         """Fire ``com.livemobillrerun.vcam.SET_MODE forceReload=true`` at
         the running TikTok process so the in-process receiver inside
@@ -1050,6 +1213,7 @@ class HookModePipeline:
             "-p", tiktok_pkg,
             "--ei", "mode", "2",
             "--ez", "forceReload", "true",
+            "--es", "bypassFacing", _normalise_bypass_facing(bypass_facing),
         ]
         if audio_reload:
             cmd += ["--ez", "audioReload", "true"]
@@ -1067,6 +1231,7 @@ class HookModePipeline:
         flip_x: bool,
         flip_y: bool,
         zoom: float = 1.0,
+        bypass_facing: str = "back",
         serial: str | None = None,
     ) -> None:
         """Send rotation / mirror / zoom to the patched TikTok process.
@@ -1091,12 +1256,70 @@ class HookModePipeline:
             "--ez", "flipX", str(flip_x).lower(),
             "--ez", "flipY", str(flip_y).lower(),
             "--ef", "zoom", f"{z:.2f}",
+            "--es", "bypassFacing", _normalise_bypass_facing(bypass_facing),
         ]
         try:
             subprocess.run(cmd, capture_output=True, text=True,
                            timeout=5, check=False)
         except subprocess.TimeoutExpired:
             log.debug("broadcast_flip_transform_to_tiktok timed out")
+
+    def broadcast_clip_mode_to_tiktok(
+        self,
+        *,
+        tiktok_pkg: str,
+        mode: int,
+        video_path: str = TARGET_PATH_ON_PHONE,
+        loop: bool = True,
+        rotation_deg: int = 0,
+        flip_x: bool = False,
+        flip_y: bool = False,
+        zoom: float = 1.0,
+        bypass_facing: str = "back",
+        serial: str | None = None,
+    ) -> bool:
+        """Switch the running TikTok hook between real camera and clip.
+
+        ``mode=0`` restores passthrough (real camera). ``mode=2``
+        re-arms replacement with the current clip. This targets the
+        in-process receiver registered by ``CameraHook`` (``-p
+        <tiktok_pkg>``), so it affects TikTok immediately without
+        restarting the app.
+        """
+        adb = self._resolve_adb() or self.cfg.adb_path
+        cmd = [adb]
+        if serial:
+            cmd += ["-s", serial]
+        safe_mode = 2 if int(mode) == 2 else 0
+        rot = int(rotation_deg) % 360
+        z = max(float(zoom), 0.01)
+        cmd += [
+            "shell", "am", "broadcast",
+            "-a", "com.livemobillrerun.vcam.SET_MODE",
+            "-p", tiktok_pkg,
+            "--ei", "mode", str(safe_mode),
+            "--es", "videoPath", video_path,
+            "--ez", "loop", str(loop).lower(),
+            "--ei", "rotation", str(rot),
+            "--ez", "flipX", str(flip_x).lower(),
+            "--ez", "flipY", str(flip_y).lower(),
+            "--ef", "zoom", f"{z:.2f}",
+            "--es", "bypassFacing", _normalise_bypass_facing(bypass_facing),
+        ]
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            log.debug("broadcast_clip_mode_to_tiktok timed out")
+            return False
+        if r.returncode != 0:
+            log.warning(
+                "broadcast_clip_mode_to_tiktok failed rc=%s stderr=%r",
+                r.returncode, (r.stderr or "").strip(),
+            )
+            return False
+        return True
 
     # ────────────────────────────────────────────────────────────
     #  push standalone audio override
@@ -1324,6 +1547,7 @@ class HookModePipeline:
         flip_x: bool = False,
         flip_y: bool = False,
         audio: bool = True,
+        bypass_facing: str = "back",
         serial: str | None = None,
         package: str = "com.livemobillrerun.vcam",
     ) -> bool:
@@ -1350,6 +1574,7 @@ class HookModePipeline:
             "--ez", "flipX", str(flip_x).lower(),
             "--ez", "flipY", str(flip_y).lower(),
             "--ez", "audio", str(audio).lower(),
+            "--es", "bypassFacing", _normalise_bypass_facing(bypass_facing),
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
@@ -1413,6 +1638,16 @@ def default_local_mp4(cfg: StreamConfig) -> Path:
     cache_dir = cfg.videos_path.parent / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / "vcam_final.mp4"
+
+
+def _normalise_bypass_facing(value: str | None) -> str:
+    """Map UI/config values to the hook's SET_MODE ``bypassFacing`` extra."""
+    raw = (value or "back").strip().lower()
+    if raw in {"front", "front-only", "selfie"}:
+        return "front"
+    if raw in {"both", "all"}:
+        return "both"
+    return "back"
 
 
 def human_bytes(n: int) -> str:

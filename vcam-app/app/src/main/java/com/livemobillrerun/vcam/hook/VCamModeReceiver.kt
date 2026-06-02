@@ -18,7 +18,8 @@ import de.robv.android.xposed.XposedBridge
  *   --ef zoom 1.0 \
  *   --ez flipX false \
  *   --ez flipY false \
- *   --ez audio true
+ *   --ez audio true \
+ *   --es bypassFacing back
  * ```
  *
  * Modes:
@@ -31,7 +32,19 @@ class VCamModeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         val mode = intent?.getIntExtra("mode", 0) ?: 0
         CameraHook.currentMode = mode
-        XposedBridge.log("[VCAM_HOOK] 📡 mode → $mode")
+        val bypassFacing = intent?.getStringExtra("bypassFacing")
+            ?.lowercase()
+            ?.trim()
+        if (bypassFacing == CameraHook.BYPASS_FACING_BACK_ONLY ||
+            bypassFacing == CameraHook.BYPASS_FACING_FRONT_ONLY ||
+            bypassFacing == CameraHook.BYPASS_FACING_BOTH
+        ) {
+            CameraHook.bypassFacingMode = bypassFacing
+        }
+        XposedBridge.log(
+            "[VCAM_HOOK] 📡 mode → $mode " +
+                "bypassFacing=${CameraHook.bypassFacingMode}"
+        )
 
         if (mode == 2) {
             val path = intent?.getStringExtra("videoPath") ?: VideoFeeder.activeVideoPath()

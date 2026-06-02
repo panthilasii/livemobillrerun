@@ -244,6 +244,7 @@ def run_encode_push(
                 target=target,
                 progress_cb=_on_push_progress,
                 tiktok_pkg=task.tiktok_pkg,
+                bypass_facing=task.bypass_facing,
                 cancel_event=task.cancel_event,
             )
         except Exception as ex:

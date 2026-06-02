@@ -153,6 +153,29 @@ class StreamConfig:
     # Redmi 5A / Realme C1-era phones.
     encode_profile: str = "high"
 
+    # ── Match-source geometry (v1.8.21) ─────────────────────────
+    # When true (default), the hook encode keeps the SOURCE clip's
+    # native resolution + aspect ratio: it applies the orientation
+    # rotation, rounds to even dimensions (H.264 requirement) and
+    # tags color, but does NOT scale to a fixed 1920×1080 box and
+    # does NOT letterbox-pad. This fixes two customer complaints:
+    #
+    #   * "ความคมชัดเสีย" — a 720p source used to be UPSCALED to
+    #     1080p (blurry interpolation) and a 4K source DOWNSCALED
+    #     (lost detail). Now the output matches the source pixel
+    #     grid, so nothing is up/down-sampled.
+    #   * "ขนาด video ใหญ่บ้างเล็กบ้างกว่าคลิปจริง" — clips whose
+    #     aspect ratio differed from 16:9 used to be fitted into a
+    #     fixed 1920×1080 frame with black bars (letterbox), so a
+    #     9:16 clip showed up tiny with huge side bars. Preserving
+    #     the source aspect ratio removes the bars entirely; the
+    #     phone's GL renderer fits the frame to the camera surface.
+    #
+    # Set false in config.json to restore the legacy fixed-box +
+    # letterbox path (``encode_width`` × ``encode_height``) for the
+    # rare phone whose MediaCodec rejects non-standard resolutions.
+    encode_match_source: bool = True
+
     keyint_seconds: int = 2
     loop_playlist: bool = True
     auto_adb_reverse: bool = True

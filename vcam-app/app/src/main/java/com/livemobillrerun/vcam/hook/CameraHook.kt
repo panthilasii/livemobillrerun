@@ -128,6 +128,22 @@ class CameraHook : IXposedHookLoadPackage {
         @JvmField val FACING_EXTERNAL: Int = CameraCharacteristics.LENS_FACING_EXTERNAL
         const val FACING_UNKNOWN = -1
 
+        const val BYPASS_FACING_BACK_ONLY = "back"
+        const val BYPASS_FACING_FRONT_ONLY = "front"
+        const val BYPASS_FACING_BOTH = "both"
+
+        /**
+         * Runtime bypass target, controlled by SET_MODE's
+         * ``bypassFacing`` extra. Default remains back-only because
+         * TikTok's pre-live liveness gate commonly probes the front
+         * camera; forcing replacement there can block the customer
+         * before the broadcast starts. Support can switch to
+         * front-only or both for devices whose camera mapping is
+         * inverted or whose live flow expects the replacement on the
+         * selfie lens.
+         */
+        @JvmField @Volatile var bypassFacingMode: String = BYPASS_FACING_BACK_ONLY
+
         /**
          * Rear-lens upright correction is applied in **texture space**
          * ([FlipRenderer.rearLensCorrectTex180]) — not via stacking degrees
@@ -154,10 +170,10 @@ class CameraHook : IXposedHookLoadPackage {
 
         /**
          * @return true when [facing] should receive the MP4
-         *         replacement. v1.8.8 hardcodes "back only" — so
-         *         the back lens (and external USB cams, treated
-         *         the same) gets the loop; the front lens keeps
-         *         producing real frames for TikTok's detector.
+         *         replacement. v1.8.21 keeps v1.8.8's back-only
+         *         behavior as the default, but allows the PC client
+         *         to switch targets at runtime for devices whose
+         *         camera mapping / live flow differs.
          *
          * Returns **false on FACING_UNKNOWN**. That's deliberate:
          * if openCamera hasn't fired yet, the safe assumption is
@@ -167,7 +183,12 @@ class CameraHook : IXposedHookLoadPackage {
          */
         @JvmStatic
         fun shouldBypass(facing: Int): Boolean {
-            return facing == FACING_BACK || facing == FACING_EXTERNAL
+            return when (bypassFacingMode) {
+                BYPASS_FACING_FRONT_ONLY -> facing == FACING_FRONT
+                BYPASS_FACING_BOTH -> facing == FACING_FRONT ||
+                    facing == FACING_BACK || facing == FACING_EXTERNAL
+                else -> facing == FACING_BACK || facing == FACING_EXTERNAL
+            }
         }
 
         /**
@@ -1031,9 +1052,21 @@ class CameraHook : IXposedHookLoadPackage {
             val path = intent.getStringExtra("videoPath")
             val forceReload = intent.getBooleanExtra("forceReload", false)
             if (mode in 0..2) currentMode = mode
+            val bypassFacing = intent.getStringExtra("bypassFacing")
+                ?.lowercase()
+                ?.trim()
+            if (bypassFacing == BYPASS_FACING_BACK_ONLY ||
+                bypassFacing == BYPASS_FACING_FRONT_ONLY ||
+                bypassFacing == BYPASS_FACING_BOTH
+            ) {
+                bypassFacingMode = bypassFacing
+            }
             if (!path.isNullOrBlank()) {
                 activeVideoPath = path
                 VideoFeeder.activeVideoPath = path
+            }
+            if (currentMode != 2) {
+                AudioFeeder.stop()
             }
 
             // Live transform parameters — applied via FlipRenderer.
@@ -1066,6 +1099,7 @@ class CameraHook : IXposedHookLoadPackage {
             log(
                 "📡 SET_MODE → mode=$currentMode " +
                     "path=${activeVideoPath?.substringAfterLast('/')} " +
+                    "bypassFacing=$bypassFacingMode " +
                     "rot=$liveRotationDegrees flipH=$liveMirrorH flipV=$liveMirrorV " +
                     "zoom=$liveZoom reload=$forceReload"
             )
