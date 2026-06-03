@@ -242,11 +242,12 @@ Local Windows ZIP build (no CI): `setup_ci_tools.py --os windows` then
 | ------------------------------- | ------------------------------------------- |
 | Anything ADB                    | `adb.py` top docstring                      |
 | Pull / patch / install          | `lspatch_pipeline.py` top docstring         |
-| Encode quality / color          | `hook_mode.py` `encode_playlist` (v1.8.19)  |
+| Encode quality / color          | `hook_mode.py` `encode_playlist` (v1.8.19); rate control `_rate_control_args` + `encode_quality_first` (v1.8.24) |
+| Encode `%` / progress bar       | `hook_mode.py` `_run_ffmpeg_with_progress` + `_extract_out_time_us` (v1.8.24) |
 | License limits                  | `customer_devices.py` `try_admit_new`       |
 | Windows "phone not found"       | `platform_tools` driver locators + AGENTS gotchas 9-10 |
 | Per-device parallel encode      | `encode_push_runner.py` concurrency contract|
 | Update system                   | `auto_update.py` + `update_prefs.py`        |
 
-See `AGENTS.md` → "Recent significant changes" for the v1.8.16-1.8.20
+See `AGENTS.md` → "Recent significant changes" for the v1.8.16-1.8.24
 changelog and the anti-patterns list before editing.

@@ -242,7 +242,67 @@ class HookModePipeline:
             if dur > 0:
                 total_sec += dur
 
+        # Last-resort fallback: if the per-file probe summed to zero
+        # (e.g. a path round-trip mismatch on Windows, or every entry
+        # failed individually) ask ffmpeg/ffprobe to read the whole
+        # concat playlist as ONE virtual input. A zero here is what
+        # used to kill the encode % entirely, so it's worth a second
+        # shot before giving up.
+        if total_sec <= 0:
+            total_sec = self._probe_concat_total(
+                playlist_file, ffprobe, ffmpeg,
+            )
+
         return total_sec, total_bytes
+
+    @staticmethod
+    def _probe_concat_total(
+        playlist_file: Path, ffprobe: str | None, ffmpeg: str,
+    ) -> float:
+        """Probe total duration of an entire concat-demuxer playlist in
+        a single call. Returns 0.0 on any failure (never raises)."""
+        if ffprobe:
+            try:
+                res = subprocess.run(
+                    [
+                        ffprobe, "-v", "error",
+                        "-f", "concat", "-safe", "0",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        "-i", str(playlist_file),
+                    ],
+                    capture_output=True, text=True,
+                    timeout=20, check=False,
+                )
+                val = (res.stdout or "").strip()
+                if val:
+                    return float(val)
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                pass
+
+        # ffmpeg -i on the concat input prints a single aggregate
+        # ``Duration:`` line to stderr.
+        try:
+            res = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(playlist_file),
+                ],
+                capture_output=True, text=True,
+                timeout=20, check=False,
+            )
+            for line in (res.stderr or "").splitlines():
+                line = line.strip()
+                if line.startswith("Duration:"):
+                    hms = line.split(",", 1)[0].split(":", 1)[1].strip()
+                    if hms.upper().startswith("N/A"):
+                        return 0.0
+                    h, m, s = hms.split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
+        return 0.0
 
     @staticmethod
     def _sibling_tool(ffmpeg_path: str, name: str) -> str | None:
@@ -259,6 +319,44 @@ class HookModePipeline:
         # without ffprobe but the customer's system might have it.
         which = shutil.which(name)
         return which
+
+    @staticmethod
+    def _extract_out_time_us(line: str) -> "int | None":
+        """Pull the encoded-output position (microseconds) out of one
+        ffmpeg ``-progress`` line.
+
+        ffmpeg builds differ in which key they emit. We accept both
+        stable forms so the progress bar works regardless of build:
+
+          * ``out_time_us=1234567``        microseconds (modern builds)
+          * ``out_time=00:00:01.234567``   wall-clock string (present on
+                                            essentially every build that
+                                            supports ``-progress``)
+
+        We deliberately ignore ``out_time_ms`` because its meaning has
+        flip-flopped across ffmpeg versions (historically microseconds,
+        a known misnomer) and using it risks a bouncing percentage.
+
+        Returns ``None`` when the line isn't a usable time line or the
+        value is ``N/A`` (emitted before the first frame).
+        """
+        if line.startswith("out_time_us="):
+            val = line.split("=", 1)[1].strip()
+            try:
+                return int(val)
+            except ValueError:
+                return None
+        if line.startswith("out_time="):
+            val = line.split("=", 1)[1].strip()
+            if not val or val == "N/A":
+                return None
+            try:
+                hh, mm, ss = val.split(":")
+                total = int(hh) * 3600 + int(mm) * 60 + float(ss)
+            except (ValueError, IndexError):
+                return None
+            return int(total * 1_000_000)
+        return None
 
     @staticmethod
     def _probe_one(p: Path, ffprobe: str | None, ffmpeg: str) -> float:
@@ -399,6 +497,27 @@ class HookModePipeline:
         mb = max(0, file_bytes) / (1024 ** 2)
         budget = mb / 3.0 + 60.0
         return max(120, int(budget))
+
+    def _rate_control_args(self) -> list[str]:
+        """Build the x264 rate-control flags.
+
+        CRF is always the primary (constant-quality) control. In the
+        default quality-first mode we deliberately emit NO ``-maxrate``
+        / ``-bufsize`` cap so the encoder gives every frame exactly the
+        bits CRF asks for — quality stays constant regardless of clip
+        length or motion ("ห้ามลดคุณภาพ"). Opting out
+        (``encode_quality_first = false``) restores the v1.8.19 peak
+        cap that bounds file size at the cost of occasionally starving
+        a very high-motion scene.
+        """
+        crf = max(0, min(51, int(getattr(self.cfg, "encode_crf", 18))))
+        args = ["-crf", str(crf)]
+        if not getattr(self.cfg, "encode_quality_first", True):
+            args += [
+                "-maxrate", self.cfg.video_maxrate,
+                "-bufsize", self.cfg.video_bufsize,
+            ]
+        return args
 
     def _build_video_filter(
         self,
@@ -659,7 +778,6 @@ class HookModePipeline:
         #   * ``-x264-params`` re-asserts the colormatrix inside
         #     the H.264 VUI so even players that ignore container
         #     metadata still decode in BT.709.
-        crf = max(0, min(51, int(getattr(self.cfg, "encode_crf", 18))))
         preset = getattr(self.cfg, "encode_preset", "medium") or "medium"
         profile = getattr(self.cfg, "encode_profile", "high") or "high"
         cmd += [
@@ -679,13 +797,11 @@ class HookModePipeline:
             "-g", str(keyint),
             "-keyint_min", str(keyint),
             "-sc_threshold", "0",
-            # CRF as primary rate control; -maxrate caps spikes so
-            # a 60-s clip never blows up to 200 MB on a high-motion
-            # scene. Bufsize is 2× maxrate per x264's rate-control
-            # guidance.
-            "-crf", str(crf),
-            "-maxrate", self.cfg.video_maxrate,
-            "-bufsize", self.cfg.video_bufsize,
+            # Rate control (v1.8.24): CRF is the constant-quality
+            # governor. Quality-first mode (default) emits no peak
+            # cap so no scene is ever bitrate-starved at any clip
+            # length; opt-in size-capped mode re-adds -maxrate/-bufsize.
+            *self._rate_control_args(),
             # ── Color metadata (v1.8.19) ────────────────────────
             # Container-level tags + H.264 VUI so every decoder
             # on the planet knows this stream is BT.709 limited
@@ -937,23 +1053,44 @@ class HookModePipeline:
                 line = line.strip()
                 if not line:
                     continue
-                if line.startswith("out_time_us=") and duration_s > 0:
-                    try:
-                        us = int(line.split("=", 1)[1])
-                    except ValueError:
-                        continue
-                    pct = max(0.0, min(1.0, us / 1_000_000.0 / duration_s))
-                    # Only fire the callback when the percentage
-                    # actually moves -- saves Tk thread thrash on
-                    # very fast encodes.
-                    if abs(pct - last_pct) >= 0.005:
-                        last_pct = pct
-                        if progress_cb is not None:
-                            progress_cb(
-                                pct,
-                                f"กำลัง encode… {int(pct * 100)}%",
-                            )
-                elif line == "progress=end":
+                # Pull the encoded-output position out of whatever
+                # time key this ffmpeg build emits (out_time_us /
+                # out_time). Older / minimal static builds emit only
+                # ``out_time=HH:MM:SS.xxxxxx`` and NOT ``out_time_us``;
+                # keying solely off out_time_us left those customers
+                # with a dead 0 % bar ("% ไม่ขึ้น").
+                us = self._extract_out_time_us(line)
+                if us is not None:
+                    encoded_s = us / 1_000_000.0
+                    if duration_s > 0:
+                        pct = max(0.0, min(1.0, encoded_s / duration_s))
+                        # Only fire when the percentage actually moves
+                        # -- saves Tk thread thrash on fast encodes.
+                        if abs(pct - last_pct) >= 0.005:
+                            last_pct = pct
+                            if progress_cb is not None:
+                                progress_cb(
+                                    pct,
+                                    f"กำลัง encode… {int(pct * 100)}%",
+                                )
+                    else:
+                        # Duration probe failed (no ffprobe + per-file
+                        # probe returned 0). We can't compute a true %,
+                        # but we CAN surface the encoded position so the
+                        # bar is visibly alive instead of frozen at 0 %.
+                        # Bounded heartbeat asymptotes toward ~0.95.
+                        hb = encoded_s / (encoded_s + 30.0)
+                        if hb - last_pct >= 0.01:
+                            last_pct = hb
+                            if progress_cb is not None:
+                                mm = int(encoded_s) // 60
+                                ss = int(encoded_s) % 60
+                                progress_cb(
+                                    hb,
+                                    f"กำลัง encode… {mm}:{ss:02d}",
+                                )
+                    continue
+                if line == "progress=end":
                     if progress_cb is not None:
                         progress_cb(1.0, "Encode เสร็จ")
                     break

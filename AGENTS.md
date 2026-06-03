@@ -233,6 +233,18 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.24** — Hook-encode `%` fix + quality-first rate control.
+  Progress (`hook_mode._run_ffmpeg_with_progress`) now parses both
+  `out_time_us=` AND `out_time=HH:MM:SS` (minimal ffmpeg builds emit
+  only the latter — that left a dead 0 % bar). `_probe_playlist_duration`
+  gains a whole-playlist fallback (`_probe_concat_total`) when the
+  per-file sum is 0, and when duration is genuinely unknown the parser
+  emits an `mm:ss` heartbeat instead of freezing at 0 %. Separately,
+  `encode_quality_first` (default true) makes CRF 18 the SOLE quality
+  governor — no `-maxrate`/`-bufsize` peak cap — so quality is constant
+  regardless of clip length/motion ("ห้ามลดคุณภาพ"); set false in
+  config.json to restore the v1.8.19 size-capped path. Rate flags
+  factored into `_rate_control_args`. Tests: `tests/test_hook_progress.py`.
 - **v1.8.23** — Auto captcha solver (Phase 1, PC-only via ADB).
   New `vcam-pc/src/captcha/` package: `capture.py`
   (`adb exec-out screencap -p` → Pillow), `detect_cv.py` (Pillow-only

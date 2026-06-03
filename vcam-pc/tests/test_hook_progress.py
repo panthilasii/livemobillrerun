@@ -124,17 +124,22 @@ class TestEncodeProgress:
         assert calls[-1][0] == 1.0, f"final sample must be 1.0: {calls[-1]}"
         assert calls[-1][1] == "Encode เสร็จ"
 
-    def test_quiet_when_duration_unknown(self, pipeline, tmp_path):
-        """If ffprobe failed (duration_s == 0), don't fabricate a
-        percentage -- the bar should stay where the caller put it
-        rather than jump randomly. We DO still expect the final
-        ``progress=end`` callback at 1.0 so the UI can clear its
-        spinner."""
+    def test_heartbeat_when_duration_unknown(self, pipeline, tmp_path):
+        """If the duration probe failed (duration_s == 0) we can't
+        compute a true percentage, but a frozen 0 % bar is exactly
+        the "% ไม่ขึ้น" complaint. Instead we surface a bounded,
+        monotonic heartbeat driven by the *real* encoded position and
+        label it as ``mm:ss`` (not a fake %), so the customer can see
+        the encode is alive. Final ``progress=end`` still snaps to
+        1.0 / "Encode เสร็จ"."""
         calls: list[tuple[float, str]] = []
         proc = _FakeProc(
             stdout_lines=[
                 "frame=100\n",
                 "out_time_us=5000000\n",
+                "progress=continue\n",
+                "frame=600\n",
+                "out_time_us=30000000\n",
                 "progress=continue\n",
                 "progress=end\n",
             ],
@@ -148,10 +153,46 @@ class TestEncodeProgress:
                 progress_cb=lambda p, m: calls.append((p, m)),
                 t0=_now(),
             )
-        non_end = [c for c in calls if c[1] != "Encode เสร็จ"]
-        assert non_end == [], (
-            f"unexpected mid-stream samples without duration: {non_end}"
+        mid = [c for c in calls if c[1] != "Encode เสร็จ"]
+        assert mid, "heartbeat should emit at least one mid-stream sample"
+        pcts = [p for p, _ in mid]
+        assert pcts == sorted(pcts), f"heartbeat must be monotonic: {pcts}"
+        assert all(0.0 <= p < 1.0 for p in pcts), f"heartbeat out of range: {pcts}"
+        assert all(":" in m for _, m in mid), (
+            f"heartbeat label should show mm:ss, got: {[m for _, m in mid]}"
         )
+        assert calls[-1][0] == 1.0 and calls[-1][1] == "Encode เสร็จ"
+
+    def test_out_time_string_key_maps_to_percent(self, pipeline, tmp_path):
+        """Builds that emit only ``out_time=HH:MM:SS.xxxxxx`` (and not
+        ``out_time_us``) must still drive the percentage. This is the
+        core "% ไม่ขึ้น" regression: keying solely off out_time_us left
+        those customers with a dead bar."""
+        calls: list[tuple[float, str]] = []
+        proc = _FakeProc(
+            stdout_lines=[
+                "frame=900\n",
+                "out_time=00:00:30.000000\n",
+                "progress=continue\n",
+                "frame=1800\n",
+                "out_time=00:01:00.000000\n",
+                "progress=end\n",
+            ],
+        )
+        with patch("subprocess.Popen", return_value=proc):
+            pipeline._run_ffmpeg_with_progress(
+                cmd=["ffmpeg"],
+                output_path=tmp_path / "out.mp4",
+                duration_s=60.0,
+                timeout_s=600,
+                progress_cb=lambda p, m: calls.append((p, m)),
+                t0=_now(),
+            )
+        pcts = [p for p, _ in calls]
+        assert any(abs(p - 0.5) < 0.02 for p in pcts), (
+            f"out_time= string key did not map to 50%: {pcts}"
+        )
+        assert calls[-1][0] == 1.0
 
     def test_callback_throttled(self, pipeline, tmp_path):
         """The parser must coalesce sub-half-percent ticks. ffmpeg
@@ -182,6 +223,40 @@ class TestEncodeProgress:
             f"throttling failed: {len(calls)} callbacks for 1000 ticks"
         )
         assert calls[-1][0] == 1.0
+
+    def test_quality_first_drops_bitrate_cap(self, pipeline):
+        """Quality-first (default) must NOT emit a -maxrate/-bufsize
+        peak cap, so CRF governs purely and no scene is ever
+        bitrate-starved regardless of clip length."""
+        pipeline.cfg.encode_quality_first = True
+        pipeline.cfg.encode_crf = 18
+        args = pipeline._rate_control_args()
+        assert args == ["-crf", "18"]
+        assert "-maxrate" not in args and "-bufsize" not in args
+
+    def test_size_capped_mode_keeps_bitrate_cap(self, pipeline):
+        """Opt-in size-capped mode restores the v1.8.19 peak cap."""
+        pipeline.cfg.encode_quality_first = False
+        pipeline.cfg.encode_crf = 18
+        pipeline.cfg.video_maxrate = "12000k"
+        pipeline.cfg.video_bufsize = "24000k"
+        args = pipeline._rate_control_args()
+        assert "-crf" in args and "18" in args
+        assert "-maxrate" in args and "12000k" in args
+        assert "-bufsize" in args and "24000k" in args
+
+    def test_extract_out_time_us_variants(self, pipeline):
+        """Lock the time-key parser: accept out_time_us + out_time,
+        ignore out_time_ms (ambiguous) and N/A / unrelated lines."""
+        f = pipeline._extract_out_time_us
+        assert f("out_time_us=30000000") == 30_000_000
+        assert f("out_time=00:00:30.000000") == 30_000_000
+        assert f("out_time=00:01:00.500000") == 60_500_000
+        # Ambiguous / not-yet-started / unrelated → None.
+        assert f("out_time_ms=30000000") is None
+        assert f("out_time=N/A") is None
+        assert f("frame=900") is None
+        assert f("progress=continue") is None
 
     def test_callback_failure_does_not_crash(self, pipeline, tmp_path):
         """A buggy progress callback (e.g. UI widget destroyed mid-

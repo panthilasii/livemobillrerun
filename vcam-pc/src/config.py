@@ -153,6 +153,22 @@ class StreamConfig:
     # Redmi 5A / Realme C1-era phones.
     encode_profile: str = "high"
 
+    # ── Quality-first rate control (v1.8.24) ────────────────────
+    # When true (default), CRF is the SOLE quality governor: we do
+    # NOT apply a ``-maxrate`` / ``-bufsize`` peak cap. This is the
+    # explicit customer requirement — "ต่อให้คลิปยาวขนาดไหน ห้าม
+    # ลดคุณภาพ". CRF already assigns bits per-frame by complexity and
+    # is completely independent of clip length, but the v1.8.19 peak
+    # cap (12 Mbps) could occasionally starve a very high-motion
+    # scene and shave detail. Dropping the cap guarantees every
+    # frame gets exactly the bits CRF 18 asks for, at any length.
+    #
+    # Trade-off: file size is unbounded (a long, busy clip can get
+    # large). That's acceptable here because quality is the priority
+    # and the push timeout already scales with file size. Set this
+    # false in config.json to restore the v1.8.19 size-capped path.
+    encode_quality_first: bool = True
+
     # ── Match-source geometry (v1.8.21) ─────────────────────────
     # When true (default), the hook encode keeps the SOURCE clip's
     # native resolution + aspect ratio: it applies the orientation
