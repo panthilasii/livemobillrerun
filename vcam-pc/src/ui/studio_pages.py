@@ -2259,6 +2259,36 @@ class DashboardPage(ctk.CTkFrame):
             row=5, column=0, sticky="w", padx=20, pady=(0, 8),
         )
 
+        # ── Auto captcha solver toggle (v1.8.23) ────────────────
+        # Opt-in per device: when on, a background loop screen-caps
+        # this phone and drags any TikTok slide/jigsaw verification
+        # for the customer. Driven by ``DeviceEntry.auto_solve`` +
+        # ``StudioApp.auto_solve`` registry; status text arrives via
+        # ``on_auto_solve_status``.
+        autosolve_row = ctk.CTkFrame(parent, fg_color="transparent")
+        autosolve_row.grid(row=6, column=0, sticky="ew", padx=20, pady=(2, 0))
+        autosolve_row.grid_columnconfigure(0, weight=1)
+        self.sw_auto_solve = ctk.CTkSwitch(
+            autosolve_row,
+            text="🤖  แก้ captcha อัตโนมัติ",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            progress_color=THEME.success,
+            command=self._on_auto_solve_toggle,
+        )
+        self.sw_auto_solve.grid(row=0, column=0, sticky="w")
+        self.lbl_auto_solve_hint = ctk.CTkLabel(
+            parent,
+            text="เปิดให้ระบบจับ captcha จิ๊กซอว์/สไลเดอร์แล้วลากให้อัตโนมัติ",
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        )
+        self.lbl_auto_solve_hint.grid(
+            row=7, column=0, sticky="w", padx=20, pady=(0, 8),
+        )
+
         # Power-user shortcut tip. Surfaced inline so customers
         # discover scrcpy's killer features without reading a
         # manual. The list is short on purpose — three items max
@@ -2277,7 +2307,7 @@ class DashboardPage(ctk.CTkFrame):
             anchor="w",
             justify="left",
             wraplength=520,
-        ).grid(row=6, column=0, sticky="w", padx=20, pady=(0, 16))
+        ).grid(row=8, column=0, sticky="w", padx=20, pady=(0, 16))
 
         # Subscribe to scrcpy session lifecycle so closing the
         # mirror window externally re-renders the button label.
@@ -2431,10 +2461,12 @@ class DashboardPage(ctk.CTkFrame):
                 text_color=THEME.fg_muted,
             )
             self._render_clip_mode_state(None, False)
+            self._render_auto_solve_state(None, False)
             return
 
         is_online = self.app.is_online(e.serial)
         self._render_clip_mode_state(e, is_online)
+        self._render_auto_solve_state(e, is_online)
 
         # scrcpy not on PATH → orange status + grey-styled button.
         # We don't fully disable the button: the dialog the click
@@ -2639,6 +2671,85 @@ class DashboardPage(ctk.CTkFrame):
 
         try:
             self.after(0, _done)
+        except Exception:
+            pass
+
+    # ── Auto captcha solver (v1.8.23) ───────────────────────────
+
+    def _render_auto_solve_state(self, e, is_online: bool) -> None:
+        if not hasattr(self, "sw_auto_solve"):
+            return
+        if e is None:
+            self.sw_auto_solve.deselect()
+            self.sw_auto_solve.configure(state="disabled")
+            self.lbl_auto_solve_hint.configure(
+                text="เลือกเครื่องก่อน",
+                text_color=THEME.fg_muted,
+            )
+            return
+
+        enabled = bool(getattr(e, "auto_solve", False))
+        if enabled:
+            self.sw_auto_solve.select()
+        else:
+            self.sw_auto_solve.deselect()
+        self.sw_auto_solve.configure(state=("normal" if is_online else "disabled"))
+
+        has_key = bool(getattr(self.app.cfg, "gemini_api_key", ""))
+        if not is_online:
+            txt = "เครื่อง offline — เชื่อมต่อก่อนเปิดแก้ captcha อัตโนมัติ"
+            color = THEME.fg_muted
+        elif enabled:
+            running = self.app.auto_solve.is_running(e.serial)
+            mode = "Gemini + CV" if has_key else "CV (ฟรี, เฉพาะสไลเดอร์)"
+            txt = f"กำลังเฝ้าดู captcha • โหมด: {mode}" if running else \
+                f"เปิดอยู่ • โหมด: {mode}"
+            color = THEME.success
+        else:
+            txt = (
+                "เปิดให้ระบบจับ captcha จิ๊กซอว์/สไลเดอร์แล้วลากให้อัตโนมัติ"
+                + ("" if has_key else " — ใส่ Gemini API key ใน ตั้งค่า เพื่อความแม่นยำ")
+            )
+            color = THEME.fg_muted
+        self.lbl_auto_solve_hint.configure(text=txt, text_color=color)
+
+    def _on_auto_solve_toggle(self) -> None:
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        want = bool(self.sw_auto_solve.get())
+        if want and not self.app.is_online(e.serial):
+            messagebox.showwarning(
+                "เครื่องไม่ได้เชื่อมต่อ",
+                "เสียบ USB หรือเชื่อม WiFi ADB ก่อนเปิดการแก้ captcha อัตโนมัติครับ",
+            )
+            self.sw_auto_solve.deselect()
+            return
+
+        self.app.devices_lib.update_auto_solve(e.serial, want)
+        self.app.save_devices()
+        # Reconcile immediately so the loop starts/stops without
+        # waiting for the next 2 s device poll.
+        try:
+            self.app._reconcile_auto_solve()
+        except Exception:
+            log.exception("auto-solve reconcile (toggle) crashed")
+        self._render_auto_solve_state(e, self.app.is_online(e.serial))
+
+    def on_auto_solve_status(self, serial: str, message: str) -> None:
+        """Called (on the Tk thread) by ``StudioApp`` when an
+        auto-solve worker emits status text. We only surface it for
+        the currently-selected device so the hint line doesn't
+        flicker between phones."""
+        if not hasattr(self, "lbl_auto_solve_hint"):
+            return
+        sel = self.app.selected_entry()
+        if sel is None or sel.serial != serial:
+            return
+        try:
+            self.lbl_auto_solve_hint.configure(
+                text=f"🤖  {message}", text_color=THEME.success,
+            )
         except Exception:
             pass
 
@@ -6474,12 +6585,19 @@ class SettingsPage(ctk.CTkFrame):
         enc_card.grid_columnconfigure(0, weight=1)
         self._build_encode_card(enc_card)
 
+        # Auto captcha-solver card (v1.8.23) — bring-your-own Gemini
+        # key. Empty key = free Pillow CV path (slide only).
+        captcha_card = _card(body)
+        captcha_card.grid(row=3, column=0, sticky="ew", padx=40, pady=10)
+        captcha_card.grid_columnconfigure(0, weight=1)
+        self._build_captcha_card(captcha_card)
+
         # Compatibility card — what phones the customer can use.
         # We surface this in-app (not just in the bundled MANUAL_TH.md)
         # because customers reliably check Settings before reading
         # docs, and the #1 sales question is "ใช้กับเครื่องอะไรได้".
         compat_card = _card(body)
-        compat_card.grid(row=3, column=0, sticky="ew", padx=40, pady=10)
+        compat_card.grid(row=4, column=0, sticky="ew", padx=40, pady=10)
         compat_card.grid_columnconfigure(0, weight=1)
         self._build_compat_card(compat_card)
 
@@ -6488,7 +6606,7 @@ class SettingsPage(ctk.CTkFrame):
         # it after reviewing license + version (the typical
         # pre-bug-report sweep).
         support_card = _card(body)
-        support_card.grid(row=4, column=0, sticky="ew", padx=40, pady=10)
+        support_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
         support_card.grid_columnconfigure(0, weight=1)
         self._build_support_card(support_card)
 
@@ -6499,13 +6617,13 @@ class SettingsPage(ctk.CTkFrame):
         #   1. visibility ("ตรวจล่าสุด X นาทีที่แล้ว"), and
         #   2. control ("ตรวจเลย" / two opt-in toggles).
         update_card = _card(body)
-        update_card.grid(row=5, column=0, sticky="ew", padx=40, pady=10)
+        update_card.grid(row=6, column=0, sticky="ew", padx=40, pady=10)
         update_card.grid_columnconfigure(0, weight=1)
         self._build_update_settings_card(update_card)
 
         # About card
         about_card = _card(body)
-        about_card.grid(row=6, column=0, sticky="ew", padx=40, pady=10)
+        about_card.grid(row=7, column=0, sticky="ew", padx=40, pady=10)
         about_card.grid_columnconfigure(0, weight=1)
 
         _h2(about_card, "เกี่ยวกับ").grid(
@@ -6618,6 +6736,93 @@ class SettingsPage(ctk.CTkFrame):
             cfg.save()
         except Exception:
             log.exception("ไม่สามารถบันทึก config (mirror)")
+
+    # ── auto captcha-solver card ─────────────────────────────────
+    def _build_captcha_card(self, parent: ctk.CTkFrame) -> None:
+        """Bring-your-own Gemini key for the auto captcha solver.
+
+        The per-device toggle that actually arms the solver lives on
+        the dashboard Live card; this card only configures the
+        optional high-accuracy brain. Empty key = free Pillow CV
+        path (handles the common slide challenge, best-effort).
+        """
+        cfg = self.app.cfg
+
+        _h2(parent, "🤖  แก้ captcha อัตโนมัติ").grid(
+            row=0, column=0, sticky="w", padx=20, pady=(20, 4)
+        )
+        _muted(
+            parent,
+            "เปิด/ปิด ราย\u200bเครื่องได้ที่การ์ด Mirror ในหน้า Dashboard.\n"
+            "ไม่ใส่ key = ใช้ตัวตรวจในเครื่องฟรี (เฉพาะ captcha สไลเดอร์).\n"
+            "ใส่ Google Gemini API key เพื่อความแม่นยำสูงและรองรับหลายแบบ\n"
+            "(key เป็นของลูกค้าเอง คิดค่าใช้จ่ายกับบัญชี Google ของลูกค้า).",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(
+            parent, text="Gemini API key",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=2, column=0, sticky="w", padx=20, pady=(0, 4))
+
+        entry_row = ctk.CTkFrame(parent, fg_color="transparent")
+        entry_row.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 8))
+        entry_row.grid_columnconfigure(0, weight=1)
+
+        self._gemini_key_var = ctk.StringVar(
+            value=str(getattr(cfg, "gemini_api_key", "") or "")
+        )
+        self._gemini_key_entry = ctk.CTkEntry(
+            entry_row,
+            textvariable=self._gemini_key_var,
+            placeholder_text="AIza… (เว้นว่างเพื่อใช้ตัวตรวจฟรี)",
+            show="*",
+            fg_color=THEME.bg_input,
+            border_color=THEME.border,
+            text_color=THEME.fg_primary,
+            height=36,
+        )
+        self._gemini_key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        ctk.CTkButton(
+            entry_row, text="บันทึก", width=90, height=36,
+            fg_color=THEME.primary, hover_color=THEME.primary_hover,
+            text_color="white",
+            command=self._on_gemini_key_save,
+        ).grid(row=0, column=1, sticky="e")
+
+        self._lbl_gemini_status = ctk.CTkLabel(
+            parent,
+            text=(
+                "สถานะ: ใช้ Gemini (แม่นยำ)"
+                if getattr(cfg, "gemini_api_key", "")
+                else "สถานะ: ใช้ตัวตรวจในเครื่องฟรี (CV)"
+            ),
+            text_color=THEME.fg_muted,
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        )
+        self._lbl_gemini_status.grid(
+            row=4, column=0, sticky="w", padx=20, pady=(0, 20)
+        )
+
+    def _on_gemini_key_save(self) -> None:
+        cfg = self.app.cfg
+        cfg.gemini_api_key = self._gemini_key_var.get().strip()
+        try:
+            cfg.save()
+        except Exception:
+            log.exception("ไม่สามารถบันทึก config (gemini key)")
+            messagebox.showwarning("บันทึกไม่สำเร็จ", "ลองอีกครั้งครับ")
+            return
+        has_key = bool(cfg.gemini_api_key)
+        self._lbl_gemini_status.configure(
+            text=(
+                "สถานะ: ใช้ Gemini (แม่นยำ)"
+                if has_key else "สถานะ: ใช้ตัวตรวจในเครื่องฟรี (CV)"
+            ),
+            text_color=THEME.success if has_key else THEME.fg_muted,
+        )
 
     # ── compatibility card ────────────────────────────────────────
     def _build_compat_card(self, parent: ctk.CTkFrame) -> None:

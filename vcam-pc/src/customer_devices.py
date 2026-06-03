@@ -161,6 +161,15 @@ class DeviceEntry:
     # and ``both`` are support toggles for devices whose camera
     # mapping / live flow differs.
     bypass_facing: str = "back"
+    # ── Auto captcha solver (v1.8.23) ───────────────────────────
+    # When True, the desktop app runs a per-device background loop
+    # (see src/captcha/runner.py) that screen-caps this phone, looks
+    # for a TikTok slide/jigsaw verification popup, and drags the
+    # slider to clear it. Off by default — the customer opts in per
+    # phone from the Live card so a phone they're using normally
+    # isn't auto-driven without their say-so. Persisted so the
+    # loop resumes on next launch for phones that were left enabled.
+    auto_solve: bool = False
 
     def display_name(self) -> str:
         return self.label or self.model or self.serial
@@ -262,6 +271,7 @@ class DeviceLibrary:
                     created_at=str(raw.get("created_at", "")),
                     clip_showing=bool(raw.get("clip_showing", True)),
                     bypass_facing=str(raw.get("bypass_facing", "back") or "back"),
+                    auto_solve=bool(raw.get("auto_solve", False)),
                 )
             except Exception:
                 log.exception("skipping malformed device entry %r", serial)
@@ -431,6 +441,14 @@ class DeviceLibrary:
             e = self.entries.get(serial)
             if e is not None:
                 e.bypass_facing = raw
+
+    def update_auto_solve(self, serial: str, auto_solve: bool) -> None:
+        """Persist whether the per-device auto captcha-solver loop
+        should run for this phone."""
+        with self._lock:
+            e = self.entries.get(serial)
+            if e is not None:
+                e.auto_solve = bool(auto_solve)
 
     def update_clip_showing(self, serial: str, clip_showing: bool) -> None:
         """Persist whether the hook should replace camera frames with the clip."""

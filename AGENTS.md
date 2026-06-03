@@ -233,6 +233,23 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.23** — Auto captcha solver (Phase 1, PC-only via ADB).
+  New `vcam-pc/src/captcha/` package: `capture.py`
+  (`adb exec-out screencap -p` → Pillow), `detect_cv.py` (Pillow-only
+  slide/jigsaw gap finder, no opencv/numpy), `gemini.py` (optional
+  bring-your-own-key vision path over `httpx`), `drag.py` (human-ish
+  `input swipe` with overshoot+settle), `solver.py` (capture→detect
+  →drag→verify), `runner.py` (`AutoSolveRegistry`, one daemon loop per
+  device, `Event` stop — mirrors `AnnouncementPoller`). Per-device
+  opt-in via `DeviceEntry.auto_solve` + Live-card switch;
+  `StudioApp._reconcile_auto_solve` starts/stops loops on the 2 s
+  device poll and `_on_close` tears them down. Config:
+  `gemini_api_key` / `gemini_model` / `captcha_poll_s` /
+  `captcha_max_retries` (Settings card "แก้ captcha อัตโนมัติ").
+  Targets TikTok on the *phone* (not PC LIVE Studio). Touch-injection
+  via the hook is deferred to Phase 2 (needs Android changes +
+  re-patch). Tests: `tests/test_captcha_*.py`,
+  `tests/test_customer_devices_auto_solve.py`.
 - **v1.8.20** — License cap enforced in auto-discovery.
   `DeviceLibrary.try_admit_new` gates new serials by
   `license.max_devices`; `_on_devices_polled` + wizard `_finish`

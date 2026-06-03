@@ -31,6 +31,7 @@ import customtkinter as ctk
 
 from ..adb import AdbController, AdbDevice
 from ..branding import BRAND, THEME
+from ..captcha import AutoSolveRegistry
 from ..config import ProfileLibrary, StreamConfig
 from ..customer_devices import DeviceEntry, DeviceLibrary
 from ..encode_push_tasks import EncodePushRegistry, device_local_mp4
@@ -354,6 +355,12 @@ class StudioApp(ctk.CTk):
         # sidebar can render a per-device progress badge.
         self.encode_tasks = EncodePushRegistry()
         self.local_mp4 = default_local_mp4(self.cfg)
+
+        # Per-device auto captcha-solver loops (v1.8.23). Started /
+        # stopped from ``_reconcile_auto_solve`` as devices go
+        # online/offline and the customer toggles the Live-card
+        # switch; torn down in ``_on_close``.
+        self.auto_solve = AutoSolveRegistry()
 
         # ── poller
         self._poller = _DevicePoller(
@@ -1040,6 +1047,13 @@ class StudioApp(ctk.CTk):
         for serial, t in transport_for.items():
             self.devices_lib.mark_seen_via(serial, t)
 
+        # Start/stop per-device auto captcha-solver loops to match the
+        # current online set + each entry's ``auto_solve`` flag.
+        try:
+            self._reconcile_auto_solve()
+        except Exception:
+            log.exception("auto-solve reconcile crashed")
+
         # Bubble the update to the current page, if it cares.
         page = self._current_page
         if page is not None and hasattr(page, "on_devices_changed"):
@@ -1050,6 +1064,57 @@ class StudioApp(ctk.CTk):
 
     def is_online(self, serial: str) -> bool:
         return serial in self.online_serials
+
+    def _reconcile_auto_solve(self) -> None:
+        """Bring the running auto-solve loops in line with state.
+
+        A loop should run for a serial iff the device is online AND
+        its ``auto_solve`` flag is set. Anything running that no
+        longer meets both conditions is stopped; anything that meets
+        both but isn't running is started. Idempotent — safe to call
+        on every 2 s device poll.
+        """
+        want: set[str] = set()
+        for e in self.devices_lib.list():
+            if getattr(e, "auto_solve", False) and self.is_online(e.serial):
+                want.add(e.serial)
+
+        # Stop loops that should no longer run.
+        for serial in self.auto_solve.running_serials():
+            if serial not in want:
+                self.auto_solve.stop(serial)
+
+        # Start loops that should be running but aren't.
+        for serial in want:
+            if self.auto_solve.is_running(serial):
+                continue
+            adb_id = self.adb_id_for_serial.get(serial, serial)
+            self.auto_solve.start(
+                serial,
+                adb_path=self.cfg.adb_path,
+                adb_serial=adb_id,
+                gemini_api_key=getattr(self.cfg, "gemini_api_key", ""),
+                gemini_model=getattr(self.cfg, "gemini_model", "gemini-2.0-flash"),
+                poll_s=getattr(self.cfg, "captcha_poll_s", 3.0),
+                max_retries=getattr(self.cfg, "captcha_max_retries", 3),
+                on_status=self._on_auto_solve_status,
+            )
+
+    def _on_auto_solve_status(self, serial: str, message: str) -> None:
+        """Receive status text from an auto-solve worker thread and
+        marshal it onto the Tk thread for the current page (if it
+        wants it). Worker threads must never touch widgets directly."""
+        def _deliver() -> None:
+            page = self._current_page
+            if page is not None and hasattr(page, "on_auto_solve_status"):
+                try:
+                    page.on_auto_solve_status(serial, message)
+                except Exception:
+                    log.debug("page.on_auto_solve_status failed", exc_info=True)
+        try:
+            self.after(0, _deliver)
+        except Exception:
+            pass
 
     def refresh_devices_now(self, timeout: float = 3.0) -> bool:
         """Force a synchronous ``adb devices -l`` refresh and update
@@ -1373,6 +1438,10 @@ class StudioApp(ctk.CTk):
 
         try:
             self._poller.stop()
+        except Exception:
+            pass
+        try:
+            self.auto_solve.stop_all()
         except Exception:
             pass
         try:

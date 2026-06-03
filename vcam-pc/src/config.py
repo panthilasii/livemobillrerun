@@ -182,6 +182,28 @@ class StreamConfig:
     videos_dir: str = "videos"
     default_profile: str = "Redmi 13C"
 
+    # ── Auto captcha solver (v1.8.23) ───────────────────────────
+    # When TikTok pops a slide/jigsaw verification on the *phone*
+    # during a live, the per-device auto-solver (see src/captcha/)
+    # can detect it from an ADB screen capture and drag the slider.
+    #
+    # ``gemini_api_key`` is **bring-your-own**: empty means the free
+    # Pillow CV detector is the only brain (handles the common slide
+    # challenge, best-effort). Supplying a Google Gemini key unlocks
+    # the high-accuracy vision path (slide / rotate / image-select)
+    # and is billed to the customer's own Google account — we ship
+    # no key and pay nothing per solve.
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    # How often each enabled device re-checks its screen for a
+    # captcha, in seconds. Lower = faster reaction but more ADB
+    # screencaps (and Gemini calls, if a key is set).
+    captcha_poll_s: float = 3.0
+    # Max consecutive drag attempts on one challenge before the loop
+    # backs off to the normal poll cadence (avoids hammering a
+    # captcha we keep failing).
+    captcha_max_retries: int = 3
+
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "StreamConfig":
         if not path.is_file():

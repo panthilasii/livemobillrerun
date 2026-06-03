@@ -124,6 +124,23 @@ on/off without re-pushing.
 - `scrcpy_mirror.py` / `scrcpy_installer.py` — on-PC screen mirror.
 - `live_control.py` — volume/home/rotate/screenshot device controls.
 
+### Auto captcha solver (v1.8.23, `captcha/` package)
+- `captcha/capture.py` — phone screen grab via `adb exec-out screencap -p`
+  → Pillow (`exec-out` avoids the Windows CRLF PNG corruption, same as
+  the APK pull ladder).
+- `captcha/detect_cv.py` — free Pillow-only slide/jigsaw detector
+  (brightness-band popup find + edge-column gap find; **no opencv/numpy**,
+  all reductions via PIL `resize`).
+- `captcha/gemini.py` — optional bring-your-own-key Gemini vision path
+  over `httpx` (no new deps); returns slider src/dst as image %.
+- `captcha/drag.py` — `input swipe` with overshoot+settle+jitter
+  (Phase 1 anti-detection; hook MotionEvent injection is Phase 2).
+- `captcha/solver.py` — `solve_once`: capture → detect (CV then Gemini)
+  → drag → re-capture verify.
+- `captcha/runner.py` — `AutoSolveRegistry`: one daemon loop per device,
+  `Event` stop. Driven by `DeviceEntry.auto_solve` + Live-card switch;
+  `StudioApp._reconcile_auto_solve` starts/stops on the 2 s poll.
+
 ### Patching
 - `lspatch_pipeline.py` — pull TikTok APKs → LSPatch fuse → re-install.
   Contains the pull-fallback ladder, Java-probe quarantine handling,
