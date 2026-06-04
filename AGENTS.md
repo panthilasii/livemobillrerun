@@ -233,6 +233,14 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.25** — Kill the Windows `cmd` console flash. GUI builds spawn
+  `adb.exe`/`ffmpeg.exe` constantly (device poll every ~2s, push,
+  screencap), and Windows gave each child its own console window that
+  popped up and vanished ("จอ adb เด้ง"). New `src/_win_no_window.py`
+  wraps `subprocess.Popen.__init__` once at `main()` startup to OR in
+  `CREATE_NO_WINDOW` for every child — covers all ~80 call sites without
+  editing them, no-op off Windows. Only `rtmp_server.py` set the flag
+  before. Tests: `tests/test_win_no_window.py`.
 - **v1.8.24** — Hook-encode `%` fix + quality-first rate control.
   Progress (`hook_mode._run_ffmpeg_with_progress`) now parses both
   `out_time_us=` AND `out_time=HH:MM:SS` (minimal ffmpeg builds emit

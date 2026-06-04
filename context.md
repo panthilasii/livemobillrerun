@@ -246,6 +246,7 @@ Local Windows ZIP build (no CI): `setup_ci_tools.py --os windows` then
 | Encode `%` / progress bar       | `hook_mode.py` `_run_ffmpeg_with_progress` + `_extract_out_time_us` (v1.8.24) |
 | License limits                  | `customer_devices.py` `try_admit_new`       |
 | Windows "phone not found"       | `platform_tools` driver locators + AGENTS gotchas 9-10 |
+| Windows cmd console flash       | `_win_no_window.py` (patched in `main()`, v1.8.25) |
 | Per-device parallel encode      | `encode_push_runner.py` concurrency contract|
 | Update system                   | `auto_update.py` + `update_prefs.py`        |
 

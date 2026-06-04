@@ -249,6 +249,14 @@ def run_legacy(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # FIRST thing, before anything can spawn a child process: stop the
+    # Windows cmd-console flash on every adb/ffmpeg call. The startup
+    # diagnostic below runs `adb version`/`adb devices`, and the Studio
+    # UI polls `adb devices` every ~2s — without this each spawn pops a
+    # black console window ("จอ adb เด้ง"). No-op off Windows.
+    from . import _win_no_window
+    _win_no_window.install()
+
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     _setup_logging(args.verbose)
 
