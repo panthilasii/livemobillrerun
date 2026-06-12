@@ -247,6 +247,7 @@ Local Windows ZIP build (no CI): `setup_ci_tools.py --os windows` then
 | License limits                  | `customer_devices.py` `try_admit_new`       |
 | Windows "phone not found"       | `platform_tools` driver locators + AGENTS gotchas 9-10 |
 | Windows cmd console flash       | `_win_no_window.py` (patched in `main()`, v1.8.25) |
+| macOS adb "รันไม่ได้"/quarantine | `platform_tools.heal_bundled_tools()` (chmod +x + `xattr -d`, called in `main()`, v1.8.26) |
 | Per-device parallel encode      | `encode_push_runner.py` concurrency contract|
 | Update system                   | `auto_update.py` + `update_prefs.py`        |
 

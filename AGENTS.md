@@ -233,6 +233,17 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.26** — Auto-heal the bundled toolchain on macOS so customers
+  never hit the "พบ adb แต่รันไม่ได้ … รอเครื่อง…" dialog. A .dmg /
+  Safari-downloaded ZIP stamps `com.apple.quarantine` on `adb`/`ffmpeg`/
+  `java`/`scrcpy`, and Gatekeeper SIGKILLs them on spawn (and some unzip
+  tools drop the +x bit). New `platform_tools.heal_bundled_tools()` runs
+  at `main()` startup (before the adb probe): `chmod +x` + `xattr -d
+  com.apple.quarantine` on the key binaries synchronously, plus a
+  background recursive `xattr -dr` sweep of `.tools/` for JDK/scrcpy
+  dylibs. `studio_app._check_adb_or_warn` re-heals + re-probes before
+  showing the dialog, so it's now truly last-resort. No-op on Windows.
+  Tests: `tests/test_heal_bundled_tools.py`.
 - **v1.8.25** — Kill the Windows `cmd` console flash. GUI builds spawn
   `adb.exe`/`ffmpeg.exe` constantly (device poll every ~2s, push,
   screencap), and Windows gave each child its own console window that

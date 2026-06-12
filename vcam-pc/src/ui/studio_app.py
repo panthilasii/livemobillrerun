@@ -877,7 +877,18 @@ class StudioApp(ctk.CTk):
                 f"ไม่พบ {adb_name} ที่ตำแหน่ง:\n  {adb_path}"
             )
         elif not self.adb.is_available():
-            broken_reason = f"พบ {adb_name}{cause_hint}"
+            # Last-chance self-heal before nagging the customer: a
+            # quarantined / non-executable bundled adb is the #1 cause
+            # here on macOS. main() already healed at boot, but re-run
+            # in case the app was moved/re-quarantined since, then
+            # re-probe. Only show the dialog if it STILL won't run.
+            try:
+                from .. import platform_tools as _pt
+                _pt.heal_bundled_tools()
+            except Exception:
+                pass
+            if not self.adb.is_available():
+                broken_reason = f"พบ {adb_name}{cause_hint}"
 
         if broken_reason is None:
             return

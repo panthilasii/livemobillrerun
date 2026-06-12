@@ -47,14 +47,19 @@ found — callers decide whether that's fatal or not.
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import shutil
+import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import PROJECT_ROOT
+
+log = logging.getLogger(__name__)
 
 
 # ── platform identification ──────────────────────────────────────
@@ -574,6 +579,113 @@ def make_subprocess_env(extra_path: list[Path] | None = None) -> dict[str, str]:
         + " -Duser.language=en -Duser.country=US -Duser.timezone=UTC"
     ).strip()
     return env
+
+
+# ── self-heal bundled executables (macOS / Linux) ────────────────
+
+
+def _exec_tool_paths() -> list[Path]:
+    """Bundled binaries that MUST be executable for the app to work.
+
+    Resolvers that return None (tool not bundled on this OS) are
+    skipped. ``ffprobe`` is added as the sibling of ``ffmpeg`` because
+    the encode duration-probe falls back to it.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path | None) -> None:
+        if p is None:
+            return
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
+    _add(find_adb())
+    ff = find_ffmpeg()
+    _add(ff)
+    if ff is not None:
+        probe = ff.with_name("ffprobe")
+        if probe.is_file():
+            _add(probe)
+    _add(find_java())
+    try:
+        _add(find_scrcpy())
+    except Exception:
+        pass
+    _add(find_mediamtx())
+    return out
+
+
+def _strip_quarantine(target: Path, *, recursive: bool) -> None:
+    """macOS-only: remove ``com.apple.quarantine`` from ``target``.
+
+    No-op on other OSes or when ``xattr`` isn't on PATH. Best-effort;
+    never raises.
+    """
+    if not is_macos():
+        return
+    xattr = shutil.which("xattr")
+    if xattr is None:
+        return
+    flag = "-dr" if recursive else "-d"
+    try:
+        subprocess.run(
+            [xattr, flag, "com.apple.quarantine", str(target)],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def heal_bundled_tools() -> None:
+    """Make the bundled toolchain runnable on macOS / Linux.
+
+    Two failure modes this fixes — both common on customer Macs and
+    the cause of the "พบ adb แต่รันไม่ได้ … หน้าเพิ่มเครื่องค้างที่
+    รอเครื่อง…" dialog:
+
+    * **Gatekeeper quarantine** — a .dmg / Safari-downloaded ZIP tags
+      every bundled binary with ``com.apple.quarantine``. macOS then
+      SIGKILLs ``adb`` / ``ffmpeg`` the instant we spawn them, so the
+      wizard hangs on "รอเครื่อง…" forever.
+    * **Missing execute bit** — some unzip tools drop the +x bit, so
+      the binary is present but not runnable.
+
+    No-op on Windows. Best-effort: never raises. The targeted
+    chmod + quarantine-strip on the key binaries runs synchronously
+    (a handful of files, fast) so it completes before the startup adb
+    probe; a recursive quarantine sweep of the whole tools tree (for
+    the JDK / scrcpy dylibs the patch + mirror steps need) is
+    dispatched to a daemon thread so it can't slow the launch.
+    """
+    if is_windows():
+        return
+    targets = _exec_tool_paths()
+    for p in targets:
+        try:
+            mode = p.stat().st_mode
+            os.chmod(p, mode | 0o111)
+        except OSError:
+            pass
+    if not is_macos():
+        return
+    for p in targets:
+        _strip_quarantine(p, recursive=False)
+    log.info("healed %d bundled tool(s): chmod +x + de-quarantine", len(targets))
+
+    def _sweep() -> None:
+        for root in (tools_root_for(), LEGACY_TOOLS_ROOT):
+            try:
+                if root.is_dir():
+                    _strip_quarantine(root, recursive=True)
+            except OSError:
+                pass
+
+    threading.Thread(
+        target=_sweep, daemon=True, name="tool-quarantine-sweep",
+    ).start()
 
 
 # ── status object ────────────────────────────────────────────────

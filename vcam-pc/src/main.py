@@ -260,6 +260,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     _setup_logging(args.verbose)
 
+    # Self-heal the bundled toolchain BEFORE the diagnostic probes adb.
+    # On macOS a .dmg / Safari-downloaded ZIP tags adb/ffmpeg/java with
+    # com.apple.quarantine and Gatekeeper then SIGKILLs them on spawn —
+    # the wizard hangs on "รอเครื่อง…" and the customer sees the
+    # "พบ adb แต่รันไม่ได้" dialog. chmod +x + xattr -d here fixes that
+    # automatically so customers never have to touch Terminal. No-op on
+    # Windows.
+    try:
+        from . import platform_tools as _pt
+        _pt.heal_bundled_tools()
+    except Exception:
+        # Healing must never block startup.
+        pass
+
     # macOS .dmg footgun guard: refuse to boot when PROJECT_ROOT is
     # on a read-only mount. We do this *before* the diagnostic write
     # because that itself would crash on the .dmg.
