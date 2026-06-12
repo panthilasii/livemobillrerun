@@ -233,6 +233,22 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.27** — Fix the REAL macOS .dmg bug: the .dmg shipped NO tools
+  at all. `build_dmg.sh` never copied `.tools/`/`apk/` into the .app
+  (28 MB dmg vs 316 MB zip), so every .dmg customer had no adb/ffmpeg/
+  JDK on disk — the v1.8.26 quarantine heal couldn't help because there
+  was nothing to heal. The dmg now stages a copy of the .app (so the
+  portable ZIP isn't double-payloaded), injects `.tools/macos/` + the
+  vcam APK into `Contents/Resources/` (NOT `Contents/MacOS/` — codesign
+  rejects foreign dirs there: "bundle format unrecognized"), hard-fails
+  the build if adb/ffmpeg/java are missing from the payload, and
+  re-signs ad-hoc. Runtime: `platform_tools._extra_tools_roots()` now
+  resolves `Resources/.tools/<os>/` and `find_vcam_apk()` checks
+  `Resources/apk/`; the heal sweep covers the extra roots. The adb
+  warning dialog also distinguishes "ไม่พบ adb ในชุดติดตั้งเลย"
+  (incomplete installer) from "พบแต่รันไม่ได้" (Gatekeeper/exec-bit) —
+  the old message claimed "พบ adb" for both and misled support. Tests:
+  `tests/test_platform_tools_frozen.py::TestMacosDmgResourcesLayout`.
 - **v1.8.26** — Auto-heal the bundled toolchain on macOS so customers
   never hit the "พบ adb แต่รันไม่ได้ … รอเครื่อง…" dialog. A .dmg /
   Safari-downloaded ZIP stamps `com.apple.quarantine` on `adb`/`ffmpeg`/

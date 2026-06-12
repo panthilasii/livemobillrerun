@@ -888,7 +888,25 @@ class StudioApp(ctk.CTk):
             except Exception:
                 pass
             if not self.adb.is_available():
-                broken_reason = f"พบ {adb_name}{cause_hint}"
+                import shutil as _shutil
+                # Distinguish "no adb on this machine AT ALL" (config
+                # fell back to the bare name "adb" because nothing was
+                # bundled — the pre-1.8.27 .dmg bug) from "file exists
+                # but won't run" (Gatekeeper / exec bit / AV). The old
+                # message claimed "พบ adb" for both, which sent
+                # support down the wrong path on every .dmg install.
+                if (
+                    adb_path is not None
+                    and not adb_path.is_absolute()
+                    and _shutil.which(str(adb_path)) is None
+                ):
+                    broken_reason = (
+                        f"ไม่พบ {adb_name} ในชุดติดตั้งนี้เลย\n"
+                        "(ตัวติดตั้งไม่ครบ — กรุณาดาวน์โหลด\n"
+                        "ตัวติดตั้งเวอร์ชันล่าสุดจากแอดมิน)"
+                    )
+                else:
+                    broken_reason = f"พบ {adb_name}{cause_hint}"
 
         if broken_reason is None:
             return

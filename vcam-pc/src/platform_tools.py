@@ -203,11 +203,15 @@ def _extra_tools_roots() -> list[Path]:
       shared toolchains (e.g. one customer wired their installs to
       a network-mounted `Z:\\np-create-tools\\` so all 6 phones'
       LSPatch caches live in one place).
-    * macOS .app bundle ``Resources/`` — if a future build of
-      ``build_dmg.sh`` ever copies ``.tools/macos/`` into
-      ``NP-Create.app/Contents/Resources/.tools/`` (the canonical
-      Apple location for bundled assets), this candidate keeps
-      runtime resolution working without touching code.
+    * macOS .app bundle ``Resources/`` — since v1.8.27 this is the
+      PRODUCTION layout for .dmg installs: ``build_dmg.sh`` copies
+      ``.tools/macos/`` into ``NP-Create.app/Contents/Resources/
+      .tools/macos/``. It has to be Resources/ (not Contents/MacOS/)
+      because ``codesign`` refuses to seal a bundle with a foreign
+      directory inside MacOS/ ("bundle format unrecognized") — the
+      pre-1.8.27 .dmg shipped NO tools at all because of exactly
+      that, which customers saw as "พบ adb แต่รันไม่ได้ / รอเครื่อง…"
+      on every Mac.
     """
     out: list[Path] = []
     env = os.environ.get("NPCREATE_TOOLS_ROOT", "").strip()
@@ -219,6 +223,8 @@ def _extra_tools_roots() -> list[Path]:
         resources = PROJECT_ROOT.parent / "Resources"
         if resources.is_dir():
             out.append(resources.resolve())
+            # The v1.8.27 .dmg payload root (Resources/.tools/<os>/…).
+            out.append((resources / ".tools").resolve())
     return out
 
 
@@ -532,21 +538,31 @@ def find_vcam_apk() -> Path | None:
     Pre-1.7.9 we used ``PROJECT_ROOT.parent`` unconditionally,
     which silently missed the bundled APK in frozen mode and made
     Patch fail with "vcam-app APK not found" on .exe installs.
+
+    macOS .dmg installs (v1.8.27+) carry the APK inside the .app at
+    ``Contents/Resources/apk/`` (same reason as ``.tools/`` — see
+    ``_extra_tools_roots``), so that base is searched too.
     """
-    base = _tools_root_base()
-    candidates = [
-        # 1.4.6+ canonical name (what build_release.py writes)
-        base / "apk" / "vcam-app-release.apk",
-        base / "apk" / "vcam-app-debug.apk",
-        # Legacy 1.4.5 customer bundles -- accepted so updating to
-        # 1.4.6 doesn't break customers who copy in just the new
-        # src/ folder over an existing extract.
-        base / "apk" / "vcam-app.apk",
-        # Dev workspace (gradle output) -- used when running from
-        # the source tree, not from a customer ZIP.
-        base / "vcam-app/app/build/outputs/apk/release/app-release.apk",
-        base / "vcam-app/app/build/outputs/apk/debug/app-debug.apk",
-    ]
+    bases = [_tools_root_base()]
+    if getattr(sys, "frozen", False) and is_macos():
+        resources = PROJECT_ROOT.parent / "Resources"
+        if resources.is_dir():
+            bases.append(resources)
+    candidates: list[Path] = []
+    for base in bases:
+        candidates += [
+            # 1.4.6+ canonical name (what build_release.py writes)
+            base / "apk" / "vcam-app-release.apk",
+            base / "apk" / "vcam-app-debug.apk",
+            # Legacy 1.4.5 customer bundles -- accepted so updating to
+            # 1.4.6 doesn't break customers who copy in just the new
+            # src/ folder over an existing extract.
+            base / "apk" / "vcam-app.apk",
+            # Dev workspace (gradle output) -- used when running from
+            # the source tree, not from a customer ZIP.
+            base / "vcam-app/app/build/outputs/apk/release/app-release.apk",
+            base / "vcam-app/app/build/outputs/apk/debug/app-debug.apk",
+        ]
     for c in candidates:
         if c.is_file():
             return c.resolve()
@@ -676,7 +692,9 @@ def heal_bundled_tools() -> None:
     log.info("healed %d bundled tool(s): chmod +x + de-quarantine", len(targets))
 
     def _sweep() -> None:
-        for root in (tools_root_for(), LEGACY_TOOLS_ROOT):
+        roots = [tools_root_for(), LEGACY_TOOLS_ROOT]
+        roots.extend(_extra_tools_roots())
+        for root in roots:
             try:
                 if root.is_dir():
                     _strip_quarantine(root, recursive=True)

@@ -59,6 +59,79 @@ if ! command -v create-dmg >/dev/null 2>&1; then
     exit 1
 fi
 
+# ── Inject the tool payload into the .app (v1.8.27) ─────────────
+#
+# PyInstaller deliberately does NOT bundle .tools/ or apk/ (see
+# build_pyinstaller.py) — the platform installer is responsible for
+# placing them. Pre-1.8.27 this script never did, so every .dmg
+# customer got a 28 MB app with NO adb/ffmpeg/JDK at all and the
+# wizard hung on "รอเครื่อง…" with the "พบ adb แต่รันไม่ได้" dialog.
+#
+# The payload goes in Contents/Resources/ — NOT Contents/MacOS/ —
+# because codesign refuses to seal a bundle with a foreign directory
+# inside MacOS/ ("bundle format unrecognized ... In subcomponent:
+# .tools"). platform_tools._extra_tools_roots() resolves
+# Resources/.tools/<os>/ at runtime, and find_vcam_apk() checks
+# Resources/apk/.
+#
+# cp -RL (dereference) so dev machines whose .tools/macos entries
+# are symlinks into legacy layouts still produce a self-contained
+# bundle; on CI the dirs are already real.
+#
+# We inject into a STAGED COPY, not dist/pyinstaller/NP-Create.app
+# itself — build_release.py zips that same .app into the portable
+# customer ZIP (which already ships .tools/ + apk/ at the bundle
+# root), and mutating the original would double the payload there.
+WORKSPACE="$(cd "$PROJECT/.." && pwd)"
+TOOLS_SRC="$WORKSPACE/.tools/macos"
+APK_SRC="$WORKSPACE/apk/vcam-app-release.apk"
+
+STAGE="$PROJECT/dist/dmg-stage"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+echo "[*] Staging .app copy for dmg ..."
+cp -R "$APP" "$STAGE/NP-Create.app"
+APP="$STAGE/NP-Create.app"
+RES="$APP/Contents/Resources"
+
+if [[ ! -d "$TOOLS_SRC" ]]; then
+    echo "[!] $TOOLS_SRC not found."
+    echo "    Run: python3 tools/setup_ci_tools.py --os macos"
+    exit 1
+fi
+
+echo "[*] Injecting .tools/macos + apk into the .app ..."
+rm -rf "$RES/.tools" "$RES/apk"
+mkdir -p "$RES/.tools" "$RES/apk"
+cp -RL "$TOOLS_SRC" "$RES/.tools/macos"
+if [[ -f "$APK_SRC" ]]; then
+    cp "$APK_SRC" "$RES/apk/vcam-app-release.apk"
+else
+    echo "[!] $APK_SRC not found — dmg will lack the vcam APK."
+    exit 1
+fi
+
+# Hard guard: never ship an empty payload again. Each of these is a
+# hard runtime dependency (device polling / encode / patch).
+for required in \
+    "$RES/.tools/macos/platform-tools/adb" \
+    "$RES/.tools/macos/ffmpeg" \
+    "$RES/.tools/macos/jdk-21/Contents/Home/bin/java"; do
+    if [[ ! -f "$required" ]]; then
+        echo "[!] payload incomplete: missing $required"
+        exit 1
+    fi
+done
+
+# Adding files invalidated PyInstaller's ad-hoc seal; re-sign so
+# Gatekeeper doesn't report the app as damaged. Plain (non-deep)
+# ad-hoc signing re-seals the bundle while leaving the vendors'
+# signatures on nested tool binaries (adb/java) untouched.
+echo "[*] Re-signing .app (ad-hoc) ..."
+codesign --force -s - "$APP"
+codesign --verify --strict "$APP"
+echo "[*] Payload injected: $(du -sh "$APP" | awk '{print $1}') total"
+
 mkdir -p "$OUT_DIR"
 rm -f "$DMG"
 

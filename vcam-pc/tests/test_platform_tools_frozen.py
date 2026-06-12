@@ -265,6 +265,99 @@ class TestFindVcamApkFrozen:
             assert found == apk.resolve()
 
 
+# ── macOS .dmg layout: payload in Contents/Resources (v1.8.27) ────
+
+
+class TestMacosDmgResourcesLayout:
+    """v1.8.27 — the .dmg injects ``.tools/macos/`` + ``apk/`` into
+    ``NP-Create.app/Contents/Resources/``.
+
+    Pre-1.8.27 ``build_dmg.sh`` shipped NO payload at all (28 MB
+    .dmg vs 316 MB zip): every macOS .dmg customer hit "พบ adb แต่
+    รันไม่ได้ / รอเครื่อง…" because there was literally no adb on
+    disk. The payload must live in Resources/ — codesign refuses to
+    seal a bundle with a foreign dir inside Contents/MacOS/. These
+    tests pin runtime resolution of that layout so the dmg can't
+    silently regress to "no tools" again.
+    """
+
+    def _make_app(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Lay out Applications/NP-Create.app, return (MacOS, Resources)."""
+        app = tmp_path / "Applications" / "NP-Create.app" / "Contents"
+        macos_dir = app / "MacOS"
+        resources = app / "Resources"
+        macos_dir.mkdir(parents=True)
+        resources.mkdir(parents=True)
+        return macos_dir, resources
+
+    def test_find_adb_in_resources_tools(self, tmp_path):
+        macos_dir, resources = self._make_app(tmp_path)
+        adb = resources / ".tools" / "macos" / "platform-tools" / "adb"
+        adb.parent.mkdir(parents=True)
+        adb.write_bytes(b"#!/bin/sh\n")
+        adb.chmod(0o755)
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Darwin"), \
+             mock.patch("shutil.which", return_value=None):
+            pt = _reload_platform_tools(macos_dir)
+            found = pt.find_adb()
+            assert found is not None, (
+                "Resources/.tools/macos/platform-tools/adb must "
+                "resolve in a frozen macOS .app — this is the .dmg "
+                "production layout since v1.8.27."
+            )
+            assert found == adb.resolve()
+
+    def test_find_ffmpeg_and_java_in_resources_tools(self, tmp_path):
+        macos_dir, resources = self._make_app(tmp_path)
+        tools = resources / ".tools" / "macos"
+        ffmpeg = tools / "ffmpeg"
+        java = tools / "jdk-21" / "Contents" / "Home" / "bin" / "java"
+        ffmpeg.parent.mkdir(parents=True, exist_ok=True)
+        java.parent.mkdir(parents=True)
+        for p in (ffmpeg, java):
+            p.write_bytes(b"\xcf\xfa\xed\xfe")
+            p.chmod(0o755)
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Darwin"), \
+             mock.patch("shutil.which", return_value=None):
+            pt = _reload_platform_tools(macos_dir)
+            assert pt.find_ffmpeg() == ffmpeg.resolve()
+            assert pt.find_java() == java.resolve()
+
+    def test_find_vcam_apk_in_resources(self, tmp_path):
+        macos_dir, resources = self._make_app(tmp_path)
+        apk = resources / "apk" / "vcam-app-release.apk"
+        apk.parent.mkdir(parents=True)
+        apk.write_bytes(b"PK\x03\x04fake-apk")
+
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch("platform.system", return_value="Darwin"):
+            pt = _reload_platform_tools(macos_dir)
+            found = pt.find_vcam_apk()
+            assert found is not None, (
+                "Resources/apk/vcam-app-release.apk must resolve in "
+                "a frozen macOS .app (the .dmg ships it there)."
+            )
+            assert found == apk.resolve()
+
+    def test_resources_layout_ignored_when_not_frozen(self, tmp_path):
+        """Dev runs must not accidentally pick up an .app's payload."""
+        macos_dir, resources = self._make_app(tmp_path)
+        adb = resources / ".tools" / "macos" / "platform-tools" / "adb"
+        adb.parent.mkdir(parents=True)
+        adb.write_bytes(b"#!/bin/sh\n")
+        adb.chmod(0o755)
+
+        with mock.patch.object(sys, "frozen", False, create=True), \
+             mock.patch("platform.system", return_value="Darwin"), \
+             mock.patch("shutil.which", return_value=None):
+            pt = _reload_platform_tools(macos_dir)
+            assert pt.find_adb() is None
+
+
 # ── find_adb_driver_dir (Windows only) ────────────────────────────
 
 
