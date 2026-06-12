@@ -268,6 +268,14 @@ def _extract_zip(zpath: Path, into: Path, strip_first: bool = False) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
+            # Restore the Unix mode bits stored in the zip entry.
+            # Google's platform-tools zip marks ``adb`` 0755 there;
+            # dropping it shipped a non-executable adb inside the
+            # macOS .dmg (v1.8.27) that only worked because the
+            # runtime heal chmod-ed it back at startup.
+            mode = (member.external_attr >> 16) & 0o7777
+            if mode & 0o111:
+                target.chmod(target.stat().st_mode | mode)
 
 
 def _extract_tar(tpath: Path, into: Path, strip_first: bool = False) -> None:

@@ -112,13 +112,20 @@ else
 fi
 
 # Hard guard: never ship an empty payload again. Each of these is a
-# hard runtime dependency (device polling / encode / patch).
+# hard runtime dependency (device polling / encode / patch). chmod
+# first — zip extraction on CI has historically dropped Unix mode
+# bits (the v1.8.27 dmg shipped a non-exec adb) — then require -x.
 for required in \
     "$RES/.tools/macos/platform-tools/adb" \
     "$RES/.tools/macos/ffmpeg" \
     "$RES/.tools/macos/jdk-21/Contents/Home/bin/java"; do
     if [[ ! -f "$required" ]]; then
         echo "[!] payload incomplete: missing $required"
+        exit 1
+    fi
+    chmod +x "$required"
+    if [[ ! -x "$required" ]]; then
+        echo "[!] payload broken: $required is not executable"
         exit 1
     fi
 done
