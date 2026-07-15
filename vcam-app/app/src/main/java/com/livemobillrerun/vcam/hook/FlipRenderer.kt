@@ -41,9 +41,12 @@ import java.util.concurrent.ConcurrentHashMap
  * a free GLES texture handle on every frame, run a fragment shader,
  * and re-render with whatever transform [params] currently says.
  *
- * **Status:** functional baseline. Rotates/mirrors but doesn't yet
- * implement zoom (`scale != 1.0`) — it's a single quad with the same
- * vertex coordinates each frame.
+ * **Status:** functional. Rotate / mirror / zoom are all applied via
+ * the MVP matrix each frame (see [drawFrameInner]). [zoom] is a uniform
+ * scale on the full-screen NDC quad: `< 1.0` shrinks the frame so
+ * TikTok-cropped edges become visible again (the "ขอบจอตก" fix),
+ * `> 1.0` enlarges past the viewport to crop/fill. Driven live from the
+ * PC via `SET_MODE --ef zoom` (see [CameraHook.InProcessModeReceiver]).
  */
 class FlipRenderer(
     /** Width of the output Surface (encoder). */

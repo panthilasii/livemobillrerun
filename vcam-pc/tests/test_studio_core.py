@@ -173,6 +173,34 @@ class TestDeviceLibrary:
         lib.update_transform("S1", rotation=450)
         assert lib.get("S1").rotation == 90  # 450 % 360
 
+    def test_zoom_default_and_update(self):
+        # v1.8.28: zoom defaults to 1.0 (no change) and is settable
+        # independently of rotation/mirror via update_transform.
+        lib = DeviceLibrary()
+        lib.upsert("S1")
+        assert lib.get("S1").zoom == 1.0
+        lib.update_transform("S1", zoom=0.85)
+        assert lib.get("S1").zoom == 0.85
+
+    def test_zoom_clamped_to_ui_range(self):
+        # A malformed / out-of-range zoom must never blank the camera
+        # (zoom 0) or explode the quad — clamp to the 0.5–2.0 UI range.
+        lib = DeviceLibrary()
+        lib.upsert("S1")
+        lib.update_transform("S1", zoom=0.0)
+        assert lib.get("S1").zoom == 0.5
+        lib.update_transform("S1", zoom=9.0)
+        assert lib.get("S1").zoom == 2.0
+
+    def test_zoom_round_trips_through_json(self, tmp_path):
+        path = tmp_path / "devices.json"
+        lib = DeviceLibrary()
+        lib.upsert("S1")
+        lib.update_transform("S1", zoom=1.25)
+        lib.save(path)
+        lib2 = DeviceLibrary.load(path)
+        assert lib2.get("S1").zoom == 1.25
+
     def test_mark_patched(self):
         lib = DeviceLibrary()
         lib.upsert("S1")

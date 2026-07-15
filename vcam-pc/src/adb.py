@@ -127,6 +127,34 @@ class AdbController:
             return False
         return r.returncode == 0
 
+    def start_server(self) -> bool:
+        """Best-effort ``adb start-server`` warm-up.
+
+        Unlike :meth:`restart_server` this does **not** kill an
+        existing daemon — it only makes sure one is running so the
+        very first ``adb devices`` poll doesn't race daemon startup
+        and return an empty list that looks like "no phone".
+
+        Why this matters on macOS specifically
+        --------------------------------------
+        On a fresh macOS install the first time we spawn the bundled
+        ``adb`` the OS runs Gatekeeper notarisation, which can add
+        10-30 s. If that first spawn is the device poller's own
+        ``adb devices`` call, the customer sees "รอเครื่อง…" the whole
+        time even with a phone plugged in. Warming the daemon up once
+        at launch (off the UI thread) absorbs that delay before the
+        poll loop starts, so detection feels instant afterwards.
+
+        Returns ``True`` when ``adb start-server`` exits cleanly. A
+        ``False`` is non-fatal — the poller's ``devices()`` call would
+        start the daemon lazily anyway.
+        """
+        try:
+            r = self._run("start-server", timeout=15)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0
+
     def restart_server(self) -> bool:
         """``adb kill-server`` then ``adb start-server``.
 

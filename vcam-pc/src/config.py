@@ -131,10 +131,18 @@ class StreamConfig:
     # customer asked for ("คมชัด"). CRF 18 is "visually
     # transparent" (humans can't tell apart from the lossless
     # source); CRF 23 is x264's default. Lower = sharper + bigger
-    # file; higher = blurrier + smaller. We default to 18 and
-    # surface it in Settings for customers on slow PCs to relax
-    # if encode time is critical.
-    encode_crf: int = 18
+    # file; higher = blurrier + smaller.
+    #
+    # v1.8.28: default lowered 18 → 16. Customers reported the MP4
+    # coming out "เล็ก/ไม่คม". CRF 18 is visually transparent on a
+    # good monitor, but TikTok Live re-compresses our feed a second
+    # time, and starting from a denser (bigger) source survives that
+    # second pass with more retained detail. CRF 16 gives a ~40-60 %
+    # bigger file that is clearly sharper after TikTok's re-encode,
+    # still short of the diminishing-returns wall at CRF 12-14.
+    # Surfaced in Settings ("คุณภาพวิดีโอ") so a customer on a slow
+    # PC / small disk can raise it back toward 20.
+    encode_crf: int = 16
 
     # x264 preset trades CPU time against compression efficiency.
     # Same CRF + slower preset = SAME visual quality, but SMALLER
@@ -191,6 +199,29 @@ class StreamConfig:
     # letterbox path (``encode_width`` × ``encode_height``) for the
     # rare phone whose MediaCodec rejects non-standard resolutions.
     encode_match_source: bool = True
+
+    # ── Target output height (v1.8.28) ──────────────────────────
+    # Within the match-source path, force the encoded frame to a
+    # fixed HEIGHT (in the landscape file orientation the hook
+    # produces after ``transpose``) while preserving the source
+    # aspect ratio — width is auto-derived and kept even. This is
+    # the "ผมต้องการให้เป็น 1080" customer request:
+    #
+    #   * 1080  → every clip lands at 1080p-class (1920×1080 file,
+    #             shown 1080×1920 portrait on TikTok). Sub-1080
+    #             sources are upscaled (Lanczos), 4K sources are
+    #             downscaled to 1080 (smaller file, still crisp).
+    #   * 720   → 720p-class for slow phones.
+    #   * 0     → disabled: keep the source's native resolution
+    #             (the pure v1.8.21 match-source behaviour).
+    #
+    # We default to 1080 because customers kept getting soft /
+    # small 720p output when their source clip happened to be 720p;
+    # normalising to 1080 fixes both the sharpness complaint (#3)
+    # and, combined with CRF 16, the "ไฟล์เล็ก" complaint (#2).
+    # No letterbox pad is added — aspect ratio is preserved, so the
+    # phone's GL renderer still fits the frame to the camera surface.
+    encode_scale_height: int = 1080
 
     keyint_seconds: int = 2
     loop_playlist: bool = True

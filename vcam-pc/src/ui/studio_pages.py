@@ -1011,6 +1011,49 @@ class DashboardPage(ctk.CTkFrame):
             "ค่าแนะนำคือกล้องหลัง เพื่อให้ TikTok ตรวจหน้าได้ตามปกติ",
         ).pack(side="left", padx=(10, 0))
 
+        # Zoom row — fixes the "ขอบจอตก" complaint. The slider drives
+        # FlipRenderer's MVP scale live over SET_MODE, so the customer
+        # can zoom OUT (< 100%) to reveal edges TikTok cropped, or IN
+        # (> 100%) to remove letterbox bars — no re-encode needed.
+        zoom_row = ctk.CTkFrame(rot, fg_color="transparent")
+        zoom_row.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 16))
+        _muted(
+            zoom_row, "ซูมภาพ (แก้ขอบจอตก):",
+        ).pack(side="left", padx=(0, 10))
+        self.zoom_var = ctk.DoubleVar(value=1.0)
+        # Discrete zoom-out button (customer-friendly toggle: one tap =
+        # one 5% step) sits left of the slider.
+        _ghost_button(
+            zoom_row, "−  ซูมออก",
+            command=self._on_zoom_out,
+            width=90,
+        ).pack(side="left", padx=(0, 8))
+        self.zoom_slider = ctk.CTkSlider(
+            zoom_row, from_=0.5, to=2.0, number_of_steps=30,
+            variable=self.zoom_var,
+            command=self._on_zoom_slider,
+            fg_color=THEME.bg_input,
+            progress_color=THEME.primary,
+            button_color=THEME.primary,
+            button_hover_color=THEME.primary_hover,
+            width=180,
+        )
+        self.zoom_slider.pack(side="left")
+        # Broadcast only on release so dragging doesn't spam adb.
+        self.zoom_slider.bind("<ButtonRelease-1>", self._on_zoom_commit)
+        _ghost_button(
+            zoom_row, "+  ซูมเข้า",
+            command=self._on_zoom_in,
+            width=90,
+        ).pack(side="left", padx=(8, 10))
+        self.lbl_zoom_val = _muted(zoom_row, "100%")
+        self.lbl_zoom_val.pack(side="left", padx=(0, 10))
+        _ghost_button(
+            zoom_row, "รีเซ็ต",
+            command=self._on_zoom_reset,
+            width=70,
+        ).pack(side="left")
+
         # Audio card — separate audio file overrides the MP4's audio.
         aud = _card(main)
         aud.grid(row=5, column=0, sticky="ew", padx=20, pady=8)
@@ -1711,6 +1754,9 @@ class DashboardPage(ctk.CTkFrame):
         self.rotation_var.set(e.rotation)
         self.mirror_h_var.set(e.mirror_h)
         self.mirror_v_var.set(e.mirror_v)
+        zoom = max(0.5, min(2.0, float(getattr(e, "zoom", 1.0) or 1.0)))
+        self.zoom_var.set(zoom)
+        self.lbl_zoom_val.configure(text=self._fmt_zoom(zoom))
         self.bypass_facing_var.set(self._bypass_facing_to_label(e.bypass_facing))
 
         # Patch button text
@@ -2649,6 +2695,7 @@ class DashboardPage(ctk.CTkFrame):
                 rotation_deg=int(getattr(e, "rotation", 0)),
                 flip_x=bool(getattr(e, "mirror_h", False)),
                 flip_y=bool(getattr(e, "mirror_v", False)),
+                zoom=float(getattr(e, "zoom", 1.0) or 1.0),
                 bypass_facing=getattr(e, "bypass_facing", "back"),
                 serial=self.app.adb_id_for(e),
             )
@@ -3707,10 +3754,65 @@ class DashboardPage(ctk.CTkFrame):
             rotation=self.rotation_var.get(),
             mirror_h=self.mirror_h_var.get(),
             mirror_v=self.mirror_v_var.get(),
+            zoom=self._current_zoom(),
         )
         self.app.save_devices()
+        self._broadcast_transform(e)
 
-        def _poke_tiktok_transform() -> None:
+    # ── zoom control ─────────────────────────────────────────────
+    @staticmethod
+    def _fmt_zoom(value: float) -> str:
+        return f"{int(round(float(value) * 100))}%"
+
+    def _current_zoom(self) -> float:
+        try:
+            return max(0.5, min(2.0, float(self.zoom_var.get())))
+        except Exception:
+            return 1.0
+
+    def _on_zoom_slider(self, value: float) -> None:
+        # Live label only — the broadcast fires on button release so we
+        # don't flood adb with a SET_MODE per pixel of drag.
+        try:
+            self.lbl_zoom_val.configure(text=self._fmt_zoom(value))
+        except Exception:
+            pass
+
+    def _on_zoom_commit(self, _event: object = None) -> None:
+        e = self.app.selected_entry()
+        if e is None:
+            return
+        zoom = self._current_zoom()
+        self.lbl_zoom_val.configure(text=self._fmt_zoom(zoom))
+        self.app.devices_lib.update_transform(e.serial, zoom=zoom)
+        self.app.save_devices()
+        self._broadcast_transform(e)
+
+    # One tap = one 5% step. Clamped to the same 0.5–2.0 range the
+    # slider (and update_transform) enforce.
+    _ZOOM_STEP = 0.05
+
+    def _step_zoom(self, delta: float) -> None:
+        new = max(0.5, min(2.0, round(self._current_zoom() + delta, 2)))
+        self.zoom_var.set(new)
+        self.lbl_zoom_val.configure(text=self._fmt_zoom(new))
+        self._on_zoom_commit()
+
+    def _on_zoom_in(self) -> None:
+        self._step_zoom(self._ZOOM_STEP)
+
+    def _on_zoom_out(self) -> None:
+        self._step_zoom(-self._ZOOM_STEP)
+
+    def _on_zoom_reset(self) -> None:
+        self.zoom_var.set(1.0)
+        self.lbl_zoom_val.configure(text="100%")
+        self._on_zoom_commit()
+
+    def _broadcast_transform(self, e: "DeviceEntry") -> None:
+        """Push the current rotation / mirror / zoom to the running
+        TikTok hook (best-effort, off the UI thread)."""
+        def _poke() -> None:
             try:
                 from ..hook_mode import TIKTOK_PACKAGE_DEFAULT
 
@@ -3720,13 +3822,14 @@ class DashboardPage(ctk.CTkFrame):
                     rotation_deg=int(self.rotation_var.get()),
                     flip_x=bool(self.mirror_h_var.get()),
                     flip_y=bool(self.mirror_v_var.get()),
+                    zoom=self._current_zoom(),
                     bypass_facing=getattr(e, "bypass_facing", "back"),
                     serial=self.app.adb_id_for(e),
                 )
             except Exception:
                 log.exception("broadcast_flip_transform_to_tiktok failed")
 
-        threading.Thread(target=_poke_tiktok_transform, daemon=True).start()
+        threading.Thread(target=_poke, daemon=True).start()
 
     def _on_encode_push(self) -> None:
         """Kick off encode + push for the *currently-selected* device.
@@ -5886,6 +5989,52 @@ class WizardPage(ctk.CTkFrame):
                 "❓  ไม่เจอเครื่อง? — ลง driver Windows",
                 command=self._show_driver_help,
             ).pack(side="left")
+        elif _sys.platform == "darwin" and elapsed > 15.0:
+            # macOS needs no USB driver, so the causes differ from
+            # Windows entirely — it's almost always a charge-only
+            # cable, USB debugging still off, or the phone's USB mode
+            # stuck on "charging". Give a Mac-specific checklist.
+            _ghost_button(
+                actions,
+                "❓  Mac ไม่เจอเครื่อง?",
+                command=self._show_macos_adb_help,
+            ).pack(side="left")
+
+    def _show_macos_adb_help(self) -> None:
+        """macOS-only 'phone not found' checklist.
+
+        Unlike Windows, macOS talks to Android over libusb with no
+        driver to install — so when a Mac customer's phone never
+        shows up the cause is almost always one of: a charge-only
+        USB cable (no data lines), USB debugging still off in
+        Developer Options, the phone's USB mode stuck on "charging
+        only", or the whole app running from an iCloud/OneDrive
+        folder where the bundled adb is a cloud placeholder. Point
+        support at the diagnostic file too."""
+        try:
+            from ..config import DATA_ROOT
+            from .._startup_diagnostic import DIAGNOSTIC_FILENAME
+
+            diag = str(DATA_ROOT / "logs" / DIAGNOSTIC_FILENAME)
+        except Exception:
+            diag = "logs/startup-diagnostic.txt"
+        messagebox.showinfo(
+            "Mac ไม่เจอเครื่อง — ตรวจ 5 ข้อนี้",
+            "บน Mac ไม่ต้องลง driver ใดๆ ถ้ายังไม่เจอเครื่อง ให้ไล่ทีละข้อ:\n\n"
+            "•  ใช้ 'สาย USB ที่ส่งข้อมูลได้' (สายชาร์จบางเส้นต่อไฟอย่างเดียว)\n"
+            "   ลองสายเส้นอื่น / เสียบพอร์ตที่ตัวเครื่อง Mac โดยตรง (ไม่ผ่าน hub)\n"
+            "•  เปิด 'การแก้ไขข้อบกพร่อง USB' (USB debugging) ใน\n"
+            "   ตั้งค่า → ตัวเลือกนักพัฒนา บนมือถือ\n"
+            "•  ที่แถบแจ้งเตือนมือถือ เปลี่ยนโหมด USB เป็น 'ถ่ายโอนไฟล์'\n"
+            "   (อย่าค้างที่ 'ชาร์จเท่านั้น')\n"
+            "•  ถ้ามี popup 'อนุญาตการแก้ไขข้อบกพร่อง USB?' → กด 'อนุญาต'\n"
+            "   และติ๊ก 'จดจำเสมอ' แล้วกดปุ่ม 'รีสตาร์ท ADB'\n"
+            "•  อย่ารันโปรแกรมจากโฟลเดอร์ iCloud/OneDrive — คัดลอกทั้ง\n"
+            "   โฟลเดอร์ไปไว้ที่ Applications หรือ Desktop ก่อนเปิดใช้งาน\n\n"
+            "ถ้ายังไม่หาย ส่งไฟล์นี้ให้แอดมิน:\n"
+            f"   {diag}\n\n"
+            "ติดต่อ Line OA: @npcreate",
+        )
 
     # ── ADB daemon restart ───────────────────────────────────────
 
@@ -6655,20 +6804,26 @@ class SettingsPage(ctk.CTkFrame):
         _muted(
             parent,
             "เลือกความละเอียดของไฟล์ MP4 ที่ส่งให้ TikTok ใช้ไลฟ์.\n"
-            "1080p = คมที่สุด (แนะนำ)  •  720p = ใช้บนเครื่องสเปคต่ำ.",
+            "1080p = คมที่สุด (แนะนำ)  •  720p = ใช้บนเครื่องสเปคต่ำ\n"
+            "ตามต้นฉบับ = ใช้ความละเอียดเดิมของคลิป (ไม่ย่อ/ไม่ขยาย).",
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
 
         cfg = self.app.cfg
-        cur_w = int(cfg.encode_width or 1920)
-        # Map to a friendly preset key.
-        preset = "1080p" if cur_w >= 1920 else "720p"
+        # Map current ``encode_scale_height`` to a friendly preset key.
+        cur_h = int(getattr(cfg, "encode_scale_height", 1080) or 0)
+        if cur_h >= 1080:
+            preset = "1080p"
+        elif cur_h > 0:
+            preset = "720p"
+        else:
+            preset = "source"
         self._encode_preset_var = ctk.StringVar(value=preset)
 
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 12))
 
         ctk.CTkRadioButton(
-            row, text="1080p  (1080×1920 portrait, 1920×1080 landscape)",
+            row, text="1080p  (คมชัดที่สุด — แนะนำ)",
             variable=self._encode_preset_var, value="1080p",
             text_color=THEME.fg_primary,
             fg_color=THEME.primary,
@@ -6677,7 +6832,7 @@ class SettingsPage(ctk.CTkFrame):
         ).grid(row=0, column=0, sticky="w", pady=4)
 
         ctk.CTkRadioButton(
-            row, text="720p   (720×1280 portrait, 1280×720 landscape)",
+            row, text="720p   (สำหรับเครื่องสเปคต่ำ)",
             variable=self._encode_preset_var, value="720p",
             text_color=THEME.fg_primary,
             fg_color=THEME.primary,
@@ -6685,23 +6840,65 @@ class SettingsPage(ctk.CTkFrame):
             command=self._on_encode_preset_change,
         ).grid(row=1, column=0, sticky="w", pady=4)
 
+        ctk.CTkRadioButton(
+            row, text="ตามต้นฉบับ  (ใช้ความละเอียดเดิมของคลิป)",
+            variable=self._encode_preset_var, value="source",
+            text_color=THEME.fg_primary,
+            fg_color=THEME.primary,
+            hover_color=THEME.primary_hover,
+            command=self._on_encode_preset_change,
+        ).grid(row=2, column=0, sticky="w", pady=4)
+
+        # ── Sharpness / quality (CRF) ────────────────────────────
+        ctk.CTkLabel(
+            parent, text="ระดับความคม / ขนาดไฟล์",
+            text_color=THEME.fg_secondary,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=3, column=0, sticky="w", padx=20, pady=(4, 2))
+        _muted(
+            parent,
+            "ยิ่งคมยิ่งไฟล์ใหญ่และใช้เวลา encode นานขึ้นเล็กน้อย.\n"
+            "แนะนำ 'สูงมาก' — คมชัดหลัง TikTok บีบอัดซ้ำ โดยไฟล์ไม่ใหญ่เกินไป.",
+        ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 6))
+
+        # CRF: lower number = higher quality + bigger file.
+        cur_crf = int(getattr(cfg, "encode_crf", 16) or 16)
+        crf_key = self._crf_to_key(cur_crf)
+        self._encode_crf_var = ctk.StringVar(value=crf_key)
+        qrow = ctk.CTkFrame(parent, fg_color="transparent")
+        qrow.grid(row=5, column=0, sticky="w", padx=20, pady=(0, 12))
+        for i, (label, key) in enumerate((
+            ("สูงสุด (ไฟล์ใหญ่สุด)", "max"),
+            ("สูงมาก (แนะนำ)", "vhigh"),
+            ("สูง", "high"),
+            ("มาตรฐาน (ไฟล์เล็ก)", "std"),
+        )):
+            ctk.CTkRadioButton(
+                qrow, text=label,
+                variable=self._encode_crf_var, value=key,
+                text_color=THEME.fg_primary,
+                fg_color=THEME.primary,
+                hover_color=THEME.primary_hover,
+                command=self._on_encode_crf_change,
+            ).grid(row=i, column=0, sticky="w", pady=3)
+
         # Mirror toggle — keep it on the same card because
         # "encoder behavior" mentally groups with resolution.
         ctk.CTkFrame(
             parent, fg_color=THEME.bg_input, height=1,
-        ).grid(row=3, column=0, sticky="ew", padx=20, pady=(4, 12))
+        ).grid(row=6, column=0, sticky="ew", padx=20, pady=(4, 12))
 
         ctk.CTkLabel(
             parent, text="ภาพสะท้อน (Mirror)",
             text_color=THEME.fg_secondary,
             font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=4, column=0, sticky="w", padx=20, pady=(0, 4))
+        ).grid(row=7, column=0, sticky="w", padx=20, pady=(0, 4))
         _muted(
             parent,
             "การไลฟ์ฉีดผ่านกล้องหลังเป็นค่าเริ่มต้น — ไม่ต้องตั้งบ่อย\n"
             "สวิตช์นี้ใช้เฉพาะโหมดเก่า (เชนกล้องหน้า) หรือเมื่อตัวหนังสือ/โลโก้\n"
             "กลับด้านผิดปกติ ให้เปิดแล้วกด encode + push ใหม่",
-        ).grid(row=5, column=0, sticky="w", padx=20, pady=(0, 8))
+        ).grid(row=8, column=0, sticky="w", padx=20, pady=(0, 8))
 
         self._mirror_var = ctk.BooleanVar(
             value=bool(getattr(cfg, "mirror_horizontal", False))
@@ -6712,14 +6909,36 @@ class SettingsPage(ctk.CTkFrame):
             text_color=THEME.fg_primary,
             progress_color=THEME.primary,
             command=self._on_mirror_change,
-        ).grid(row=6, column=0, sticky="w", padx=20, pady=(0, 20))
+        ).grid(row=9, column=0, sticky="w", padx=20, pady=(0, 20))
+
+    # CRF preset ↔ numeric value. Lower CRF = sharper + bigger file.
+    _CRF_PRESETS: dict[str, int] = {
+        "max": 14,
+        "vhigh": 16,
+        "high": 18,
+        "std": 20,
+    }
+
+    def _crf_to_key(self, crf: int) -> str:
+        """Snap an arbitrary CRF value to the nearest preset key so the
+        radio group always has exactly one selection, even for a
+        hand-edited config.json."""
+        best = min(
+            self._CRF_PRESETS.items(),
+            key=lambda kv: abs(kv[1] - int(crf)),
+        )
+        return best[0]
 
     def _on_encode_preset_change(self) -> None:
         preset = self._encode_preset_var.get()
         cfg = self.app.cfg
         if preset == "720p":
+            cfg.encode_scale_height = 720
             cfg.encode_width, cfg.encode_height = 1280, 720
-        else:
+        elif preset == "source":
+            cfg.encode_scale_height = 0
+        else:  # 1080p
+            cfg.encode_scale_height = 1080
             cfg.encode_width, cfg.encode_height = 1920, 1080
         try:
             cfg.save()
@@ -6728,6 +6947,16 @@ class SettingsPage(ctk.CTkFrame):
             return
         # Dashboard rebuilds on navigation, so the label updates the
         # next time the user opens it. Nothing else to refresh here.
+
+    def _on_encode_crf_change(self) -> None:
+        cfg = self.app.cfg
+        cfg.encode_crf = self._CRF_PRESETS.get(
+            self._encode_crf_var.get(), 16
+        )
+        try:
+            cfg.save()
+        except Exception:
+            log.exception("ไม่สามารถบันทึก config (crf)")
 
     def _on_mirror_change(self) -> None:
         cfg = self.app.cfg

@@ -124,6 +124,15 @@ class _DevicePoller(threading.Thread):
         self._shutdown.set()
 
     def run(self) -> None:
+        # Warm the daemon up once before the poll loop so the first
+        # ``adb devices`` doesn't race a cold (or Gatekeeper-delayed
+        # on macOS) daemon start and return an empty list that looks
+        # like "no phone". Best-effort — devices() would start it
+        # lazily anyway.
+        try:
+            self._adb.start_server()
+        except Exception:
+            log.debug("adb start-server warm-up failed", exc_info=True)
         while not self._shutdown.is_set():
             try:
                 devs = self._adb.devices() if self._adb.is_available() else []

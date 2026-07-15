@@ -233,6 +233,26 @@ Newest first. `version` lives in `vcam-pc/src/branding.py`; tags
 `v*` trigger the release workflow (4 artifacts: Windows .exe +
 .zip, macOS .dmg + .zip).
 
+- **v1.8.28** — Customer batch: (1) **Zoom control** to fix "ขอบจอตก".
+  New `DeviceEntry.zoom` (clamped 0.5–2.0) + a slider in the dashboard
+  "ทิศทางภาพ" card; drives `FlipRenderer`'s MVP scale live over
+  `SET_MODE --ef zoom` (broadcast on slider release, also carried by
+  the rotation + clip-mode broadcasts). Android already applied zoom —
+  only the stale `FlipRenderer` docstring was corrected. (2) **1080
+  normalisation**: new `StreamConfig.encode_scale_height` (default
+  1080) makes the match-source encode `scale=-2:H` (aspect-preserving,
+  no pad) so every clip lands 1080p-class regardless of source; `0`
+  restores pure native-resolution. Settings resolution selector now
+  offers 1080p / 720p / ตามต้นฉบับ. (3) **Bigger/sharper file**:
+  default `encode_crf` 18 → 16 (survives TikTok's second re-encode);
+  new "ระดับความคม / ขนาดไฟล์" selector (CRF 14/16/18/20). (4) **macOS
+  device discovery**: `AdbController.start_server()` warm-up runs once
+  before the poll loop (absorbs Gatekeeper's first-spawn delay so the
+  first `adb devices` isn't an empty "no phone"); the wizard's
+  no-device state gains a Mac-specific help button (charge-only cable /
+  USB-debugging off / USB mode / iCloud folder checklist) mirroring the
+  Windows driver-help nudge. Tests: `test_hook_filters.py`,
+  `test_studio_core.py` (zoom).
 - **v1.8.27** — Fix the REAL macOS .dmg bug: the .dmg shipped NO tools
   at all. `build_dmg.sh` never copied `.tools/`/`apk/` into the .app
   (28 MB dmg vs 316 MB zip), so every .dmg customer had no adb/ffmpeg/

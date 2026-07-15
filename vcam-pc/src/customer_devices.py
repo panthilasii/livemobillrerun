@@ -48,6 +48,16 @@ class DeviceEntry:
     rotation: int = 0              # 0 / 90 / 180 / 270
     mirror_h: bool = False
     mirror_v: bool = False
+    # ── Display zoom (v1.8.28) ──────────────────────────────────
+    # Uniform scale applied by the Android FlipRenderer's MVP matrix
+    # to the clip before it reaches TikTok's camera surface. 1.0 =
+    # no change. Customers reported "ขอบจอตก" (edges cut off) —
+    # zoom OUT (< 1.0, e.g. 0.85) pulls the whole frame in so the
+    # cropped edges become visible again; zoom IN (> 1.0) fills /
+    # crops to remove letterbox bars. Range clamped 0.5–2.0 in the
+    # UI. Sent live via ``SET_MODE --ef zoom`` so it takes effect
+    # without re-encoding or re-pushing the MP4.
+    zoom: float = 1.0
     patched_at: str = ""           # iso timestamp; empty = never
     added_at: str = ""             # iso timestamp; set on first sight
     # ── WiFi / wireless-ADB state ───────────────────────────────
@@ -249,6 +259,7 @@ class DeviceLibrary:
                     rotation=int(raw.get("rotation", 0)) % 360,
                     mirror_h=bool(raw.get("mirror_h", False)),
                     mirror_v=bool(raw.get("mirror_v", False)),
+                    zoom=float(raw.get("zoom", 1.0) or 1.0),
                     patched_at=str(raw.get("patched_at", "")),
                     added_at=str(raw.get("added_at", "")),
                     wifi_ip=str(raw.get("wifi_ip", "")),
@@ -414,6 +425,7 @@ class DeviceLibrary:
         rotation: int | None = None,
         mirror_h: bool | None = None,
         mirror_v: bool | None = None,
+        zoom: float | None = None,
     ) -> None:
         with self._lock:
             e = self.entries.get(serial)
@@ -425,6 +437,10 @@ class DeviceLibrary:
                 e.mirror_h = bool(mirror_h)
             if mirror_v is not None:
                 e.mirror_v = bool(mirror_v)
+            if zoom is not None:
+                # Clamp to the UI-exposed range; a malformed value must
+                # never blank the camera (zoom 0) or explode the quad.
+                e.zoom = max(0.5, min(2.0, float(zoom)))
 
     def update_bypass_facing(self, serial: str, bypass_facing: str) -> None:
         """Persist which camera lens receives the hook replacement.

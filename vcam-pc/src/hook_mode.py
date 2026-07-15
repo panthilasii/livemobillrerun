@@ -596,23 +596,40 @@ class HookModePipeline:
         #   of leaving the encoder to clip blacks/whites.
         match_source = getattr(self.cfg, "encode_match_source", True)
         if match_source:
-            # v1.8.21 match-source path: keep the source's native
-            # resolution + aspect ratio. We still run a ``scale``
-            # filter — but only to (a) round to even dimensions
-            # (H.264 mandates even W/H) and (b) carry the SAME
-            # color-matrix + chroma-precision conversion the fixed
-            # path used. ``trunc(iw/2)*2`` is a no-op for the vast
-            # majority of clips (already even) and at worst shaves
-            # 1px — it never up/down-samples, so sharpness is
-            # preserved bit-for-bit relative to the source grid.
-            # No ``pad`` → no letterbox bars → on-screen size
-            # matches the real clip.
-            vf.append(
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2:"
-                "flags=lanczos+full_chroma_int+full_chroma_inp:"
-                "in_color_matrix=auto:out_color_matrix=bt709:"
-                "in_range=auto:out_range=tv"
-            )
+            # v1.8.28: optional fixed-height normalisation. When
+            # ``encode_scale_height`` > 0 the customer asked for a
+            # specific output class (default 1080p, "ต้องการให้เป็น
+            # 1080"). We scale to that HEIGHT and let width follow the
+            # source aspect ratio (``-2`` = auto, even). This is the
+            # only place that up/down-samples; a 720p source is
+            # upscaled to 1080 and a 4K source is downscaled to 1080,
+            # both preserving aspect (no pad, no crop → the phone's GL
+            # renderer still fits the frame to the camera surface).
+            scale_h = int(getattr(self.cfg, "encode_scale_height", 0) or 0)
+            if scale_h > 0:
+                scale_h -= scale_h % 2  # H.264 needs even dimensions
+                vf.append(
+                    f"scale=-2:{scale_h}:"
+                    "flags=lanczos+full_chroma_int+full_chroma_inp:"
+                    "in_color_matrix=auto:out_color_matrix=bt709:"
+                    "in_range=auto:out_range=tv"
+                )
+            else:
+                # Pure match-source (v1.8.21): keep the source's native
+                # resolution + aspect ratio. The ``scale`` filter only
+                # (a) rounds to even dimensions (H.264 mandates even
+                # W/H) and (b) carries the SAME color-matrix +
+                # chroma-precision conversion the fixed path used.
+                # ``trunc(iw/2)*2`` is a no-op for the vast majority of
+                # clips (already even) and at worst shaves 1px — it
+                # never up/down-samples, so sharpness is preserved
+                # bit-for-bit relative to the source grid.
+                vf.append(
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2:"
+                    "flags=lanczos+full_chroma_int+full_chroma_inp:"
+                    "in_color_matrix=auto:out_color_matrix=bt709:"
+                    "in_range=auto:out_range=tv"
+                )
             vf.append(f"fps={self.cfg.fps}")
             vf.append("setsar=1")
             return vf

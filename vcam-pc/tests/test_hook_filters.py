@@ -8,6 +8,10 @@ load-bearing for live-stream correctness:
   the mirror axis stays horizontal in the source frame.
 * v1.8.21's default match-source path MUST NOT inject ``pad`` —
   padding caused portrait clips to look smaller than the source.
+* v1.8.28 normalises the match-source output to a fixed height
+  (``encode_scale_height``, default 1080) via ``scale=-2:H`` —
+  still NO pad, aspect preserved. ``encode_scale_height=0`` restores
+  the pure native-resolution behaviour.
 * Legacy fixed-box mode still uses ``scale`` before ``pad`` so the
   letterboxing math works on the already-fitted frame; otherwise
   pad would crop or stretch.
@@ -61,17 +65,37 @@ class TestVideoFilterOrdering:
         assert "hflip" not in vf
         assert vf.index("transpose=2") < vf.index("vflip")
 
-    def test_match_source_default_has_no_pad(self):
+    def test_match_source_default_scales_to_1080_no_pad(self):
+        # v1.8.28: the default now normalises to 1080p height
+        # (``encode_scale_height=1080``) preserving aspect (``-2``)
+        # with NO letterbox pad — the "ต้องการให้เป็น 1080" request.
         pipe = _pipeline()
         vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
-        assert any(
-            f.startswith("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-            for f in vf
+        assert any(f.startswith("scale=-2:1080") for f in vf), (
+            "default encode must scale to 1080 height preserving aspect"
         )
         assert not any(f.startswith("pad=") for f in vf), (
             "match-source encode must not letterbox-pad; padding is "
             "what made 9:16 customer clips look smaller than the source"
         )
+
+    def test_match_source_zero_keeps_native_resolution(self):
+        # ``encode_scale_height=0`` restores the pure v1.8.21
+        # match-source behaviour: even-round only, never up/downscale.
+        pipe = _pipeline(encode_scale_height=0)
+        vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
+        assert any(
+            f.startswith("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            for f in vf
+        )
+        assert not any(f.startswith("scale=-2:") for f in vf)
+        assert not any(f.startswith("pad=") for f in vf)
+
+    def test_match_source_720_scale_height(self):
+        pipe = _pipeline(encode_scale_height=720)
+        vf = pipe._build_video_filter(_profile(), False, 1920, 1080)
+        assert any(f.startswith("scale=-2:720") for f in vf)
+        assert not any(f.startswith("pad=") for f in vf)
 
     def test_legacy_fixed_box_scale_precedes_pad(self):
         pipe = _pipeline(encode_match_source=False)
@@ -96,6 +120,13 @@ class TestVideoFilterOrdering:
         cfg = StreamConfig()
         assert cfg.encode_width == 1920
         assert cfg.encode_height == 1080
+
+    def test_default_scale_height_and_crf(self):
+        # v1.8.28: default output normalised to 1080p at CRF 16
+        # (sharper + bigger file to survive TikTok's re-encode).
+        cfg = StreamConfig()
+        assert cfg.encode_scale_height == 1080
+        assert cfg.encode_crf == 16
 
     def test_defaults_rear_hook_encode_path(self):
         cfg = StreamConfig()
